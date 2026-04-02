@@ -111,8 +111,9 @@ _ACCEPT_TO_SUBMIT_LINK_RE = re.compile(
     r'href=["\']([^"\']+)["\'][^>]*>[^<]*Accept\s+to\s+submit\s+providers',
     re.IGNORECASE,
 )
-# Location: "at 3424 - Baxter, MN (BAXTER, MN)" or "at 4143 - Greenville, NC (GREENVILLE, NC)" -> strip parenthetical
-_LOCATION_RE = re.compile(r"at\s+([^(]+?)\s*\([^)]+\)", re.IGNORECASE)
+# Location: "at 3424 - Baxter, MN (BAXTER, MN)" -> strip parenthetical.
+# Use \bat\b so "What it does: ..." in email <style> blocks does not match "at " inside "What ".
+_LOCATION_RE = re.compile(r"\bat\s+([^(]+?)\s*\([^)]+\)", re.IGNORECASE)
 _ACTION_PATTERNS = [
     (re.compile(r"updated the job post", re.I), "updated"),
     (re.compile(r"New job post from", re.I), "new"),
@@ -192,6 +193,7 @@ def scrape_emails_from_sender(
     from_email: str,
     imap_server: str = IMAP_SERVER,
     days: int | None = None,
+    hours: float | None = None,
     max_results: int | None = None,
 ):
     """
@@ -203,6 +205,7 @@ def scrape_emails_from_sender(
         from_email: Only include emails from this sender
         imap_server: IMAP server host
         days: If set, only include emails from the last N days
+        hours: If set, only include emails from the last N hours (overrides days if stricter)
         max_results: If set, stop after this many emails
 
     Returns:
@@ -217,6 +220,9 @@ def scrape_emails_from_sender(
     cutoff_date = None
     if days is not None:
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
+    if hours is not None:
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        cutoff_date = since if cutoff_date is None else max(cutoff_date, since)
 
     mail = imaplib.IMAP4_SSL(imap_server)
     mail.login(email_account, email_password)

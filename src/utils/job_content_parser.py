@@ -1,0 +1,625 @@
+"""
+Parse raw job content text (from Kimedics job post page) into a structured row.
+Designed to work 100% of the time: missing or malformed fields become empty string.
+
+Extraction stages (see job_content_ai for validate/fix):
+  1. Structured header (label/value pairs) — status, POC, dates, etc.
+  2. Description block after ``--- Description (full text) ---``:
+     - Labeled lines ``Address:``, ``City:``, ``Dates:``, ``Hours:``, ``Clinical Staff:``, etc.
+     - Bullet insight lines starting with ``*``
+     - Fallback section-style blocks (heading on its own line) when labels are absent
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Union
+
+# Canonical columns we always output (for CSV): identity → location → org/status → scheduling →
+# clinical detail → insight → remaining Kimedics header fields → full description.
+JOB_CONTENT_COLUMNS = [
+    "job_id",
+    "title_line",
+    "location_line",
+    "practice_value",
+    "city",
+    "state",
+    "address_line",
+    "job_title",
+    "posting_org",
+    "priority",
+    "status",
+    "point_of_contact",
+    "provider_start_date",
+    "provider_end_date",
+    "posted_date",
+    "dates_needed",
+    "standard_schedule",
+    "required_procedures",
+    "additional_requirements",
+    "support_staff",
+    "insight",
+    "basics_job_title",
+    "number_of_open_positions",
+    "shift_credential_accepted",
+    "position_type",
+    "time",
+    "rates",
+    "only_accept_providers_under_max_rates",
+    "why_searching_for_providers",
+    "shifts_available",
+    "estimated_shifts_per_month",
+    "state_license_required",
+    "board_specialty_match",
+    "privileges_available",
+    "min_years_experience",
+    "geographic_restriction",
+    "description_full_text",
+]
+
+# Map exact label (as in file) -> our column name (first occurrence wins for duplicates)
+LABEL_TO_COLUMN = {
+    "Job Title": "job_title",
+    "Posted Date": "posted_date",
+    "Posting Org": "posting_org",
+    "Priority": "priority",
+    "Status": "status",
+    "Full Job Post": "_skip",
+    "Description": "_skip",
+    "Basics": "_skip",
+    "Job title": "basics_job_title",
+    "Number of open positions": "number_of_open_positions",
+    "Shift Credential Accepted": "shift_credential_accepted",
+    "Position type": "position_type",
+    "Time": "time",
+    "Rates": "rates",
+    "Billable = $0-$0/hr": "_skip",  # value of Rates sometimes
+    "Only accept providers under the max rates": "only_accept_providers_under_max_rates",
+    "No": "_skip",
+    "Yes": "_skip",
+    "Point Of Contact": "point_of_contact",
+    "Search Details": "_skip",
+    "Why are you searching for providers?": "why_searching_for_providers",
+    "Provider start date": "provider_start_date",
+    "Provider end date": "provider_end_date",
+    "Which shifts are available for providers?": "shifts_available",
+    "Estimated shifts per month": "estimated_shifts_per_month",
+    "State License Required To Apply": "state_license_required",
+    "Board specialty must match practice set up to apply": "board_specialty_match",
+    "Privileges Available": "privileges_available",
+    "Minimum Years of Experience": "min_years_experience",
+    "Geographic Restriction": "geographic_restriction",
+    "Other notes": "_skip",
+    "Sharing": "_skip",
+    "Edit": "_skip",
+}
+
+def _parse_city_state(text: str) -> tuple[str, str]:
+    """
+    Best-effort city/state from a Kimedics line like '6313 - Cheektowaga, NY' or 'Baxter, MN'.
+    """
+    s = (text or "").strip()
+    if not s:
+        return "", ""
+    m = re.match(r"^\d+\s*-\s*(.+)$", s)
+    if m:
+        s = m.group(1).strip()
+    s = re.sub(r"^location\s*:\s*", "", s, flags=re.IGNORECASE).strip()
+    if "," in s:
+        left, right = s.rsplit(",", 1)
+        return left.strip(), right.strip()
+    return "", ""
+
+
+def _extract_insight_lines(description: str) -> str:
+    """Lines in the description that start with '*'."""
+    lines = []
+    for ln in (description or "").splitlines():
+        t = ln.strip()
+        if t.startswith("*"):
+            lines.append(t)
+    return "\n".join(lines)
+
+
+def _norm_heading(s: str) -> str:
+    return (s or "").strip().lower().rstrip(":")
+
+
+def _is_following_section_start(line: str) -> bool:
+    """Heuristic: next titled block in Kimedics free-text descriptions."""
+    t = line.strip()
+    if not t or len(t) > 100:
+        return False
+    low = _norm_heading(t)
+    markers = (
+        "required procedures",
+        "additional requirements",
+        "clinical staff",
+        "support staff",
+        "dates needed",
+        "standard schedule",
+        "types of cases",
+        "volume",
+        "insight",
+        "point of contact",
+        "facility:",
+        "address:",
+        "city:",
+        "state:",
+        "dates:",
+        "hours:",
+    )
+    return any(low.startswith(m) or low == m for m in markers)
+
+
+def _kimedics_inline_label_value(line: str) -> tuple[str, str] | None:
+    """If line is 'Short Label: rest', return (lowercased label head, value part)."""
+    s = (line or "").strip()
+    if ":" not in s:
+        return None
+    head, _, tail = s.partition(":")
+    h = head.strip()
+    if len(h) > 70 or not re.match(r"^[A-Za-z0-9]", h):
+        return None
+    return (h.lower(), tail.strip())
+
+
+def _section_after_heading(desc_lines: list[str], headings: tuple[str, ...]) -> str:
+    """Collect text for a section: heading on its own line, or 'Heading: value' on one line."""
+    for i, ln in enumerate(desc_lines):
+        low = _norm_heading(ln)
+        if not low:
+            continue
+        buf: list[str] = []
+        matched = False
+        for h in headings:
+            if low == h or low.startswith(h + " "):
+                matched = True
+                break
+            if low.startswith(h + ":"):
+                matched = True
+                rest = ln.split(":", 1)[1].strip()
+                if rest:
+                    buf.append(rest)
+                break
+        if not matched:
+            continue
+        for j in range(i + 1, len(desc_lines)):
+            raw = desc_lines[j]
+            stripped = raw.strip()
+            if not stripped:
+                if buf:
+                    break
+                continue
+            if _kimedics_inline_label_value(stripped) is not None:
+                break
+            if _is_following_section_start(stripped) and buf:
+                break
+            buf.append(stripped)
+        return "\n".join(buf).strip()
+    return ""
+
+
+# (regex, field) — order matters; more specific patterns first.
+_DESC_LABELED_LINE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"^Additional\s+requirements?\s*/\s*info\s*:\s*(.*)$", re.I), "additional_requirements"),
+    (re.compile(r"^Additional\s+requirements?\s*:\s*(.*)$", re.I), "additional_requirements"),
+    (re.compile(r"^Required\s+procedures?\s*:\s*(.*)$", re.I), "required_procedures"),
+    (re.compile(r"^Clinical\s+staff\s*:\s*(.*)$", re.I), "support_staff"),
+    (re.compile(r"^Support\s+staff\s*:\s*(.*)$", re.I), "support_staff"),
+    (re.compile(r"^Dates\s+needed\s*:\s*(.*)$", re.I), "dates_needed"),
+    (re.compile(r"^Dates\s*:\s*(.*)$", re.I), "dates_needed"),
+    (re.compile(r"^Standard\s+schedule\s*:\s*(.*)$", re.I), "standard_schedule"),
+    (re.compile(r"^Hours\s*:\s*(.*)$", re.I), "standard_schedule"),
+    (re.compile(r"^Schedule\s*:\s*(.*)$", re.I), "standard_schedule"),
+    (re.compile(r"^Address\s*:\s*(.*)$", re.I), "address_line"),
+    (re.compile(r"^City\s*:\s*(.*)$", re.I), "city"),
+    (re.compile(r"^State\s*:\s*(.*)$", re.I), "state"),
+]
+
+
+def _line_matches_any_desc_label(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    return any(p.match(s) for p, _ in _DESC_LABELED_LINE_PATTERNS)
+
+
+def _extract_labeled_description_fields(description: str) -> dict[str, str]:
+    """
+    Kimedics-style 'Key: value' lines in the free-text description (often after Facility/Address).
+    Values may continue on following lines until a blank line or another label line.
+    """
+    desc = (description or "").strip()
+    if not desc:
+        return {}
+    lines = desc.splitlines()
+    out: dict[str, str] = {}
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        s = raw.strip()
+        if not s:
+            i += 1
+            continue
+        matched_field = None
+        m0 = None
+        for pat, field in _DESC_LABELED_LINE_PATTERNS:
+            m = pat.match(s)
+            if m:
+                matched_field = field
+                m0 = m
+                break
+        if not matched_field or m0 is None:
+            i += 1
+            continue
+        v0 = (m0.group(1) or "").strip()
+        parts: list[str] = [v0] if v0 else []
+        j = i + 1
+        while j < len(lines):
+            nxt = lines[j]
+            t = nxt.strip()
+            if not t:
+                break
+            if _line_matches_any_desc_label(nxt):
+                break
+            if _kimedics_inline_label_value(nxt) is not None:
+                break
+            parts.append(t)
+            j += 1
+        val = " ".join(parts).strip()
+        if val:
+            out[matched_field] = val
+        i = j
+    return out
+
+
+def _fill_from_description_blocks(out: dict) -> None:
+    """Best-effort extraction from description_full_text (non-AI)."""
+    desc = (out.get("description_full_text") or "").strip()
+    if not desc:
+        return
+    lines = desc.splitlines()
+
+    if not (out.get("required_procedures") or "").strip():
+        block = _section_after_heading(
+            lines,
+            ("required procedures", "required procedure"),
+        )
+        if block:
+            out["required_procedures"] = block
+
+    if not (out.get("additional_requirements") or "").strip():
+        block = _section_after_heading(
+            lines,
+            (
+                "additional requirements/ info",
+                "additional requirements",
+                "additional requirements/info",
+                "additional requirement",
+            ),
+        )
+        if block:
+            out["additional_requirements"] = block
+
+    if not (out.get("support_staff") or "").strip():
+        block = _section_after_heading(lines, ("clinical staff", "support staff"))
+        if block:
+            out["support_staff"] = block
+
+    if not (out.get("dates_needed") or "").strip():
+        block = _section_after_heading(lines, ("dates needed", "dates required", "coverage dates"))
+        if block:
+            out["dates_needed"] = block
+
+    if not (out.get("standard_schedule") or "").strip():
+        # Avoid bare "schedule" — it often grabs the next non-label line (e.g. a person's name).
+        block = _section_after_heading(
+            lines,
+            ("standard schedule", "shift hours", "hours", "weekly hours"),
+        )
+        if block:
+            out["standard_schedule"] = block
+
+
+def _is_plausible_schedule_text(s: str) -> bool:
+    """True if text looks like hours/days, not a person name or stray label."""
+    t = (s or "").strip()
+    if not t:
+        return False
+    low = t.lower()
+    if re.search(r"\d", t):
+        return True
+    if re.search(r"\b(am|pm|a\.m\.|p\.m\.)\b", low):
+        return True
+    if re.search(
+        r"\b(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        low,
+    ):
+        return True
+    if "hour" in low or "shift" in low:
+        return True
+    return False
+
+
+def _sanitize_standard_schedule(out: dict) -> None:
+    ss = (out.get("standard_schedule") or "").strip()
+    if ss and not _is_plausible_schedule_text(ss):
+        out["standard_schedule"] = ""
+
+
+def _normalize_state_code(state: str) -> str:
+    """
+    Strip parenthetical qualifiers, e.g. ``IL (Rogers Park)`` → ``IL``, ``TX (NW Crossing)`` → ``TX``.
+    """
+    s = (state or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"\s*\([^)]*\)", "", s)
+    return s.strip()
+
+
+_SINGLE_COUNT_SUPPORT_STAFF = re.compile(r"^\s*(\d+)\s*\.?\s*$")
+
+
+def _normalize_support_staff(text: str) -> str:
+    """If value is only a number (optional trailing period), append `` team members``."""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    m = _SINGLE_COUNT_SUPPORT_STAFF.match(s)
+    if m:
+        return f"{int(m.group(1))} team members"
+    return s
+
+
+def _collapse_whitespace(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).strip()
+
+
+def _city_appears_in_street(street: str, city: str) -> bool:
+    if not city or not street:
+        return False
+    return city.lower() in street.lower()
+
+
+def _state_appears_in_street(street: str, state: str) -> bool:
+    """True if ``state`` appears as a token (2-letter US style), not as substring of a word."""
+    if not state or not street:
+        return False
+    st = state.strip().upper()
+    if not st:
+        return False
+    return bool(
+        re.search(rf"(?:^|[\s,]){re.escape(st)}(?:$|[\s,\.])", street.upper())
+    )
+
+
+def _compose_full_address_line(out: dict) -> None:
+    """
+    Build one ``address_line``: street from ``Address:`` plus city/state when missing.
+    If the street segment already includes city and state tokens, keep it (whitespace-normalized only).
+    """
+    street = _collapse_whitespace(out.get("address_line") or "")
+    city = (out.get("city") or "").strip()
+    state = (out.get("state") or "").strip()
+    if not street and not city and not state:
+        out["address_line"] = ""
+        return
+    if not street:
+        if city and state:
+            out["address_line"] = f"{city}, {state}"
+        else:
+            out["address_line"] = city or state
+        return
+    has_c = _city_appears_in_street(street, city)
+    has_s = _state_appears_in_street(street, state)
+    if has_c and has_s:
+        out["address_line"] = street
+    elif not has_c and city and state:
+        out["address_line"] = f"{street}, {city}, {state}"
+    elif not has_s and state:
+        out["address_line"] = f"{street}, {state}"
+    elif not has_c and city:
+        out["address_line"] = f"{street}, {city}"
+    else:
+        out["address_line"] = street
+
+
+def _normalize_city_display(city: str) -> str:
+    """Title-case city for display (e.g. all-caps Kimedics labels → ``Los Lunas``)."""
+    s = _collapse_whitespace(city)
+    if not s:
+        return ""
+    return s.title()
+
+
+def _finalize_field_normalizations(out: dict) -> None:
+    """Post-parse cleanup for city, state, and support_staff."""
+    c = (out.get("city") or "").strip()
+    if c:
+        out["city"] = _normalize_city_display(c)
+    st = (out.get("state") or "").strip()
+    if st:
+        out["state"] = _normalize_state_code(st)
+    ss = (out.get("support_staff") or "").strip()
+    if ss:
+        out["support_staff"] = _normalize_support_staff(ss)
+
+
+def _normalize_key(key: str) -> str:
+    key = (key or "").strip()
+    if key in LABEL_TO_COLUMN:
+        col = LABEL_TO_COLUMN[key]
+        if col == "_skip":
+            return "_skip"
+        return col
+    return ""
+
+
+def _extract_practice_value_from_description(desc: str) -> str:
+    """
+    Kimedics often repeats the practice line in the description (``Facility:`` or a standalone
+    ``#### - City, ST`` line) when the header omits it (e.g. line 3 is ``Job Title``).
+    """
+    d = (desc or "").strip()
+    if not d:
+        return ""
+    m = re.search(r"(?im)^Facility\s*:\s*(.+)$", d)
+    if m:
+        return m.group(1).strip()
+    for ln in d.splitlines()[:40]:
+        t = ln.strip()
+        if not t:
+            continue
+        # Skip ISO / numeric date-only lines so we do not treat them as practice ids.
+        if re.match(r"^\d{4}-\d{2}-\d{2}\b", t) or re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}\b", t):
+            continue
+        # Office id + location: "4361 - Rosenberg, TX" (digit chunk then hyphen; rest has letters).
+        if re.match(r"^\d{3,5}\s*-\s*.+", t) and re.search(r"[A-Za-z]", t):
+            return t
+    return ""
+
+
+def _backfill_practice_value(out: dict, main_block: str) -> None:
+    if (out.get("practice_value") or "").strip():
+        return
+    v = _extract_practice_value_from_description(out.get("description_full_text") or "")
+    if v:
+        out["practice_value"] = v
+        return
+    lines = [ln.strip() for ln in (main_block or "").splitlines()]
+    for i, ln in enumerate(lines):
+        if ln.lower() != "practice":
+            continue
+        if i + 1 >= len(lines):
+            break
+        nxt = lines[i + 1].strip()
+        if nxt and not _normalize_key(nxt):
+            out["practice_value"] = nxt
+            return
+
+
+def repair_flat_jobpost_text_missing_posted_date(flat_text: str, posted_date: str | None) -> str:
+    """
+    Kimedics job UI often lays out metadata in two columns. Playwright's ``inner_text()`` on
+    ``.sections__container`` lists the *label* column first (``Posted Date`` then ``Posting Org``)
+    while the posted date value lives in the other column—commonly an ``<input>``—so the
+    flattened text has **no** line between those labels and ``parse_job_content_txt`` leaves
+    ``posted_date`` empty.
+
+    When the browser exposes a real posted date (see ``extract_posted_date_from_kimedics_page``),
+    splice it between ``Posted Date`` and ``Posting Org`` so the alternating key/value parser works.
+    """
+    pd = (posted_date or "").strip()
+    if not pd or not (flat_text or "").strip():
+        return flat_text or ""
+    t = (flat_text or "").replace("\r\n", "\n")
+    for needle in ("Posted Date\nPosting Org", "Posted Date\n\nPosting Org"):
+        if needle in t:
+            return t.replace(needle, f"Posted Date\n{pd}\nPosting Org", 1)
+    return flat_text
+
+
+def parse_job_content_txt(text: str) -> dict:
+    """
+    Parse raw job post text into a single row dict with keys in JOB_CONTENT_COLUMNS.
+    Never raises: missing/malformed data yields empty strings.
+    """
+    out = {c: "" for c in JOB_CONTENT_COLUMNS}
+    if not (text or "").strip():
+        return out
+
+    # Split description block
+    desc_marker = "--- Description (full text) ---"
+    parts = text.split(desc_marker, 1)
+    main_block = (parts[0] or "").strip()
+    out["description_full_text"] = (parts[1] or "").strip() if len(parts) > 1 else ""
+
+    lines = [ln.strip() for ln in main_block.splitlines()]
+    if not lines:
+        return out
+
+    # First line: title and job_id
+    out["title_line"] = lines[0]
+    m = re.search(r"#(\d+)", lines[0])
+    if m:
+        out["job_id"] = m.group(1)
+
+    if len(lines) >= 2:
+        out["location_line"] = lines[1]
+    # Line 2 is "Practice"; line 3 may be practice value (e.g. "6313 - Cheektowaga, NY") or missing (19476 has "Job Title" here)
+    start_i = 4
+    if len(lines) >= 4:
+        if _normalize_key(lines[3]):
+            # Line 3 is a known label (e.g. "Job Title") — practice value missing, start key-value from 3
+            out["practice_value"] = ""
+            start_i = 3
+        else:
+            out["practice_value"] = lines[3]
+
+    # From start_i: alternating key, value. If the "value" is itself a known label, treat current key's value as "" and use that line as next key.
+    i = start_i
+    while i + 1 < len(lines):
+        key = lines[i]
+        value = lines[i + 1]
+        col = _normalize_key(key)
+        if col and col != "_skip" and col in out:
+            # If value is a known label (e.g. "Provider start date" after "Other"), store empty for this key
+            if _normalize_key(value):
+                out[col] = ""
+            else:
+                out[col] = value
+        if _normalize_key(value):
+            i += 1  # value is next key
+        else:
+            i += 2
+
+    _backfill_practice_value(out, main_block)
+
+    city, st = _parse_city_state(out.get("practice_value") or "")
+    if not city and not st:
+        city, st = _parse_city_state(out.get("location_line") or "")
+    out["city"] = city
+    out["state"] = st
+    # Description labels (e.g. City:/State:/Dates:) override header-derived city/state when present.
+    labeled = _extract_labeled_description_fields(out.get("description_full_text") or "")
+    for key, val in labeled.items():
+        v = (val or "").strip()
+        if v:
+            out[key] = v
+    out["insight"] = _extract_insight_lines(out.get("description_full_text") or "")
+    for k in (
+        "dates_needed",
+        "standard_schedule",
+        "required_procedures",
+        "additional_requirements",
+        "support_staff",
+    ):
+        if not out.get(k):
+            out[k] = ""
+
+    _fill_from_description_blocks(out)
+    _sanitize_standard_schedule(out)
+    _finalize_field_normalizations(out)
+    _compose_full_address_line(out)
+
+    return out
+
+
+def parse_job_content_file(path: Union[Path, str]) -> dict:
+    """Read a .txt or .csv path and return parsed row (for .txt). For .csv, read first data row and return as dict if needed; else treat as txt."""
+    path = Path(path)
+    if not path.exists():
+        return parse_job_content_txt("")
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return parse_job_content_txt(text)
+
+
+def cleaned_row_to_flat_dict(row: dict) -> dict:
+    """Ensure row has exactly JOB_CONTENT_COLUMNS with string values."""
+    flat = {}
+    for col in JOB_CONTENT_COLUMNS:
+        flat[col] = str((row.get(col) or "")).strip()
+    return flat

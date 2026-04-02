@@ -1,6 +1,25 @@
-/__pycache__/
-.venv/
+# Environment and secrets
 .env
-src/__pycache__/
+
+# Virtual environment
+.venv/
+
+# Local data outputs (CSVs, scraped text, exports)
 data/
+
+# OS
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Pytest
+.pytest_cache/
+
+# Streamlit app (separate deployment, not part of Modal pipeline)
+prox_streamlit_app/
