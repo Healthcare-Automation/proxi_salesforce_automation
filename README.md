@@ -2,7 +2,7 @@
 
 Automations for **Kimedics job emails** (Gmail) and **Salesforce jobs** (REST API). All scripts are read-only where possible; Salesforce uses a read-only pull.
 
-**Where things live:** [docs/project_layout.md](docs/project_layout.md) (production vs local vs tests). **Salesforce → Supabase field rules & levers:** [docs/salesforce_job_push_rules.md](docs/salesforce_job_push_rules.md).
+**Engineering docs:** [docs/engineering/dev_guide.md](docs/engineering/dev_guide.md) · [docs/engineering/salesforce_job_push_rules.md](docs/engineering/salesforce_job_push_rules.md) · [docs/engineering/scrape_validation.md](docs/engineering/scrape_validation.md). **Stakeholder overview:** [docs/overview/client_overview.md](docs/overview/client_overview.md).
 
 ---
 
@@ -11,7 +11,9 @@ Automations for **Kimedics job emails** (Gmail) and **Salesforce jobs** (REST AP
 ```
 proxi_salesforce_automation/
 ├── .env
-├── docs/                   # Layout guide, Modal deploy, Salesforce field rules
+├── docs/
+│   ├── engineering/        # Dev guide, SF field rules, scrape validation
+│   └── overview/           # Stakeholder-facing overview
 ├── manual/                 # One-off notebooks (Supabase ↔ Salesforce, etc.)
 ├── tests/                  # Pytest + dev scrapers + explorer notebooks
 ├── data/                   # gitignored outputs (CSV, scraped .txt)
@@ -57,7 +59,7 @@ python src/local/local_run_scrape_gmail.py
 - **Schedule:** Every 30 minutes.
 - **Secrets:** Modal secret **salesforce-automation** (e.g. `GMAIL_APP_PASSWORD`, `DB_PASSWORD`, Kimedics creds for link scrape).
 
-**Deploy / run once:** see [docs/modal_deploy.md](docs/modal_deploy.md).
+**Deploy / run once:** see [docs/engineering/dev_guide.md](docs/engineering/dev_guide.md).
 
 ```bash
 modal deploy src/production/scrape_gmail_modal.py
@@ -191,7 +193,7 @@ Use a `.env` file in the **project root** (or export in the shell). `.env` is no
 | Scrape Kimedics emails → CSV | `python src/local/local_run_scrape_gmail.py` |
 | Incremental Gmail → Supabase | `python src/local/run_incremental.py` |
 | Scrape view_job_link content | `python src/local/scrape_link_content.py` (needs job_emails.csv) |
-| Deploy Modal Gmail job | `modal deploy src/production/scrape_gmail_modal.py` (see `docs/modal_deploy.md`) |
+| Deploy Modal Gmail job | `modal deploy src/production/scrape_gmail_modal.py` (see `docs/engineering/dev_guide.md`) |
 | Pull Salesforce jobs → CSV | `python src/local/pull_salesforce_jobs.py` |
 | Create one test Job__c (writes SF) | `python src/dev/create_test_job_salesforce.py --yes` |
 | Run scraping + Gmail tests | `pytest tests/ -v` |

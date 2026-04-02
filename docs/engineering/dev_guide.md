@@ -193,9 +193,12 @@ manual/
   triggers/                    ← notebooks for manual job create/update
 
 docs/
-  dev_guide.md                 ← this file
-  client_overview.md           ← non-technical stakeholder overview
-  salesforce_job_push_rules.md ← field mapping reference
+  engineering/
+    dev_guide.md                 ← this file
+    salesforce_job_push_rules.md ← field mapping reference
+    scrape_validation.md         ← scrape validation & alerting logic
+  overview/
+    client_overview.md           ← stakeholder-facing overview
 ```
 
 ---
