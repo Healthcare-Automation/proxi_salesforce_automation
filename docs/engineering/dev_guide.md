@@ -64,7 +64,7 @@ Modal dashboard → Apps → `salesforce-automation` → Logs.
 2. Dedup against Supabase `email_scrapes` (skip already-logged by `job_post_id` + date)
 3. Log new emails → `scrape_runs` + `email_scrapes`
 4. For each new email with a job link: Playwright → scrape the Kimedics job page → parse → write `job_content` + upsert `job_current`
-5. Resolve Salesforce `sf_job_id` + `sf_worksite_account_id` for touched jobs (practice match via SOQL)
+5. Resolve Salesforce `sf_job_id` + `sf_worksite_account_id` for touched jobs (practice match → AI fallback → unmapped)
 6. Patch blank Salesforce fields on already-mapped jobs (External ID, External Link, status, posted date)
 
 ---
@@ -168,7 +168,8 @@ src/
     gmail.py                    ← Gmail IMAP scrape + email parser
     playwright_job_scrape.py    ← Playwright orchestration for job pages
     job_content_parser.py       ← parse scraped HTML/text into structured fields
-    sf_job_supabase_resolve.py  ← practice-match Kimedics ↔ SF Job__c
+    sf_job_supabase_resolve.py  ← Kimedics ↔ SF Job__c resolver (cache → practice match → AI fallback)
+    sf_ai_matcher.py            ← OpenAI gpt-4o-mini fuzzy fallback for unmatched practice values
     sf_scrape_sync.py           ← patch blank SF fields after resolve
     sf_job_payload.py           ← build the SF REST payload for create/update
     sf_practice_key.py          ← normalize practice_value for matching
@@ -196,6 +197,63 @@ docs/
   client_overview.md           ← non-technical stakeholder overview
   salesforce_job_push_rules.md ← field mapping reference
 ```
+
+---
+
+## Salesforce ID resolution (`sf_job_id` + `sf_worksite_account_id`)
+
+Every scraped Kimedics job must be linked to a Salesforce `Job__c` record (`sf_job_id`) and its associated worksite account (`sf_worksite_account_id`). The resolver runs automatically after each scrape and tries four strategies in order:
+
+### Resolution order
+
+| Step | Source | Condition | Notes |
+|---|---|---|---|
+| 1 | `job_current` cache | Both IDs already set | Fast path — no SF call needed |
+| 2 | `job_content` history | Any previous scrape for this `job_id` has an ID | Carry-forward from older scrapes |
+| 3 | Deterministic practice match | `practice_key(practice_value)` == `practice_key(Job_Client_Job_Id__c)` and exactly 1 hit | Normalizes Unicode dashes, case, punctuation |
+| 4 | **AI fuzzy match** | Step 3 found 0 hits | `gpt-4o-mini` via `sf_ai_matcher.py` (see below) |
+| — | `mapping_no_match` | All above failed | Job flagged as unmapped; won't be pushed to SF |
+
+### AI fuzzy matching (`sf_ai_matcher.py`)
+
+The deterministic `practice_key` normalizer handles most differences (dashes, case, punctuation) but fails on two recurring patterns:
+
+| Pattern | Kimedics example | Salesforce example |
+|---|---|---|
+| Apostrophe in city name | `3185 - St. Joseph, MO` | `3185- St. Joseph's, MO` |
+| Extra location suffix | `4140 - Suffolk, VA` | `4140 - Suffolk, VA- Downtown` |
+
+The AI fallback resolves these without any manual intervention:
+
+1. **Extract facility number** — pulls the leading 3–5 digit ID from the Kimedics `practice_value` (e.g. `3185` from `"3185 - St. Joseph, MO"`). This number is the strongest cross-system identifier.
+2. **Pre-filter SF candidates** — scans all ~4400 SF `Job__c` records and keeps only those whose `Job_Client_Job_Id__c` starts with the same facility number. Typically 1–5 records. If 0, OpenAI is never called.
+3. **Ask `gpt-4o-mini`** — sends the Kimedics value and the small candidate list. Model answers with `{"match": "...", "confidence": "high"|"medium"|"low"}`.
+4. **Safety check** — the returned value must be present in the pre-filtered candidate list (prevents hallucinated answers). Only `high` or `medium` confidence is acted on.
+
+**Cost**: ~$0.00003 per call (150–250 input tokens on `gpt-4o-mini`). Only fires on misses, so real-world cost is near zero.
+
+**Requires** `OPENAI_API_KEY` in the Modal secret `salesforce-automation` (already set).
+
+### Querying resolution outcomes
+
+```sql
+-- See every AI match that fired today
+SELECT job_id, payload->>'kimedics_practice' AS kimedics, payload->>'sf_matched_value' AS sf_match,
+       payload->>'confidence' AS confidence, created_at
+FROM job_event_log
+WHERE event_type = 'mapping_ai_match'
+ORDER BY created_at DESC;
+
+-- Jobs that are still unmatched (neither deterministic nor AI worked)
+SELECT job_id, payload->>'practice_raw' AS practice, payload->>'ai_attempted' AS ai_attempted
+FROM job_event_log
+WHERE event_type = 'mapping_no_match'
+ORDER BY created_at DESC;
+```
+
+### Manual notebook
+
+`manual/sf_kimedics_mapping/sf_job_worksite_resolve.ipynb` — run the full resolver (including AI fallback) against all `job_current` rows, inspect results, and apply to Supabase in one notebook.
 
 ---
 
@@ -233,7 +291,8 @@ ORDER BY created_at;
 | `sf_mapping_pull_failed` | SOQL query to Salesforce failed (payload has `error`) |
 | `mapping_cache_hit` | Both SF ids already on `job_current`; no lookup needed |
 | `mapping_ambiguous` | Multiple `Job__c` records matched the same practice key |
-| `mapping_no_match` | No Salesforce match found for this practice value |
+| `mapping_ai_match` | Deterministic match failed; AI fuzzy-matched the practice value (payload has `kimedics_practice`, `sf_matched_value`, `confidence`) |
+| `mapping_no_match` | No Salesforce match found — neither deterministic nor AI (payload has `ai_attempted` flag) |
 | `sf_ids_update` | SF ids written to Supabase (payload has `prev`/`next` diff) |
 | `sf_sync_skipped_no_mapping` | Scrape sync skipped — no `sf_job_id` on this job yet (resolver didn't find a match) |
 | `sf_scrape_fields_patched` | Fields patched on Salesforce successfully |
@@ -253,7 +312,14 @@ ORDER BY created_at;
 → Salesforce requires `Job_Ranking__c` on PATCH even when we're only updating other fields. Add it to `SCRAPE_SYNC_FIELD_ORDER` in `sf_scrape_sync.py` or make it optional in the SF org.
 
 **`mapping_no_match` when you know the job exists in SF**
-→ The practice key normalization might not be matching. Run `pull_salesforce_jobs.py --describe` to see `Job_Client_Job_Id__c` values live, compare with `practice_value` in Supabase `job_current`. Use `sf_practice_key.practice_key()` to normalize both and verify they collide.
+→ First check if the AI fallback was attempted (`ai_attempted: true` in the payload). If so, the facility number (e.g. `3185`) doesn't exist in Salesforce at all — the job may not be created there yet.
+
+If `ai_attempted: false`, the `practice_value` was blank — check the scrape for that job.
+
+For manual diagnosis: run `pull_salesforce_jobs.py` to see live `Job_Client_Job_Id__c` values, then compare with `practice_value` in `job_current`. Use `sf_practice_key.practice_key()` to normalize both and see if they should collide.
+
+**AI is returning `mapping_no_match` for a job you expect to match**
+→ The pre-filter in `sf_ai_matcher.py` requires the Kimedics and SF values to share the same leading facility number (e.g. both start with `3185`). If the numbers differ between systems, AI won't be triggered. Check `Job_Client_Job_Id__c` in Salesforce vs `practice_value` in `job_current` to confirm.
 
 **Playwright login failing**
 → Check `KIMEDICS_EMAIL` / `KIMEDICS_PASSWORD` in `.env`. Try `tests/scrape_kimedics_batch_playwright.py` locally with `--pg-schema staging` to see the raw browser output.
