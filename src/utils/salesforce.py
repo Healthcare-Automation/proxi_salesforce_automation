@@ -555,14 +555,17 @@ def describe_sobject(
 
 def sobject_queryable_fields(describe_response: dict) -> list[str]:
     """
-    Return field names safe to put in SOQL SELECT (queryable + not compound address/location).
+    Return field names safe to put in SOQL SELECT.
 
-    Non-queryable fields must not appear in SELECT — Salesforce rejects the whole query.
+    Excludes compound address/location types (always non-queryable in SOQL).
+    The field-level ``queryable`` attribute is not returned by all API versions,
+    so we default to True when absent and only exclude if explicitly False.
     """
     return [
         f["name"]
         for f in describe_response.get("fields", [])
-        if f.get("queryable") is True and f.get("type") not in ("address", "location")
+        if f.get("queryable", True) is not False
+        and f.get("type") not in ("address", "location")
     ]
 
 

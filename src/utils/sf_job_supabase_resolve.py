@@ -183,6 +183,56 @@ def resolve_sf_ids_for_job_ids(
             )
             continue
 
+        # ── AI fallback (only when deterministic matching found 0 hits) ──────
+        # Triggered for cases like apostrophes ("St. Joseph" vs "St. Joseph's")
+        # or extra suffixes ("Suffolk, VA" vs "Suffolk, VA- Downtown").
+        ai_result = None
+        if practice_raw:
+            try:
+                from utils.sf_ai_matcher import ai_match_practice
+                ai_result = ai_match_practice(practice_raw, sf_jobs)
+            except Exception as ai_exc:
+                print(f"[resolve] AI match error for job {jid}: {ai_exc}")
+
+        if ai_result is not None:
+            wid = (
+                sf_by_id.get(ai_result.matched_sf_job_id, {})
+                .get("Job_Worksite_Location_1__c") or ""
+            ).strip() or None
+            j_final = j or ai_result.matched_sf_job_id
+            w_final = w or wid
+            update_sf_ids_for_job(
+                conn,
+                job_id=jid,
+                sf_job_id=j_final or None,
+                sf_worksite_account_id=w_final or None,
+                source="sf_ai_match",
+                mapping_status="resolved",
+                mapping_detail=(
+                    f"AI matched (confidence={ai_result.confidence}): "
+                    f"{practice_raw!r} → {ai_result.matched_sf_value!r}"
+                ),
+                run_id=run_id,
+                schema=schema,
+            )
+            log_job_event(
+                conn,
+                job_id=jid,
+                event_type="mapping_ai_match",
+                schema=schema,
+                run_id=run_id,
+                payload={
+                    "kimedics_practice": practice_raw[:200] if practice_raw else None,
+                    "sf_matched_value":  ai_result.matched_sf_value,
+                    "sf_job_id":         ai_result.matched_sf_job_id,
+                    "confidence":        ai_result.confidence,
+                    "candidates_seen":   ai_result.candidates_seen,
+                },
+            )
+            updated += 1
+            continue
+
+        # True no-match — deterministic and AI both failed.
         log_job_event(
             conn,
             job_id=jid,
@@ -194,6 +244,7 @@ def resolve_sf_ids_for_job_ids(
                 "practice_raw": practice_raw[:500] if practice_raw else None,
                 "practice_hits": len(hits) if p else 0,
                 "sf_jobs_indexed": len(sf_jobs),
+                "ai_attempted": bool(practice_raw),
             },
         )
 

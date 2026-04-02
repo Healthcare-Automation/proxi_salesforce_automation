@@ -15,7 +15,6 @@ proxi_salesforce_automation/
 ├── manual/                 # One-off notebooks (Supabase ↔ Salesforce, etc.)
 ├── tests/                  # Pytest + dev scrapers + explorer notebooks
 ├── data/                   # gitignored outputs (CSV, scraped .txt)
-├── prox_streamlit_app/     # Optional monitoring UI
 └── src/
     ├── production/         # Modal scheduled job (only deploy entrypoints)
     ├── local/              # CLI: Gmail, incremental, staging repair, HTTP link scrape, SF CSV pull
