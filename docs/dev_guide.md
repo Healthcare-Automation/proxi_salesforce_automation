@@ -235,6 +235,7 @@ ORDER BY created_at;
 | `mapping_ambiguous` | Multiple `Job__c` records matched the same practice key |
 | `mapping_no_match` | No Salesforce match found for this practice value |
 | `sf_ids_update` | SF ids written to Supabase (payload has `prev`/`next` diff) |
+| `sf_sync_skipped_no_mapping` | Scrape sync skipped — no `sf_job_id` on this job yet (resolver didn't find a match) |
 | `sf_scrape_fields_patched` | Fields patched on Salesforce successfully |
 | `sf_scrape_fields_error` | Salesforce PATCH rejected (payload has `error` + attempted fields) |
 

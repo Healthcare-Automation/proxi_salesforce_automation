@@ -252,6 +252,8 @@ def sync_missing_scrape_fields_for_job_ids(
     if not ids or conn is None:
         return (0, 0)
 
+    from utils.supabase_db import log_job_event
+
     rows = get_job_current(conn, job_ids=ids, limit=None, schema=schema)
     by_job = {str(r.get("job_id") or "").strip(): r for r in rows}
     attempted = 0
@@ -259,6 +261,14 @@ def sync_missing_scrape_fields_for_job_ids(
     for jid in ids:
         row = by_job.get(jid) or {}
         if not (row.get("sf_job_id") or "").strip():
+            log_job_event(
+                conn,
+                job_id=jid,
+                event_type="sf_sync_skipped_no_mapping",
+                run_id=run_id,
+                schema=schema,
+                payload={"reason": "no sf_job_id on job_current"},
+            )
             continue
         attempted += 1
         r = sync_missing_scrape_fields_to_salesforce(
