@@ -2,7 +2,7 @@
 After a Kimedics scrape, push a small set of Job__c fields to Salesforce **only when** we have
 ``sf_job_id`` and the Salesforce field is currently blank (do not overwrite existing SF values).
 
-Fields: External Job ID / Link (standard custom names) + org-specific test fields.
+Fields: External Job ID / Link, Job_Ranking__c (default ``B`` when SF blank), + org-specific test fields.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ SF_FIELD_TEST_POSTED_DATE = "test_posted_date__c"
 SCRAPE_SYNC_FIELD_ORDER: tuple[str, ...] = (
     "External_Job_ID__c",
     "External_Job_Link__c",
+    "Job_Ranking__c",
     SF_FIELD_TEST_STATUS,
     SF_FIELD_TEST_POSTED_DATE,
 )
@@ -64,6 +65,8 @@ def desired_scrape_sync_fields_from_job_row(row: dict | None) -> dict[str, Any]:
     link = external_job_link_from_job_row(r)
     if link:
         out["External_Job_Link__c"] = link
+    # SF org requires Job_Ranking__c on PATCH; default when blank matches full payload rules.
+    out["Job_Ranking__c"] = str(r.get("job_ranking") or "B").strip() or "B"
     st = (r.get("status") or "").strip()
     if st:
         out[SF_FIELD_TEST_STATUS] = st

@@ -21,5 +21,16 @@ def test_desired_scrape_sync_fields():
     d = desired_scrape_sync_fields_from_job_row(row)
     assert d["External_Job_ID__c"] == "19448"
     assert "portal.kimedics.com" in (d.get("External_Job_Link__c") or "")
+    assert d["Job_Ranking__c"] == "B"
     assert d[SF_FIELD_TEST_STATUS] == "Open"
     assert d[SF_FIELD_TEST_POSTED_DATE] == "2025-01-15"
+
+
+def test_desired_scrape_sync_fields_job_ranking_from_row():
+    row = {
+        "job_id": "1",
+        "view_job_link": "https://example.com/x",
+        "job_ranking": "A",
+    }
+    d = desired_scrape_sync_fields_from_job_row(row)
+    assert d["Job_Ranking__c"] == "A"
