@@ -12,6 +12,7 @@ import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, Union
 
 # Optional: only use if psycopg2 is available
 try:
@@ -665,7 +666,7 @@ def truncate_email_scrape_tables(
     conn.commit()
 
 
-def log_run_start(conn, run_type: str, columns: list[str], *, schema: str = "public") -> int | None:
+def log_run_start(conn, run_type: str, columns: list[str], *, schema: str = "public") -> Optional[int]:
     """Insert a scrape run (started). Returns run id or None."""
     if conn is None:
         return None
@@ -705,10 +706,10 @@ def log_job_event(
     *,
     job_id: str,
     event_type: str,
-    payload: dict | None = None,
-    run_id: int | None = None,
+    payload: Optional[dict] = None,
+    run_id: Optional[int] = None,
     schema: str = "public",
-) -> int | None:
+) -> Optional[int]:
     """
     Append one audit event for a job_id.
 
@@ -743,7 +744,7 @@ def log_job_event(
     return int(row[0]) if row else None
 
 
-def _diff_dict_keys(prev: dict | None, nxt: dict | None) -> list[str]:
+def _diff_dict_keys(prev: Optional[dict], nxt: Optional[dict]) -> list[str]:
     """Return keys whose values differ (shallow compare)."""
     a = prev or {}
     b = nxt or {}
@@ -790,7 +791,7 @@ def get_existing_email_keys(
     return out
 
 
-def _normalize_email_date_key(date_iso: str | None) -> str:
+def _normalize_email_date_key(date_iso: Optional[str]) -> str:
     """Normalize email date to YYYY-MM-DDTHH:MM:SS+00:00 for exact matching."""
     if not date_iso or not isinstance(date_iso, str):
         return ""
@@ -848,7 +849,7 @@ def sync_email_scrape_locations_from_parsed(
     schema = _validate_pg_identifier(schema, "schema")
     es = _tbl(schema, "email_scrapes")
     seen: set[tuple[str, str]] = set()
-    updates: list[tuple[str, str, str | None]] = []
+    updates: list[tuple[str, str, Optional[str]]] = []
     skipped_no_job_or_date = 0
 
     for r in parsed_rows:
@@ -960,8 +961,8 @@ def log_email_scrapes(
 
 
 def find_email_scrape_id(
-    conn, job_post_id: str, date_iso: str | None, *, schema: str = "public"
-) -> int | None:
+    conn, job_post_id: str, date_iso: Optional[str], *, schema: str = "public"
+) -> Optional[int]:
     """Find email_scrapes.id by job_post_id and exact email date (full ISO) for 1:1 mapping."""
     if conn is None or not job_post_id or not HAS_PSYCOPG2 or pg_sql is None:
         return None
@@ -1006,7 +1007,7 @@ def fetch_email_scrapes_with_job_links(
     conn,
     *,
     schema: str = "public",
-    limit: int | None = None,
+    limit: Optional[int] = None,
     only_without_job_content: bool = False,
     only_sparse_job_content: bool = False,
     min_description_length: int = 80,
@@ -1093,7 +1094,7 @@ def fetch_email_scrapes_with_job_links(
 
 def fetch_view_job_link_for_email_scrape(
     conn, email_scrape_id: int, *, schema: str = "public"
-) -> str | None:
+) -> Optional[str]:
     """Return view_job_link from email_scrapes for this id."""
     if conn is None or not email_scrape_id or not HAS_PSYCOPG2 or pg_sql is None:
         return None
@@ -1111,7 +1112,7 @@ def fetch_view_job_link_for_email_scrape(
         return s if s else None
 
 
-def _txt(cleaned: dict, key: str) -> str | None:
+def _txt(cleaned: dict, key: str) -> Optional[str]:
     v = cleaned.get(key)
     if v is None:
         return None
@@ -1119,7 +1120,7 @@ def _txt(cleaned: dict, key: str) -> str | None:
     return s if s else None
 
 
-def _types_of_cases(cleaned: dict) -> str | None:
+def _types_of_cases(cleaned: dict) -> Optional[str]:
     """Persisted column: required_procedures and additional_requirements joined with newline."""
     rp = _txt(cleaned, "required_procedures")
     ar = _txt(cleaned, "additional_requirements")
@@ -1132,14 +1133,14 @@ def log_job_content(
     conn,
     run_id: int,
     job_post_id: str,
-    email_received_date: str | None,
+    email_received_date: Optional[str],
     cleaned: dict,
-    email_scrape_id: int | None = None,
+    email_scrape_id: Optional[int] = None,
     *,
     schema: str = "public",
-    sf_lookup_cache: dict | None = None,
-    view_job_link: str | None = None,
-) -> int | None:
+    sf_lookup_cache: Optional[dict] = None,
+    view_job_link: Optional[str] = None,
+) -> Optional[int]:
     """Insert or update one job_content row. One row per email_scrape_id (1:1 with email_scrapes)."""
     if conn is None or run_id is None or not HAS_PSYCOPG2 or pg_sql is None:
         return None
@@ -1288,7 +1289,7 @@ def _upsert_job_current(
     cleaned: dict,
     *,
     schema: str = "public",
-    view_job_link: str | None = None,
+    view_job_link: Optional[str] = None,
 ) -> None:
     """Keep job_current as the latest state per job_id. Called after each job_content insert/update."""
     if conn is None or not HAS_PSYCOPG2 or pg_sql is None:
@@ -1381,9 +1382,9 @@ def _upsert_job_current(
 def get_job_content(
     conn,
     *,
-    limit: int | None = 500,
+    limit: Optional[int] = 500,
     schema: str = "public",
-    job_ids: list[str] | None = None,
+    job_ids: Optional[list[str]] = None,
 ) -> list[dict]:
     """
     Read job_content rows (historical / per-email scrape). Optional filter by Kimedics job_id.
@@ -1428,9 +1429,9 @@ def get_job_content(
 
 def get_job_current(
     conn,
-    job_ids: list[str] | None = None,
+    job_ids: Optional[list[str]] = None,
     *,
-    limit: int | None = 1000,
+    limit: Optional[int] = 1000,
     schema: str = "public",
 ) -> list[dict]:
     """
@@ -1477,7 +1478,7 @@ def get_job_current(
 
 def fetch_job_current_for_salesforce_push(
     conn, job_id: str, *, schema: str = "public"
-) -> dict | None:
+) -> Optional[dict]:
     """
     One ``job_current`` row by primary key ``job_id``, as a mutable dict, with
     ``enrich_cleaned_row_salesforce_fields`` applied (SF account / worksite lookups).
@@ -1522,7 +1523,7 @@ def load_job_current_row_for_salesforce(job_id: str, *, schema: str = "public") 
 
 def fetch_sf_reference_account_id(
     conn, reference_key: str, *, schema: str = "public"
-) -> str | None:
+) -> Optional[str]:
     """Return salesforce_account_id for a row in sf_account_reference (e.g. primary_aspen_dental_management)."""
     if conn is None or not HAS_PSYCOPG2 or pg_sql is None:
         return None
@@ -1543,12 +1544,12 @@ def update_sf_ids_for_job(
     conn,
     *,
     job_id: str,
-    sf_job_id: str | None = None,
-    sf_worksite_account_id: str | None = None,
-    source: str | None = None,
-    mapping_status: str | None = None,
-    mapping_detail: str | None = None,
-    run_id: int | None = None,
+    sf_job_id: Optional[str] = None,
+    sf_worksite_account_id: Optional[str] = None,
+    source: Optional[str] = None,
+    mapping_status: Optional[str] = None,
+    mapping_detail: Optional[str] = None,
+    run_id: Optional[int] = None,
     schema: str = "public",
 ) -> tuple[int, int]:
     """

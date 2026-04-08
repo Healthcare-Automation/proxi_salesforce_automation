@@ -23,7 +23,7 @@ import textwrap
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Any, Sequence
+from typing import Any, Sequence, Optional
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -94,7 +94,7 @@ def _send(
     subject: str,
     html:    str,
     text:    str = "",
-    recipients: Sequence[str] | None = None,
+    recipients: Optional[Sequence[str]] = None,
 ) -> bool:
     """Send an email. Returns True on success. Never raises."""
     sender      = os.environ.get("GMAIL_EMAIL", _SENDER_DEFAULT)
@@ -130,8 +130,8 @@ def _send(
 def send_scrape_alert(
     job_post_id:   str,
     issues:        list,                 # list[ValidationIssue] from scrape_validator
-    cleaned:       dict | None = None,
-    view_job_link: str | None  = None,
+    cleaned:       Optional[dict] = None,
+    view_job_link: Optional[str] = None,
 ) -> bool:
     """
     Send an immediate alert email when a scraped job fails validation.

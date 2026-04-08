@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import sys
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from utils.job_description_proxi_template import build_proxi_job_posting_description
 from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE, extract_pay_range_from_description
@@ -49,7 +49,7 @@ SF_PUSH_STATIC_DEFAULTS: dict[str, str] = {
 }
 
 
-def _truncate_external_job_link(url: str | None) -> str | None:
+def _truncate_external_job_link(url: Optional[str]) -> Optional[str]:
     s = (url or "").strip()
     if not s:
         return None
@@ -63,7 +63,7 @@ def _truncate_external_job_link(url: str | None) -> str | None:
     return s[:EXTERNAL_JOB_LINK_MAX_LEN]
 
 
-def external_job_link_from_job_row(row: dict | None) -> str | None:
+def external_job_link_from_job_row(row: Optional[dict]) -> Optional[str]:
     """
     Value for ``External_Job_Link__c``: canonical Kimedics portal URL when ``job_id`` is numeric
     (e.g. ``https://portal.kimedics.com/app/workspace/job-posts/19448``); otherwise truncated
@@ -78,7 +78,7 @@ def external_job_link_from_job_row(row: dict | None) -> str | None:
     return _truncate_external_job_link(r.get("view_job_link"))
 
 
-def _truncate_external_job_id(job_id: str | None) -> str | None:
+def _truncate_external_job_id(job_id: Optional[str]) -> Optional[str]:
     if not job_id:
         return None
     s = str(job_id).strip()
@@ -89,13 +89,13 @@ def _truncate_external_job_id(job_id: str | None) -> str | None:
     return s[:EXTERNAL_JOB_ID_MAX_LEN]
 
 
-def external_job_id_match_key(job_id: str | None) -> str | None:
+def external_job_id_match_key(job_id: Optional[str]) -> Optional[str]:
     """Lowercase truncated key for matching Kimedics ``job_id`` ↔ ``External_Job_ID__c``."""
     t = _truncate_external_job_id(job_id)
     return (t or "").strip().lower() or None
 
 
-def _mdy_to_iso(d: str | None) -> str | None:
+def _mdy_to_iso(d: Optional[str]) -> Optional[str]:
     if not d or not isinstance(d, str):
         return None
     try:
@@ -157,9 +157,9 @@ def job_row_to_salesforce_fields(
     row: dict,
     *,
     use_canonical_description: bool = True,
-    primary_account_id: str | None = None,
-    worksite_account_id: str | None = None,
-    description_use_html: bool | None = None,
+    primary_account_id: Optional[str] = None,
+    worksite_account_id: Optional[str] = None,
+    description_use_html: Optional[bool] = None,
 ) -> dict[str, Any]:
     """
     Build a Job__c field dict from one job row (``job_current`` shape).
@@ -199,7 +199,7 @@ def job_row_to_salesforce_fields(
         "Job_Status__c": (r.get("status") or "").strip() or None,
         "Job_State__c": state_sf or None,
         "Job_City__c": city or None,
-        "Job_Insight__c": (r.get("insight") or "").strip() or None,
+        "Insight__c": (r.get("insight") or "").strip() or None,
         "Job_Recruitment_Level__c": (r.get("priority") or "").strip() or None,
         "Job_Facility_Display__c": (r.get("practice_value") or "").strip() or None,
         "Job_Street_Address__c": (r.get("address_line") or "").strip() or None,
@@ -224,9 +224,9 @@ def prepare_payload_for_write(
     *,
     use_canonical_description: bool = True,
     for_update: bool = False,
-    primary_account_id: str | None = None,
-    worksite_account_id: str | None = None,
-    description_use_html: bool | None = None,
+    primary_account_id: Optional[str] = None,
+    worksite_account_id: Optional[str] = None,
+    description_use_html: Optional[bool] = None,
 ) -> dict[str, Any]:
     """
     Full row → Salesforce fields → picklist coercion → createable/updateable filter.

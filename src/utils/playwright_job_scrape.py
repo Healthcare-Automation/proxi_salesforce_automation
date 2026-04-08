@@ -8,6 +8,7 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from utils.job_content_parser import repair_flat_jobpost_text_missing_posted_date
 from utils.sf_job_payload import KIMEDICS_PORTAL_JOB_POST_URL_PREFIX
@@ -140,7 +141,7 @@ def augment_kimedics_job_body_text(page, body_text: str) -> str:
     return repair_flat_jobpost_text_missing_posted_date(body_text, posted or None)
 
 
-def canonical_kimedics_url(job_post_id: str | None) -> str | None:
+def canonical_kimedics_url(job_post_id: Optional[str]) -> Optional[str]:
     """Stable portal URL when the job_post_id is numeric (e.g. ``19531``)."""
     jid = (job_post_id or "").strip()
     if jid and jid.isdigit():
@@ -241,7 +242,7 @@ def _navigate_and_login_if_needed(
     email: str,
     password: str,
     *,
-    final_url: str | None = None,
+    final_url: Optional[str] = None,
 ) -> None:
     """
     Navigate to ``url`` using ``networkidle``, detect login vs job content, handle login

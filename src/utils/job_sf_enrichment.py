@@ -8,7 +8,7 @@ Important:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from utils.sf_push_defaults import (
     SF_REFERENCE_KEY_PRIMARY,
@@ -21,7 +21,7 @@ def enrich_cleaned_row_salesforce_fields(
     cleaned: dict,
     *,
     schema: str = "public",
-    cache: dict[str, Any] | None = None,
+    cache: Optional[dict[str, Any]] = None,
 ) -> None:
     """
     Mutates ``cleaned`` in place: sets sf_primary_account_id, sf_worksite_account_id,

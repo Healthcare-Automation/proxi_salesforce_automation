@@ -58,7 +58,7 @@ Parsed from Kimedics pages into `job_content` / `job_current` (see `utils/job_co
 | `status` | `Job_Status__c` | |
 | `city` | `Job_City__c` | Title-cased in parser |
 | `state` | `Job_State__c` | **Full state name** at push (TX → Texas): `us_state_expand.state_name_for_salesforce` |
-| `insight` | `Job_Insight__c` | Parser: lines starting with `*` |
+| `insight` | `Insight__c` | Parser: lines starting with `*` |
 | `dates_needed` | `Job_Dates_Needed__c` | Heuristic + optional AI (`utils/job_content_ai.py`) |
 | `standard_schedule` | `Job_Standard_Schedule__c` | Heuristic + optional AI |
 | `types_of_cases` | `Job_Types_of_Cases__c` | Join of “Required procedures” + “Additional requirements” in parser; AI can refine |

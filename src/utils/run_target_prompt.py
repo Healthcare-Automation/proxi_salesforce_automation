@@ -10,6 +10,7 @@ Modal production does not import this module.
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 PRODUCTION_INPUT = "PRODUCTION"
 STAGING_INPUT = "STAGING"
@@ -55,7 +56,7 @@ def prompt_pg_schema(*, staging_only: bool = False) -> str:
 
 
 def resolve_pg_schema(
-    pg_schema: str | None,
+    pg_schema: Optional[str],
     *,
     production_ok: bool = False,
     staging_only: bool = False,

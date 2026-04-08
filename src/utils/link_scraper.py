@@ -39,7 +39,7 @@ All functions are pure and documented so you can trace every decision.
 import re
 import ssl
 from html.parser import HTMLParser
-from typing import Callable
+from typing import Callable, Optional, Union
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -95,7 +95,7 @@ _JS_LOCATION_RE = re.compile(
 )
 
 
-def _extract_meta_refresh_url(html: str) -> str | None:
+def _extract_meta_refresh_url(html: str) -> Optional[str]:
     """If the HTML has a meta refresh to another URL, return that URL (absolute). Else None."""
     if not html or len(html) > META_REFRESH_MAX_BODY:
         return None
@@ -118,7 +118,7 @@ def _extract_meta_refresh_url(html: str) -> str | None:
 # -----------------------------------------------------------------------------
 
 
-def _cookie_header(cookies: dict | str | None) -> str:
+def _cookie_header(cookies: Union[dict, str, None]) -> str:
     """Turn cookies dict or 'name=value; ...' string into a Cookie header value."""
     if not cookies:
         return ""
@@ -130,7 +130,7 @@ def _cookie_header(cookies: dict | str | None) -> str:
 def fetch_url(
     url: str,
     timeout_seconds: float = 15.0,
-    cookies: dict | str | None = None,
+    cookies: Union[dict, str, None] = None,
 ) -> dict:
     """
     Fetch a URL with HTTP GET and return response metadata and body.
@@ -368,7 +368,7 @@ def extract_main_text(html: str, max_chars: int = 150_000) -> str:
 def scrape_link(
     url: str,
     timeout_seconds: float = 15.0,
-    cookies: dict | str | None = None,
+    cookies: Union[dict, str, None] = None,
 ) -> dict:
     """
     Fetch a URL, detect if it's a login page, and extract main text content.
@@ -445,7 +445,7 @@ def scrape_link(
 
 def scrape_link_with_login(
     url: str,
-    get_cookies: Callable[[], dict | str | None],
+    get_cookies: Callable[[], Union[dict, str, None]],
     timeout_seconds: float = 15.0,
 ) -> dict:
     """

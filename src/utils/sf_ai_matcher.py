@@ -33,7 +33,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 MODEL          = "gpt-4o-mini"
@@ -55,7 +55,7 @@ class AIMatchResult(NamedTuple):
 _FACILITY_NUM_RE = re.compile(r"^\s*(\d{3,5})\s*[-\u2013\u2014]")
 
 
-def _facility_number(val: str) -> str | None:
+def _facility_number(val: str) -> Optional[str]:
     """Return the leading 3-5 digit facility ID, or None if absent."""
     m = _FACILITY_NUM_RE.match((val or "").strip())
     return m.group(1) if m else None
@@ -70,7 +70,7 @@ def _normalize_for_display(val: str) -> str:
 
 # ── OpenAI call ───────────────────────────────────────────────────────────────
 
-def _call_openai(prompt_messages: list[dict], api_key: str) -> dict | None:
+def _call_openai(prompt_messages: list[dict], api_key: str) -> Optional[dict]:
     """POST to OpenAI chat completions. Returns parsed JSON or None on any error."""
     payload = json.dumps({
         "model": MODEL,
@@ -97,7 +97,7 @@ def _call_openai(prompt_messages: list[dict], api_key: str) -> dict | None:
 def ai_match_practice(
     kimedics_practice: str,
     sf_candidates: list[dict],
-) -> AIMatchResult | None:
+) -> Optional[AIMatchResult]:
     """
     Try to fuzzy-match ``kimedics_practice`` against SF Job__c records.
 

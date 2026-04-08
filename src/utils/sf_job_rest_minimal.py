@@ -13,6 +13,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Optional
 
 DEFAULT_REST_VERSION = "v59.0"
 
@@ -26,8 +27,8 @@ class OAuthTokenHTTPError(RuntimeError):
         *,
         status_code: int,
         request_url: str,
-        error_code: str | None = None,
-        error_description: str | None = None,
+        error_code: Optional[str] = None,
+        error_description: Optional[str] = None,
         response_body: str = "",
     ) -> None:
         super().__init__(message)
@@ -48,8 +49,8 @@ def _http_form_post(url: str, form: dict) -> dict:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         raw = e.fp.read().decode("utf-8", errors="replace") if e.fp else ""
-        err_code: str | None = None
-        err_desc: str | None = None
+        err_code: Optional[str] = None
+        err_desc: Optional[str] = None
         try:
             err = json.loads(raw)
             err_code = err.get("error")
@@ -116,9 +117,9 @@ def rest_json(
     method: str,
     path: str,
     *,
-    body: dict | None = None,
+    body: Optional[dict] = None,
     api_version: str = DEFAULT_REST_VERSION,
-) -> dict | None:
+) -> Optional[dict]:
     instance_url = instance_url.rstrip("/")
     if path.startswith("/"):
         path = path[1:]

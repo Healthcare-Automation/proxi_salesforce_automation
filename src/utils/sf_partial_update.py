@@ -8,7 +8,7 @@ filter + optional picklist coercion match ``update_salesforce_job.py`` behavior.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Optional
 
 from utils.sf_job_payload import coerce_picklists_to_valid
 from utils.sf_job_rest_minimal import (
@@ -43,7 +43,7 @@ def patch_sobject_fields(
     *,
     coerce_picklists: bool = True,
     dry_run: bool = False,
-    api_version: str | None = None,
+    api_version: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     PATCH ``record_id`` on ``sobject_name`` with ``fields``.

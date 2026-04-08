@@ -15,7 +15,7 @@ Does not create Salesforce records (that stays in the “new job” path elsewhe
 from __future__ import annotations
 
 import os
-from typing import Sequence
+from typing import Sequence, Optional
 
 from utils.sf_practice_key import practice_key
 
@@ -25,7 +25,7 @@ def resolve_sf_ids_for_job_ids(
     job_ids: Sequence[str],
     *,
     schema: str = "public",
-    run_id: int | None = None,
+    run_id: Optional[int] = None,
 ) -> int:
     """
     For each Kimedics ``job_id``, upsert missing SF ids via cache → history → practice match.

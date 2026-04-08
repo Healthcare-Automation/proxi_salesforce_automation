@@ -9,6 +9,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Optional, Union
 
 # Default API version for REST
 DEFAULT_API_VERSION = "v59.0"
@@ -103,7 +104,7 @@ def _diagnose_login(
     *,
     has_security_token: bool,
     use_sandbox: bool,
-    my_domain_host: str | None,
+    my_domain_host: Optional[str],
 ) -> str:
     """Plain-language guess from attempt outcomes (not authoritative)."""
     details = " ".join((a.get("detail") or "") for a in attempts).lower()
@@ -177,7 +178,7 @@ def get_token_client_credentials(
     consumer_key: str,
     consumer_secret: str,
     *,
-    token_url: str | None = None,
+    token_url: Optional[str] = None,
     use_sandbox: bool = False,
 ) -> dict:
     """
@@ -199,7 +200,7 @@ def get_token_client_credentials(
     return _request_token(url, body)
 
 
-def _soap_fault_message(xml_text: str) -> str | None:
+def _soap_fault_message(xml_text: str) -> Optional[str]:
     m = re.search(r"<faultstring[^>]*>([^<]*)</faultstring>", xml_text, re.I)
     if m:
         s = (m.group(1) or "").strip()
@@ -226,7 +227,7 @@ def _xml_escape(text: str) -> str:
     )
 
 
-def _my_domain_host_from_token_url(token_url: str | None) -> str | None:
+def _my_domain_host_from_token_url(token_url: Optional[str]) -> Optional[str]:
     """If SALESFORCE_TOKEN_URL is a My Domain host, return hostname (e.g. acme.my.salesforce.com)."""
     if not (token_url and str(token_url).strip()):
         return None
@@ -241,7 +242,7 @@ def _my_domain_host_from_token_url(token_url: str | None) -> str | None:
     return None
 
 
-def _oauth_password_urls(use_sandbox: bool, token_url: str | None) -> list[str]:
+def _oauth_password_urls(use_sandbox: bool, token_url: Optional[str]) -> list[str]:
     primary = "test.salesforce.com" if use_sandbox else "login.salesforce.com"
     secondary = "login.salesforce.com" if use_sandbox else "test.salesforce.com"
     urls: list[str] = []
@@ -260,7 +261,7 @@ def _oauth_password_urls(use_sandbox: bool, token_url: str | None) -> list[str]:
     return urls
 
 
-def _soap_login_bases(use_sandbox: bool, token_url: str | None) -> list[str]:
+def _soap_login_bases(use_sandbox: bool, token_url: Optional[str]) -> list[str]:
     primary = "test.salesforce.com" if use_sandbox else "login.salesforce.com"
     secondary = "login.salesforce.com" if use_sandbox else "test.salesforce.com"
     bases: list[str] = []
@@ -326,13 +327,13 @@ def _soap_partner_login(login_base: str, username: str, password: str, *, api_ve
 def get_token_auto(
     consumer_key: str,
     consumer_secret: str,
-    username: str | None = None,
-    password: str | None = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
     *,
     use_client_credentials: bool = True,
-    security_token: str | None = None,
+    security_token: Optional[str] = None,
     use_sandbox: bool = False,
-    token_url: str | None = None,
+    token_url: Optional[str] = None,
 ) -> dict:
     """
     Obtain access_token + instance_url for API use.
@@ -386,9 +387,9 @@ def get_token(
     username: str,
     password: str,
     *,
-    security_token: str | None = None,
+    security_token: Optional[str] = None,
     use_sandbox: bool = False,
-    token_url: str | None = None,
+    token_url: Optional[str] = None,
 ) -> dict:
     """
     Username-password OAuth, then SOAP Partner ``login`` if every OAuth attempt returns
@@ -424,7 +425,7 @@ def get_token(
         "my_domain_from_token_url": my_domain_host or "(none)",
     }
 
-    last_oauth: RuntimeError | None = None
+    last_oauth: Optional[RuntimeError] = None
     for oauth_u in _oauth_password_urls(use_sandbox, token_url):
         try:
             result = _request_token(oauth_u, body)
@@ -450,7 +451,7 @@ def get_token(
                     context=context,
                 ) from None
 
-    last_soap: BaseException | None = None
+    last_soap: Optional[BaseException] = None
     for base in _soap_login_bases(use_sandbox, token_url):
         soap_url = f"{base.rstrip('/')}/services/Soap/u/{uver}"
         try:
@@ -654,12 +655,12 @@ _RESOLVER_JOB_FIELDS: tuple[str, ...] = (
 def pull_jobs_for_id_resolve(
     consumer_key: str,
     consumer_secret: str,
-    username: str | None = None,
-    password: str | None = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
     *,
     use_client_credentials: bool = True,
-    token_url: str | None = None,
-    security_token: str | None = None,
+    token_url: Optional[str] = None,
+    security_token: Optional[str] = None,
     use_sandbox: bool = False,
     job_object_name: str = "Job__c",
     api_version: str = DEFAULT_API_VERSION,
@@ -691,12 +692,12 @@ def pull_jobs_for_id_resolve(
 def pull_all_jobs(
     consumer_key: str,
     consumer_secret: str,
-    username: str | None = None,
-    password: str | None = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
     *,
     use_client_credentials: bool = True,
-    token_url: str | None = None,
-    security_token: str | None = None,
+    token_url: Optional[str] = None,
+    security_token: Optional[str] = None,
     use_sandbox: bool = False,
     job_object_name: str = "Job__c",
     api_version: str = DEFAULT_API_VERSION,

@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from email import message_from_bytes
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
+from typing import Optional
 
 IMAP_SERVER = "imap.gmail.com"
 
@@ -192,9 +193,9 @@ def scrape_emails_from_sender(
     email_password: str,
     from_email: str,
     imap_server: str = IMAP_SERVER,
-    days: int | None = None,
-    hours: float | None = None,
-    max_results: int | None = None,
+    days: Optional[int] = None,
+    hours: Optional[float] = None,
+    max_results: Optional[int] = None,
 ):
     """
     Fetch emails from inbox that were received FROM a specific sender.

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Union
+from typing import Union, Optional
 
 # Canonical columns we always output (for CSV): identity → location → org/status → scheduling →
 # clinical detail → insight → remaining Kimedics header fields → full description.
@@ -153,7 +153,7 @@ def _is_following_section_start(line: str) -> bool:
     return any(low.startswith(m) or low == m for m in markers)
 
 
-def _kimedics_inline_label_value(line: str) -> tuple[str, str] | None:
+def _kimedics_inline_label_value(line: str) -> Optional[tuple[str, str]]:
     """If line is 'Short Label: rest', return (lowercased label head, value part)."""
     s = (line or "").strip()
     if ":" not in s:
@@ -501,7 +501,7 @@ def _backfill_practice_value(out: dict, main_block: str) -> None:
             return
 
 
-def repair_flat_jobpost_text_missing_posted_date(flat_text: str, posted_date: str | None) -> str:
+def repair_flat_jobpost_text_missing_posted_date(flat_text: str, posted_date: Optional[str]) -> str:
     """
     Kimedics job UI often lays out metadata in two columns. Playwright's ``inner_text()`` on
     ``.sections__container`` lists the *label* column first (``Posted Date`` then ``Posting Org``)

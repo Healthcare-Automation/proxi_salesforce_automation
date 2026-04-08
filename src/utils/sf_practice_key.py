@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from typing import Optional
 
 # Fold Unicode dash / minus characters to ASCII hyphen before the rest of the pipeline.
 _DASH_TRANSLATION = str.maketrans(
@@ -27,7 +28,7 @@ _DASH_TRANSLATION = str.maketrans(
 )
 
 
-def practice_key(val: str | None) -> str:
+def practice_key(val: Optional[str]) -> str:
     """
     Single key for practice-only Job__c matching (1:1 on this key → take Id + worksite).
 

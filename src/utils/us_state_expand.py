@@ -6,6 +6,8 @@ Parser output often keeps 2-letter codes; Job_State__c and client-facing copy us
 
 from __future__ import annotations
 
+from typing import Optional
+
 # All 50 states + DC; values are canonical display strings for push rules.
 US_STATE_CODE_TO_NAME: dict[str, str] = {
     "AL": "Alabama",
@@ -62,7 +64,7 @@ US_STATE_CODE_TO_NAME: dict[str, str] = {
 }
 
 
-def state_name_for_salesforce(state: str | None) -> str:
+def state_name_for_salesforce(state: Optional[str]) -> str:
     """
     Return full state name when input is a 2-letter code; otherwise return stripped text.
 

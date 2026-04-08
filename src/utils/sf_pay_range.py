@@ -7,6 +7,7 @@ Used only at Salesforce push time (not stored as a separate Supabase column).
 from __future__ import annotations
 
 import re
+from typing import Optional
 
 # Examples: $125 – $145 per hour, $125-$145/hr, Starting at $125/hour, $125 per hour
 _PAY_PATTERNS = [
@@ -22,7 +23,7 @@ _PAY_PATTERNS = [
 ]
 
 
-def extract_pay_range_from_description(text: str | None) -> str | None:
+def extract_pay_range_from_description(text: Optional[str]) -> Optional[str]:
     """
     Return first plausible pay-range substring from free text, or None.
 

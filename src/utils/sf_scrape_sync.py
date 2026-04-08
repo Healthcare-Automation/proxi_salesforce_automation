@@ -1,6 +1,6 @@
 """
-After a Kimedics scrape, push a small set of Job__c fields to Salesforce **only when** we have
-``sf_job_id`` and the Salesforce field is currently blank (do not overwrite existing SF values).
+After a Kimedics scrape, push a small set of Job__c fields to Salesforce whenever we have
+``sf_job_id``. We PATCH only the fields whose desired value differs from the current SF value.
 
 Fields: External Job ID / Link, Job_Ranking__c (default ``B`` when SF blank), + org-specific test fields.
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional, Union
 
 from utils.sf_job_payload import _truncate_external_job_id, external_job_link_from_job_row
 from utils.sf_job_rest_minimal import DEFAULT_REST_VERSION, describe_sobject, rest_json, update_job_record
@@ -38,7 +38,19 @@ def _sf_field_empty(val: Any) -> bool:
     return str(val).strip() == ""
 
 
-def posted_date_to_salesforce_date(raw: str | None) -> str | None:
+def _normalize_sf_compare_value(val: Any) -> str:
+    """
+    Normalize values for "should we PATCH?" comparisons.
+    Salesforce REST GET may return None, strings, numbers, booleans; we compare trimmed strings.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    return str(val).strip()
+
+
+def posted_date_to_salesforce_date(raw: Optional[str]) -> Optional[str]:
     """Normalize Kimedics posted_date text to YYYY-MM-DD for a Salesforce Date field."""
     if raw is None:
         return None
@@ -55,7 +67,7 @@ def posted_date_to_salesforce_date(raw: str | None) -> str | None:
     return None
 
 
-def desired_scrape_sync_fields_from_job_row(row: dict | None) -> dict[str, Any]:
+def desired_scrape_sync_fields_from_job_row(row: Optional[dict]) -> dict[str, Any]:
     """Values we want on Salesforce from the latest scraped job row (Supabase-shaped dict)."""
     r = dict(row or {})
     out: dict[str, Any] = {}
@@ -76,7 +88,7 @@ def desired_scrape_sync_fields_from_job_row(row: dict | None) -> dict[str, Any]:
     return out
 
 
-def _rest_token_from_env() -> tuple[str, str] | None:
+def _rest_token_from_env() -> Optional[tuple[str, str]]:
     ck = (os.environ.get("SALESFORCE_CONSUMER_KEY") or "").strip()
     cs = (os.environ.get("SALESFORCE_CONSUMER_SECRET") or "").strip()
     if not ck or not cs:
@@ -123,9 +135,9 @@ def sync_missing_scrape_fields_to_salesforce(
     job_row: dict,
     *,
     conn=None,
-    job_id_for_log: str | None = None,
+    job_id_for_log: Optional[str] = None,
     schema: str = "public",
-    run_id: int | None = None,
+    run_id: Optional[int] = None,
     dry_run: bool = False,
     job_object_name: str = "Job__c",
 ) -> dict[str, Any]:
@@ -167,13 +179,14 @@ def sync_missing_scrape_fields_to_salesforce(
         want = desired[fname]
         if want is None or (isinstance(want, str) and not want.strip()):
             continue
-        if not _sf_field_empty(current.get(fname)):
+        have = current.get(fname)
+        if _normalize_sf_compare_value(have) == _normalize_sf_compare_value(want):
             continue
         patch[fname] = want
 
     if not patch:
         out["ok"] = True
-        out["reason"] = "all_fields_already_set_in_salesforce"
+        out["reason"] = "already_matches_salesforce"
         _maybe_log(
             conn,
             jid_log,
@@ -214,12 +227,19 @@ def sync_missing_scrape_fields_to_salesforce(
     out["ok"] = True
     out["patched"] = True
     out["fields"] = sorted(body.keys())
+    prev_vals = {k: current.get(k) for k in out["fields"]}
+    next_vals = {k: body.get(k) for k in out["fields"]}
     _maybe_log(
         conn,
         jid_log,
         "sf_scrape_fields_patched",
         schema,
-        {"fields": out["fields"], "values": {k: body[k] for k in out["fields"]}},
+        {
+            "sf_job_id": sf_job_id or None,
+            "fields_changed": out["fields"],
+            "prev": prev_vals,
+            "next": next_vals,
+        },
         run_id=run_id,
     )
     return out
@@ -242,7 +262,7 @@ def sync_missing_scrape_fields_for_job_ids(
     *,
     schema: str = "public",
     dry_run: bool = False,
-    run_id: int | None = None,
+    run_id: Optional[int] = None,
 ) -> tuple[int, int]:
     """
     Load ``job_current`` rows and run :func:`sync_missing_scrape_fields_to_salesforce` for each.
