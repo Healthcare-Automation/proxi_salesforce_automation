@@ -23,7 +23,6 @@ from utils.us_state_expand import state_name_for_salesforce
 
 # Default Salesforce Account Ids (hyperlink targets in UI; REST sends Id only).
 SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID = "0015f00000HH63kAAD"
-SF_WORKSITE_DEFAULT_ACCOUNT_ID = "001UP00000HKOXRYA5"
 
 # Kimedics id → Salesforce External_Job_ID__c (org may enforce max length on Text field).
 EXTERNAL_JOB_ID_MAX_LEN = 20
@@ -166,7 +165,8 @@ def job_row_to_salesforce_fields(
 
     Hyperlink / lookup fields:
       Job_Account__c → primary account Id (Aspen Dental Management Inc.).
-      Job_Worksite_Location_1__c → worksite account Id (per-city map or default).
+      Job_Worksite_Location_1__c → worksite account Id from the row (or ``worksite_account_id``
+      override only). Omitted when unknown — no placeholder Account Id.
 
     ``use_canonical_description``: when True, set Job_Client_Job_Description__c from
     ``build_proxi_job_posting_description`` so copy matches structured fields; when False,
@@ -174,7 +174,9 @@ def job_row_to_salesforce_fields(
     """
     r = dict(row or {})
     pid = (r.get("sf_primary_account_id") or "").strip() or (primary_account_id or SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID)
-    wid = (r.get("sf_worksite_account_id") or "").strip() or (worksite_account_id or SF_WORKSITE_DEFAULT_ACCOUNT_ID)
+    w_from_row = (r.get("sf_worksite_account_id") or "").strip()
+    w_override = (worksite_account_id or "").strip() if worksite_account_id is not None else ""
+    wid = (w_override or w_from_row) or None
 
     desc_raw = (r.get("description_full_text") or "").strip()
     inferred_pay = extract_pay_range_from_description(desc_raw)
@@ -193,7 +195,8 @@ def job_row_to_salesforce_fields(
     out: dict[str, Any] = {
         "External_Job_ID__c": _truncate_external_job_id(r.get("job_id")),
         "Job_Account__c": pid,
-        "Job_Worksite_Location_1__c": wid,
+        "Job_Worksite_Location_1__c": wid if wid else None,
+        "Job_Client_Job_Id__c": (r.get("practice_value") or "").strip() or None,
         "Job_Client_Job_Description__c": body or None,
         "External_Job_Link__c": external_job_link_from_job_row(r),
         "Job_Status__c": (r.get("status") or "").strip() or None,

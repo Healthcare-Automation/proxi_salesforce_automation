@@ -17,11 +17,10 @@ def _minimal_row():
 def test_build_html_contains_structure():
     out = build_proxi_job_posting_description(_minimal_row(), use_html=True)
     assert "<strong>" in out  # section labels (Patient mix, etc.)
-    assert "<ul>" in out and "<li>" in out
+    assert "<ul" in out and "<li" in out
     assert "Palm Springs" in out
     assert "California" in out
-    assert "Dates" in out and "Schedule" in out
-    assert "source notes" in out.lower()
+    assert "Dates:" in out and "Schedule:" in out
     assert "Highlights" not in out
 
 
@@ -41,7 +40,6 @@ def test_build_html_escapes_angle_brackets():
 
 def test_build_plain_has_section_breaks():
     out = build_proxi_job_posting_description(_minimal_row(), use_html=False)
-    assert "\n\n" in out or "\nPATIENT MIX\n" in out
+    assert "\n\n" in out
     assert "<p>" not in out
-    assert "source notes" in out.lower()
     assert "HIGHLIGHTS" not in out

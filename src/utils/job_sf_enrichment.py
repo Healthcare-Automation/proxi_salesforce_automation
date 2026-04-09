@@ -1,9 +1,12 @@
 """
 Fill Salesforce-oriented columns on a parsed job row using Supabase lookup tables.
 
-Important:
-- We DO NOT guess or default a worksite location id.
-- Worksite + Salesforce Job id resolution happens via practice mapping logic elsewhere.
+Worksite Account Id:
+- Prefer ``sf_worksite_location_map`` (city + state).
+- Optionally create a new Salesforce Account + map row when ``PROXI_SF_CREATE_WORKSITES=true``.
+
+``sf_job_id`` still comes from practice / external-id matching or the create-job path in
+``sf_job_supabase_resolve``.
 """
 
 from __future__ import annotations
@@ -56,3 +59,31 @@ def enrich_cleaned_row_salesforce_fields(
 
     if not (cleaned.get("sf_primary_account_id") or "").strip() and local.get("primary_id"):
         cleaned["sf_primary_account_id"] = local["primary_id"]
+
+    # Worksite Account Id: location map + optional Salesforce Account create
+    if not (cleaned.get("sf_worksite_account_id") or "").strip() and city and state:
+        try:
+            from utils.supabase_db import fetch_worksite_account_id_for_location
+            from utils.sf_worksite_create import fetch_or_create_worksite_account_id
+            from utils.sf_scrape_sync import _rest_token_from_env
+        except Exception:
+            return
+        wid = fetch_worksite_account_id_for_location(conn, city, state, schema=schema)
+        if not wid:
+            tok = _rest_token_from_env()
+            if tok:
+                iu, at = tok
+                jid_log = (cleaned.get("job_id") or "").strip() or None
+                wid = fetch_or_create_worksite_account_id(
+                    conn,
+                    city,
+                    state,
+                    instance_url=iu,
+                    access_token=at,
+                    schema=schema,
+                    run_id=None,
+                    job_id_for_log=jid_log,
+                    skip_location_lookup=True,
+                )
+        if wid:
+            cleaned["sf_worksite_account_id"] = wid

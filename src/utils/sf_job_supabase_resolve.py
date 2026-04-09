@@ -1,15 +1,16 @@
 """
 Fill missing ``sf_job_id`` / ``sf_worksite_account_id`` on Supabase after a Kimedics scrape.
 
-Order (matches manual resolver / agreed workflow):
-1. Skip if ``job_current`` already has both ids.
-2. Merge from newest ``job_content`` rows that have either id (carry forward partial cache).
-3. If still missing either id, 1:1 Salesforce match on normalized ``practice_value`` ↔ ``Job_Client_Job_Id__c``;
-   take ``Job__c.Id`` and ``Job_Worksite_Location_1__c``.
-4. If practice is missing or practice match finds 0 / N hits, try **Kimedics ``job_id`` ↔ ``External_Job_ID__c``**
-   (same truncation as pushes). Still 1:1 only.
+Order:
+1. Skip if ``job_current`` already has both ``sf_job_id`` and ``sf_worksite_account_id``.
+2. Merge from newest ``job_content`` with both ids (history carry-forward).
+3. **Practice** match: normalized ``practice_value`` ↔ ``Job_Client_Job_Id__c`` (1:1 only; N>1 → ambiguous, no update).
+4. **External Job ID** match: Kimedics ``job_id`` ↔ ``External_Job_ID__c`` (1:1 only; same truncation as push).
+5. **AI** fallback on practice string when practice key had 0 hits.
+6. **No match**: log ``mapping_no_match``; if ``PROXI_SF_CREATE_JOBS=true``, **POST** a new ``Job__c``
+   (needs a worksite Account Id from ``sf_worksite_location_map`` or ``PROXI_SF_CREATE_WORKSITES=true``).
 
-Does not create Salesforce records (that stays in the “new job” path elsewhere).
+Does not create jobs when mapping is ambiguous (1:N).
 """
 
 from __future__ import annotations
@@ -18,6 +19,172 @@ import os
 from typing import Sequence, Optional
 
 from utils.sf_practice_key import practice_key
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _sf_rest_token() -> Optional[tuple[str, str]]:
+    ck = (os.environ.get("SALESFORCE_CONSUMER_KEY") or "").strip()
+    cs = (os.environ.get("SALESFORCE_CONSUMER_SECRET") or "").strip()
+    if not ck or not cs:
+        return None
+    from utils.salesforce import get_token_auto
+
+    token_url = os.environ.get("SALESFORCE_TOKEN_URL") or None
+    use_sandbox = os.environ.get("SALESFORCE_USE_SANDBOX", "").lower() in ("1", "true", "yes")
+    use_cc = os.environ.get("SALESFORCE_USE_USERNAME_PASSWORD", "").lower() not in ("1", "true", "yes")
+    token = get_token_auto(
+        ck,
+        cs,
+        os.environ.get("SALESFORCE_USERNAME") or None,
+        os.environ.get("SALESFORCE_PASSWORD") or None,
+        use_client_credentials=use_cc,
+        token_url=token_url,
+        security_token=os.environ.get("SALESFORCE_SECURITY_TOKEN") or None,
+        use_sandbox=use_sandbox,
+    )
+    instance_url = (token.get("instance_url") or "").strip()
+    access_token = (token.get("access_token") or "").strip()
+    if not instance_url or not access_token:
+        return None
+    return instance_url, access_token
+
+
+def _try_create_sf_job_after_no_match(
+    conn,
+    *,
+    job_id: str,
+    row: dict,
+    schema: str,
+    run_id: Optional[int],
+) -> bool:
+    """POST new Job__c when unmapped; requires worksite Account Id (map or create). Returns True if created."""
+    from utils.supabase_db import (
+        get_job_current,
+        log_job_event,
+        update_sf_ids_for_job,
+        fetch_worksite_account_id_for_location,
+    )
+    from utils.sf_job_payload import prepare_payload_for_write
+    from utils.sf_job_rest_minimal import (
+        create_job_record,
+        describe_sobject,
+        filter_createable_fields,
+    )
+    from utils.sf_worksite_create import fetch_or_create_worksite_account_id
+
+    jid = (job_id or "").strip()
+    if not jid or conn is None:
+        return False
+
+    cur = get_job_current(conn, job_ids=[jid], limit=1, schema=schema)
+    latest = dict(cur[0]) if cur else dict(row)
+    if (latest.get("sf_job_id") or "").strip():
+        return False
+
+    tok = _sf_rest_token()
+    if not tok:
+        log_job_event(
+            conn,
+            job_id=jid,
+            event_type="job_create_failed",
+            schema=schema,
+            run_id=run_id,
+            payload={"reason": "no_salesforce_credentials"},
+        )
+        return False
+
+    instance_url, access_token = tok
+    job_object_name = os.environ.get("SALESFORCE_JOB_OBJECT", "Job__c").strip()
+
+    city = (latest.get("city") or "").strip()
+    state = (latest.get("state") or "").strip()
+    w = (latest.get("sf_worksite_account_id") or "").strip()
+    if not w and city and state:
+        w = fetch_worksite_account_id_for_location(conn, city, state, schema=schema) or ""
+    if not w and city and state:
+        w = (
+            fetch_or_create_worksite_account_id(
+                conn,
+                city,
+                state,
+                instance_url=instance_url,
+                access_token=access_token,
+                schema=schema,
+                run_id=run_id,
+                job_id_for_log=jid,
+            )
+            or ""
+        )
+    if not w:
+        log_job_event(
+            conn,
+            job_id=jid,
+            event_type="job_create_failed",
+            schema=schema,
+            run_id=run_id,
+            payload={"reason": "no_worksite_account_id"},
+        )
+        return False
+
+    latest["sf_worksite_account_id"] = w
+    try:
+        from utils.job_sf_enrichment import enrich_cleaned_row_salesforce_fields
+
+        enrich_cleaned_row_salesforce_fields(conn, latest, schema=schema)
+    except Exception:
+        pass
+
+    use_html = os.environ.get("PROXI_JOB_DESCRIPTION_HTML", "true").lower() in ("1", "true", "yes")
+    try:
+        describe = describe_sobject(instance_url, access_token, job_object_name)
+        fields = prepare_payload_for_write(
+            latest,
+            describe,
+            for_update=False,
+            use_canonical_description=True,
+            description_use_html=use_html,
+        )
+        fields = filter_createable_fields(describe, fields)
+        if not fields:
+            raise RuntimeError("create payload empty after createable filter")
+        resp = create_job_record(instance_url, access_token, job_object_name, fields)
+        new_job_id = (resp.get("id") or "").strip()
+        if not new_job_id:
+            raise RuntimeError(f"create Job__c returned no id: {resp!r}")
+    except Exception as e:
+        log_job_event(
+            conn,
+            job_id=jid,
+            event_type="job_create_failed",
+            schema=schema,
+            run_id=run_id,
+            payload={"error": str(e)[:2000]},
+        )
+        return False
+
+    update_sf_ids_for_job(
+        conn,
+        job_id=jid,
+        sf_job_id=new_job_id,
+        sf_worksite_account_id=w,
+        source="sf_create_job",
+        mapping_status="created",
+        mapping_detail="Created Job__c after no practice/external/AI match",
+        run_id=run_id,
+        schema=schema,
+    )
+    log_job_event(
+        conn,
+        job_id=jid,
+        event_type="job_created_in_salesforce",
+        schema=schema,
+        run_id=run_id,
+        payload={"sf_job_id": new_job_id, "sf_worksite_account_id": w},
+    )
+    return True
 
 
 def resolve_sf_ids_for_job_ids(
@@ -33,6 +200,7 @@ def resolve_sf_ids_for_job_ids(
     Returns the number of jobs for which ``update_sf_ids_for_job`` was invoked (may include no-ops).
     """
     from utils.salesforce import pull_jobs_for_id_resolve
+    from utils.sf_job_payload import external_job_id_match_key
     from utils.supabase_db import get_job_current, get_job_content, log_job_event, update_sf_ids_for_job
 
     ids = sorted({str(x or "").strip() for x in job_ids if str(x or "").strip()})
@@ -87,6 +255,12 @@ def resolve_sf_ids_for_job_ids(
         key = practice_key(j.get("Job_Client_Job_Id__c"))
         if key:
             sf_by_practice.setdefault(key, set()).add(j["Id"])
+
+    sf_by_external: dict[str, set[str]] = {}
+    for j in sf_jobs:
+        ek = external_job_id_match_key(j.get("External_Job_ID__c"))
+        if ek:
+            sf_by_external.setdefault(ek, set()).add(j["Id"])
 
     cur_rows = get_job_current(conn, job_ids=ids, limit=None, schema=schema)
     cur_by_job = {str(r.get("job_id") or "").strip(): r for r in cur_rows}
@@ -183,6 +357,45 @@ def resolve_sf_ids_for_job_ids(
             )
             continue
 
+        # ── External Job ID (Kimedics job_id ↔ External_Job_ID__c), 1:1 only ──
+        ext_key = external_job_id_match_key(jid)
+        ext_hits: list[str] = []
+        if ext_key:
+            ext_hits = sorted(sf_by_external.get(ext_key, set()))
+        if len(ext_hits) == 1:
+            sfid = ext_hits[0]
+            wid = (sf_by_id.get(sfid, {}).get("Job_Worksite_Location_1__c") or "").strip() or None
+            j_final = j or sfid
+            w_final = w or wid
+            update_sf_ids_for_job(
+                conn,
+                job_id=jid,
+                sf_job_id=j_final or None,
+                sf_worksite_account_id=w_final or None,
+                source="sf_external_job_id_match",
+                mapping_status="resolved",
+                mapping_detail="1:1 External_Job_ID__c match",
+                run_id=run_id,
+                schema=schema,
+            )
+            updated += 1
+            continue
+        if len(ext_hits) > 1:
+            log_job_event(
+                conn,
+                job_id=jid,
+                event_type="mapping_ambiguous",
+                schema=schema,
+                run_id=run_id,
+                payload={
+                    "source": "sf_external_job_id_match",
+                    "external_key": ext_key,
+                    "hits": len(ext_hits),
+                    "candidate_sf_job_ids": ext_hits,
+                },
+            )
+            continue
+
         # ── AI fallback (only when deterministic matching found 0 hits) ──────
         # Triggered for cases like apostrophes ("St. Joseph" vs "St. Joseph's")
         # or extra suffixes ("Suffolk, VA" vs "Suffolk, VA- Downtown").
@@ -247,5 +460,10 @@ def resolve_sf_ids_for_job_ids(
                 "ai_attempted": bool(practice_raw),
             },
         )
+        if _env_truthy("PROXI_SF_CREATE_JOBS"):
+            if _try_create_sf_job_after_no_match(
+                conn, job_id=jid, row=row, schema=schema, run_id=run_id
+            ):
+                updated += 1
 
     return updated

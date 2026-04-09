@@ -14,6 +14,7 @@ Template follows client direction (locum general dentist, Aspen-style minimal so
 from __future__ import annotations
 
 import html
+import os
 import re
 from typing import Iterable
 
@@ -55,7 +56,11 @@ def _bullets_html(lines: Iterable[str]) -> str:
     items = [_e(ln) for ln in lines if (ln or "").strip()]
     if not items:
         return ""
-    return "<ul>" + "".join(f"<li>{it}</li>" for it in items) + "</ul>"
+    # Use semantic list markup for proper bullet indentation/wrapping.
+    # Add light inline styles to reduce Salesforce's default list spacing.
+    ul_style = "margin-top:0;margin-bottom:0;padding-left:20px;"
+    li_style = "margin:0 0 4px 0;"
+    return f"<ul style=\"{ul_style}\">" + "".join(f"<li style=\"{li_style}\">{it}</li>" for it in items) + "</ul>"
 
 
 def _as_sentence(fragment: str) -> str:
@@ -99,19 +104,35 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
     ``use_html=False``: plain text with blank lines and ALL CAPS section labels (no bold).
     """
     city = (row.get("city") or "").strip()
-    state_full = state_name_for_salesforce(row.get("state") or "")
-    loc_display = f"{city}, {state_full}" if city and state_full else (city or state_full or "the listed location")
-    title_city = f"{city}, {state_full}" if city and state_full else loc_display
+    state_raw = (row.get("state") or "").strip()
+    state_full = state_name_for_salesforce(state_raw)
+    state_code = state_raw.upper() if len(state_raw) == 2 and state_raw.isalpha() else ""
 
-    dates = (row.get("dates_needed") or "").strip() or "See posting or contact recruiter"
-    schedule = (row.get("standard_schedule") or "").strip() or "See posting or contact recruiter"
+    title_loc = ""
+    if city and state_code:
+        title_loc = f"{city}, {state_code}"
+    elif city and state_full:
+        title_loc = f"{city}, {state_full}"
+    else:
+        title_loc = city or state_code or state_full or ""
+
+    prose_loc = ""
+    if city and state_full:
+        prose_loc = f"{city}, {state_full}"
+    else:
+        prose_loc = title_loc or "the listed location"
+
+    dates = (row.get("dates_needed") or "").strip()
+    schedule = (row.get("standard_schedule") or "").strip()
 
     raw_desc_for_pay = (row.get("description_full_text") or "").strip()
-    pay_line = extract_pay_range_from_description(raw_desc_for_pay) or DEFAULT_SALARY_PAY_RANGE
+    pay_line = (extract_pay_range_from_description(raw_desc_for_pay) or "").strip()
 
     types_of_cases = (row.get("types_of_cases") or "").strip()
     support_staff = (row.get("support_staff") or "").strip()
-    insight_items = _insight_bullet_items(row.get("insight") or "")
+    # We intentionally do not include "source notes" in the client-facing description.
+    # Keep parsing available in case we need it later.
+    _ = _insight_bullet_items(row.get("insight") or "")
 
     state_license = (row.get("state_license_required") or "").strip()
     raw_desc = (row.get("description_full_text") or "").strip()
@@ -122,12 +143,6 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
             seg = segment.strip()
             if seg:
                 clinical_bullets.append(seg)
-    if not clinical_bullets:
-        clinical_bullets = [
-            "Preventive care and comprehensive exams",
-            "Restorative dentistry including fillings and crowns",
-            "Surgical and simple extractions as clinically appropriate",
-        ]
 
     support_bullets: list[str] = []
     if support_staff:
@@ -135,112 +150,163 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
             seg = segment.strip()
             if seg:
                 support_bullets.append(seg)
-    if not support_bullets:
-        support_bullets = [
-            "Clinical team per office staffing model",
-            "Front office support",
-        ]
 
-    req_bullets = [
-        f"Active {state_full} dental license" if state_full else "Active state dental license",
-        "Active DEA (schedules per state requirement)",
-        "CSR if required by the state",
-        "Experience in high-volume general dentistry environments preferred",
-    ]
+    req_bullets: list[str] = []
     if state_license:
-        req_bullets.insert(0, state_license)
+        req_bullets.append(state_license)
+    req_bullets.extend(
+        [
+            f"Active {state_full} dental license" if state_full else "Active state dental license",
+            "Active DEA with all schedules",
+            "CSR if required by the state",
+            "Experience in high volume general dentistry environments preferred",
+        ]
+    )
 
-    patient_lines = ["Primarily adult patients", "Volume: see office schedule and patient mix"]
+    # Patient mix is only emitted when explicitly available (avoid fabricating volumes).
+    patient_lines: list[str] = []
 
-    # One line break between major blocks (Rich Text margins on <p>/<ul> vary; this evens rhythm).
-    _gap = "<br/>"
+    # Only claim specific "ideal for extractions/dentures" when supported by extracted text.
+    _toc_low = types_of_cases.lower()
+    mention_extractions = "extract" in _toc_low
+    mention_dentures = "denture" in _toc_low
+    include_ideal_para = mention_extractions and mention_dentures
 
     if use_html:
-        chunks: list[str] = []
-        chunks.append(
-            "<p>"
-            f"Proxi Dental Staffing is seeking a General Dentist for a locum tenens opportunity in {_e(title_city)}."
-            "</p>"
-        )
-        chunks.append(
-            "<p>"
-            "This position offers the opportunity to practice comprehensive general dentistry with a "
-            "supportive clinical team and steady patient flow."
-            "</p>"
-        )
-        chunks.append("<p><em>Travel and lodging may be available for qualified candidates.</em></p>")
-        chunks.append(f"<p><strong>Dates</strong><br/>{_e(dates)}</p>")
-        chunks.append(f"<p><strong>Schedule</strong><br/>{_e(schedule)}</p>")
-        chunks.append(f"<p><strong>Pay range</strong><br/>{_e(pay_line)}</p>")
-        notes_html = _source_posting_notes_html(insight_items)
-        if notes_html:
-            chunks.append(notes_html)
-        chunks.append(_gap)
-        chunks.append("<p><strong>Patient mix</strong></p>")
-        chunks.append(_bullets_html(patient_lines))
-        chunks.append(_gap)
-        chunks.append("<p><strong>Clinical scope</strong></p>")
-        chunks.append(_bullets_html(clinical_bullets))
-        chunks.append(
-            "<p>"
-            "Full scope may vary by office. Any clinical limitations can be discussed during the "
-            "presentation process."
-            "</p>"
-        )
-        chunks.append(_gap)
-        chunks.append("<p><strong>Support staff</strong></p>")
-        chunks.append(_bullets_html(support_bullets))
-        chunks.append(_gap)
-        chunks.append("<p><strong>Requirements</strong></p>")
-        chunks.append(_bullets_html(req_bullets))
+        def _spacer() -> str:
+            # Rich Text: <p> adds consistent vertical rhythm; <br/> alone can collapse/stack oddly.
+            return "<p><br/></p>"
 
-        if raw_desc and len(raw_desc) > 200:
-            excerpt = _e(raw_desc[:12000]) + ("…" if len(raw_desc) > 12000 else "")
-            chunks.append(_gap)
-            chunks.append("<hr/>")
-            chunks.append("<p><strong>Source job post (Kimedics excerpt)</strong></p>")
-            chunks.append(f"<p>{excerpt.replace(chr(10), '<br/>')}</p>")
+        chunks: list[str] = []
+        if title_loc:
+            chunks.append(f"<p><strong>General Dentist Locum Tenens Opportunity in {_e(title_loc)}</strong></p>")
+        else:
+            chunks.append("<p><strong>General Dentist Locum Tenens Opportunity</strong></p>")
+
+        chunks.append(_spacer())
+
+        use_ai_intro = (os.environ.get("PROXI_JOB_DESCRIPTION_USE_AI", "").lower() in ("1", "true", "yes"))
+        if use_ai_intro:
+            try:
+                from utils.job_description_ai import generate_ai_intro_html
+
+                ai = generate_ai_intro_html(row)
+                chunks.append(ai.intro_html)
+            except Exception:
+                # Safe fallback: never block writes on AI.
+                use_ai_intro = False
+
+        if not use_ai_intro:
+            chunks.append(
+                "<p>"
+                f"Proxi Dental Staffing is seeking a General Dentist for a locum tenens opportunity in {_e(prose_loc)}."
+                " This position offers the opportunity to practice comprehensive general dentistry with a supportive "
+                "clinical team and steady patient flow."
+                "</p>"
+            )
+            chunks.append(_spacer())
+
+            if include_ideal_para:
+                chunks.append(
+                    "<p>"
+                    "This role is ideal for a dentist comfortable with surgical extractions and dentures who enjoys "
+                    "working in a collaborative environment."
+                    "</p>"
+                )
+                chunks.append(_spacer())
+
+            chunks.append("<p>Travel and lodging may be available for qualified candidates.</p>")
+
+        meta_lines: list[str] = []
+        if dates:
+            meta_lines.append(f"<strong>Dates:</strong> {_e(dates)}")
+        if schedule:
+            meta_lines.append(f"<strong>Schedule:</strong> {_e(schedule)}")
+        if meta_lines:
+            chunks.append(_spacer())
+            chunks.append("<p>" + "<br/>".join(meta_lines) + "</p>")
+
+        if pay_line:
+            chunks.append(f"<p><strong>Pay Range:</strong> {_e(pay_line)}</p>")
+
+        if patient_lines:
+            chunks.append(_spacer())
+            chunks.append("<p><strong>Patient Mix</strong></p>")
+            chunks.append(_bullets_html(patient_lines))
+
+        if clinical_bullets:
+            chunks.append(_spacer())
+            chunks.append("<p><strong>Clinical Scope</strong></p>")
+            chunks.append(_bullets_html(clinical_bullets))
+            chunks.append(_spacer())
+            chunks.append(
+                "<p>"
+                "Full mouth extractions may be required. Any clinical limitations can be discussed during the "
+                "presentation process."
+                "</p>"
+            )
+
+        if support_bullets:
+            chunks.append(_spacer())
+            chunks.append("<p><strong>Support Staff</strong></p>")
+            chunks.append(_bullets_html(support_bullets))
+
+        if req_bullets:
+            chunks.append(_spacer())
+            chunks.append("<p><strong>Requirements</strong></p>")
+            chunks.append(_bullets_html(req_bullets))
 
         return "".join(chunks).strip()
 
     # ----- Plain text (Long Text Area): spacing + section labels, no HTML -----
     lines: list[str] = []
+    if title_loc:
+        lines.append(f"General Dentist Locum Tenens Opportunity in {title_loc}")
+    else:
+        lines.append("General Dentist Locum Tenens Opportunity")
+    lines.append("")
     lines.append(
-        f"Proxi Dental Staffing is seeking a General Dentist for a locum tenens opportunity in {title_city}."
-    )
-    lines.append(
+        f"Proxi Dental Staffing is seeking a General Dentist for a locum tenens opportunity in {prose_loc}. "
         "This position offers the opportunity to practice comprehensive general dentistry with a supportive "
         "clinical team and steady patient flow."
     )
+    if include_ideal_para:
+        lines.append("")
+        lines.append(
+            "This role is ideal for a dentist comfortable with surgical extractions and dentures who enjoys working "
+            "in a collaborative environment."
+        )
     lines.append("")
     lines.append("Travel and lodging may be available for qualified candidates.")
     lines.append("")
-    lines.append(f"Dates: {dates}")
-    lines.append(f"Schedule: {schedule}")
-    lines.append(f"Pay range: {pay_line}")
-    lines.append("")
-    notes_plain = _source_posting_notes_plain(insight_items)
-    if notes_plain:
-        lines.append(notes_plain)
+    if dates:
+        lines.append(f"Dates: {dates}")
+    if schedule:
+        lines.append(f"Schedule: {schedule}")
+    if dates or schedule:
         lines.append("")
-    lines.append("PATIENT MIX")
-    lines.append(_bullets_plain(patient_lines))
-    lines.append("")
-    lines.append("CLINICAL SCOPE")
-    lines.append(_bullets_plain(clinical_bullets))
-    lines.append("")
-    lines.append(
-        "Full scope may vary by office. Any clinical limitations can be discussed during the presentation process."
-    )
-    lines.append("")
-    lines.append("SUPPORT STAFF")
-    lines.append(_bullets_plain(support_bullets))
-    lines.append("")
-    lines.append("REQUIREMENTS")
-    lines.append(_bullets_plain(req_bullets))
-
-    if raw_desc and len(raw_desc) > 200:
-        excerpt = raw_desc[:12000] + ("…" if len(raw_desc) > 12000 else "")
-        lines.extend(["", "—" * 40, "SOURCE JOB POST (KIMEDICS EXCERPT)", "—" * 40, excerpt])
+    if pay_line:
+        lines.append(f"Pay Range: {pay_line}")
+        lines.append("")
+    # Do not include source notes in plain text output either.
+    if patient_lines:
+        lines.append("PATIENT MIX")
+        lines.append(_bullets_plain(patient_lines))
+        lines.append("")
+    if clinical_bullets:
+        lines.append("CLINICAL SCOPE")
+        lines.append(_bullets_plain(clinical_bullets))
+        lines.append("")
+        lines.append(
+            "Full mouth extractions may be required. Any clinical limitations can be discussed during the presentation process."
+        )
+        lines.append("")
+    if support_bullets:
+        lines.append("SUPPORT STAFF")
+        lines.append(_bullets_plain(support_bullets))
+        lines.append("")
+    if req_bullets:
+        lines.append("REQUIREMENTS")
+        lines.append(_bullets_plain(req_bullets))
 
     return "\n".join(lines).strip()

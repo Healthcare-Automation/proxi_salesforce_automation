@@ -171,6 +171,25 @@ def create_job_record(
     return out or {}
 
 
+def create_account_record(
+    instance_url: str,
+    access_token: str,
+    fields: dict,
+    *,
+    api_version: str = DEFAULT_REST_VERSION,
+) -> dict:
+    """POST /sobjects/Account/ — returns JSON including id."""
+    out = rest_json(
+        instance_url,
+        access_token,
+        "POST",
+        "sobjects/Account",
+        body=fields,
+        api_version=api_version,
+    )
+    return out or {}
+
+
 def describe_sobject(
     instance_url: str,
     access_token: str,

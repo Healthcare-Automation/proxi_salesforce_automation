@@ -206,6 +206,7 @@ def _ensure_sf_mapping_tables(conn, schema: str = "public") -> None:
         return
     schema = _validate_pg_identifier(schema, "schema")
     ref = _tbl(schema, "sf_account_reference")
+    wmap = _tbl(schema, "sf_worksite_location_map")
     with conn.cursor() as cur:
         cur.execute(
             pg_sql.SQL(
@@ -221,6 +222,114 @@ def _ensure_sf_mapping_tables(conn, schema: str = "public") -> None:
                 );
                 """
             ).format(ref)
+        )
+        cur.execute(
+            pg_sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {} (
+                    id SERIAL PRIMARY KEY,
+                    location_key TEXT NOT NULL UNIQUE,
+                    city TEXT,
+                    state TEXT,
+                    salesforce_account_id TEXT NOT NULL,
+                    display_label TEXT,
+                    source TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            ).format(wmap)
+        )
+        cur.execute(
+            pg_sql.SQL(
+                "CREATE INDEX IF NOT EXISTS sf_worksite_location_map_city_state ON {} (city, state);"
+            ).format(wmap)
+        )
+    conn.commit()
+
+
+def _normalize_location_key(city: str, state: str) -> str:
+    c = (city or "").strip().lower()
+    s = (state or "").strip().upper()
+    c = " ".join(c.split())
+    s = " ".join(s.split())
+    if not c and not s:
+        return ""
+    return f"{c}|{s}"
+
+
+def fetch_worksite_account_id_for_location(
+    conn,
+    city: str,
+    state: str,
+    *,
+    schema: str = "public",
+) -> Optional[str]:
+    """Return mapped Salesforce Account Id for (city,state), if any."""
+    if conn is None or not HAS_PSYCOPG2 or pg_sql is None:
+        return None
+    schema = _validate_pg_identifier(schema, "schema")
+    key = _normalize_location_key(city, state)
+    if not key:
+        return None
+    wmap = _tbl(schema, "sf_worksite_location_map")
+    with conn.cursor() as cur:
+        cur.execute(
+            pg_sql.SQL(
+                "SELECT salesforce_account_id FROM {} WHERE location_key = %s LIMIT 1;"
+            ).format(wmap),
+            (key,),
+        )
+        row = cur.fetchone()
+    return str(row[0]).strip() if row and row[0] else None
+
+
+def upsert_worksite_account_id_for_location(
+    conn,
+    city: str,
+    state: str,
+    *,
+    salesforce_account_id: str,
+    display_label: Optional[str] = None,
+    source: Optional[str] = None,
+    schema: str = "public",
+) -> None:
+    """Insert/update the location→AccountId mapping row."""
+    if conn is None or not HAS_PSYCOPG2 or pg_sql is None:
+        return
+    schema = _validate_pg_identifier(schema, "schema")
+    key = _normalize_location_key(city, state)
+    sid = (salesforce_account_id or "").strip()
+    if not key or not sid:
+        return
+    wmap = _tbl(schema, "sf_worksite_location_map")
+    old_display = pg_sql.Composed([wmap, pg_sql.SQL(".display_label")])
+    old_source = pg_sql.Composed([wmap, pg_sql.SQL(".source")])
+    with conn.cursor() as cur:
+        cur.execute(
+            pg_sql.SQL(
+                """
+                INSERT INTO {} (
+                    location_key, city, state, salesforce_account_id, display_label, source, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (location_key) DO UPDATE SET
+                    city = EXCLUDED.city,
+                    state = EXCLUDED.state,
+                    salesforce_account_id = EXCLUDED.salesforce_account_id,
+                    display_label = COALESCE(EXCLUDED.display_label, {}),
+                    source = COALESCE(EXCLUDED.source, {}),
+                    updated_at = NOW();
+                """
+            ).format(wmap, old_display, old_source),
+            (
+                key,
+                (city or "").strip() or None,
+                (state or "").strip() or None,
+                sid,
+                (display_label or "").strip() or None,
+                (source or "").strip() or None,
+            ),
         )
     conn.commit()
 
@@ -267,6 +376,47 @@ def _ensure_job_event_log_table(conn, schema: str = "public") -> None:
     conn.commit()
 
 
+def _ensure_sf_patch_queue_table(conn, schema: str = "public") -> None:
+    """Ensure the delayed Salesforce patch queue table exists in the target schema."""
+    if conn is None or not HAS_PSYCOPG2 or pg_sql is None:
+        return
+    schema = _validate_pg_identifier(schema, "schema")
+    q = _tbl(schema, "sf_patch_queue")
+    sr = _tbl(schema, "scrape_runs")
+    with conn.cursor() as cur:
+        cur.execute(
+            pg_sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {} (
+                    job_id TEXT PRIMARY KEY,
+                    enqueued_run_id INTEGER REFERENCES {}(id),
+                    first_seen_at TIMESTAMPTZ NOT NULL,
+                    eligible_at TIMESTAMPTZ NOT NULL,
+                    last_seen_at TIMESTAMPTZ NOT NULL,
+                    last_status TEXT,
+                    closed_seen_at TIMESTAMPTZ,
+                    reopened_seen_at TIMESTAMPTZ,
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    processed_at TIMESTAMPTZ,
+                    processed_run_id INTEGER REFERENCES {}(id)
+                );
+                """
+            ).format(q, sr, sr)
+        )
+        # Backward-compatible migrations
+        cur.execute(
+            pg_sql.SQL(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS enqueued_run_id INTEGER REFERENCES {}(id);"
+            ).format(q, sr)
+        )
+        cur.execute(
+            pg_sql.SQL(
+                "CREATE INDEX IF NOT EXISTS sf_patch_queue_state_eligible_at ON {} (state, eligible_at);"
+            ).format(q)
+        )
+    conn.commit()
+
+
 def seed_sf_account_reference_defaults(conn, schema: str = "public") -> None:
     """
     Seed known Aspen hyperlink Account Ids (iterative: add rows as you discover more).
@@ -289,7 +439,7 @@ def seed_sf_account_reference_defaults(conn, schema: str = "public") -> None:
             "001UP00000HKOXRYA5",
             "Worksite default (Job_Worksite_Location_1__c)",
             "Job_Worksite_Location_1__c (hyperlink)",
-            "Historical default worksite Account Id reference; job rows get worksite from SF practice match or create path.",
+            "Optional reference row only — not applied by payload builders; real worksite Id must live on the job row or be resolved via enrichment.",
         ),
     ]
     with conn.cursor() as cur:
@@ -326,6 +476,7 @@ def ensure_full_staging_schema(
     migrate_job_tables_extra_columns(conn, schema)
     _ensure_sf_mapping_tables(conn, schema)
     _ensure_job_event_log_table(conn, schema)
+    _ensure_sf_patch_queue_table(conn, schema)
     if seed_sf_defaults:
         seed_sf_account_reference_defaults(conn, schema)
 
@@ -583,10 +734,26 @@ def ensure_tables(conn) -> None:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS job_event_log_event_type_created_at ON job_event_log (event_type, created_at);"
         )
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sf_patch_queue (
+                job_id TEXT PRIMARY KEY,
+                enqueued_run_id INTEGER REFERENCES scrape_runs(id),
+                first_seen_at TIMESTAMPTZ NOT NULL,
+                eligible_at TIMESTAMPTZ NOT NULL,
+                last_seen_at TIMESTAMPTZ NOT NULL,
+                last_status TEXT,
+                closed_seen_at TIMESTAMPTZ,
+                reopened_seen_at TIMESTAMPTZ,
+                state TEXT NOT NULL DEFAULT 'pending',
+                processed_at TIMESTAMPTZ,
+                processed_run_id INTEGER REFERENCES scrape_runs(id)
+            );
+        """)
     conn.commit()
     migrate_job_tables_extra_columns(conn, "public")
     _ensure_sf_mapping_tables(conn, "public")
     _ensure_job_event_log_table(conn, "public")
+    _ensure_sf_patch_queue_table(conn, "public")
     seed_sf_account_reference_defaults(conn, "public")
 
 
@@ -1244,6 +1411,7 @@ def log_job_content(
                         cleaned,
                         schema=schema,
                         view_job_link=resolved_link or None,
+                        run_id=run_id,
                     )
                 return content_id
         cur.execute(
@@ -1278,6 +1446,7 @@ def log_job_content(
             cleaned,
             schema=schema,
             view_job_link=resolved_link or None,
+            run_id=run_id,
         )
     return content_id
 
@@ -1290,6 +1459,7 @@ def _upsert_job_current(
     *,
     schema: str = "public",
     view_job_link: Optional[str] = None,
+    run_id: Optional[int] = None,
 ) -> None:
     """Keep job_current as the latest state per job_id. Called after each job_content insert/update."""
     if conn is None or not HAS_PSYCOPG2 or pg_sql is None:
@@ -1300,6 +1470,17 @@ def _upsert_job_current(
     if not job_id:
         return
     with conn.cursor() as cur:
+        # Capture SF ids before the UPSERT so we can log accurate prev/next.
+        cur.execute(
+            pg_sql.SQL(
+                "SELECT sf_worksite_account_id, sf_job_id FROM {} WHERE job_id = %s LIMIT 1;"
+            ).format(jcur),
+            (job_id,),
+        )
+        prev_row = cur.fetchone() or (None, None)
+        prev_w = (prev_row[0] or "").strip() if prev_row[0] is not None else ""
+        prev_j = (prev_row[1] or "").strip() if prev_row[1] is not None else ""
+
         cur.execute(
             pg_sql.SQL(
                 """
@@ -1376,6 +1557,39 @@ def _upsert_job_current(
                 job_content_id,
             ),
         )
+
+        # Read the resulting SF ids and log prev/next when they differ.
+        cur.execute(
+            pg_sql.SQL(
+                "SELECT sf_worksite_account_id, sf_job_id FROM {} WHERE job_id = %s LIMIT 1;"
+            ).format(jcur),
+            (job_id,),
+        )
+        next_row = cur.fetchone() or (None, None)
+        next_w = (next_row[0] or "").strip() if next_row[0] is not None else ""
+        next_j = (next_row[1] or "").strip() if next_row[1] is not None else ""
+
+        changed_fields: list[str] = []
+        if (prev_w or "") != (next_w or ""):
+            changed_fields.append("sf_worksite_account_id")
+        if (prev_j or "") != (next_j or ""):
+            changed_fields.append("sf_job_id")
+
+        if changed_fields:
+            log_job_event(
+                conn,
+                job_id=job_id,
+                event_type="job_current_upsert",
+                run_id=run_id,
+                schema=schema,
+                payload={
+                    "source": "job_current_upsert",
+                    "fields_changed": changed_fields,
+                    "prev": {"sf_worksite_account_id": prev_w or None, "sf_job_id": prev_j or None},
+                    "next": {"sf_worksite_account_id": next_w or None, "sf_job_id": next_j or None},
+                    "job_content_id": int(job_content_id),
+                },
+            )
     conn.commit()
 
 
@@ -1629,3 +1843,292 @@ def update_sf_ids_for_job(
         )
     conn.commit()
     return (int(n_cur or 0), int(n_content or 0))
+
+
+def enqueue_sf_patch_jobs(
+    conn,
+    job_ids: list[str],
+    *,
+    run_id: Optional[int] = None,
+    schema: str = "public",
+    delay_minutes: int = 30,
+) -> int:
+    """
+    Enqueue touched jobs for delayed Salesforce scrape-field PATCHing.
+
+    Returns number of distinct job_ids enqueued/refreshed.
+    """
+    if conn is None or not HAS_PSYCOPG2 or pg_sql is None:
+        return 0
+    schema = _validate_pg_identifier(schema, "schema")
+    q = _tbl(schema, "sf_patch_queue")
+
+    ids = sorted({str(x or "").strip() for x in (job_ids or []) if str(x or "").strip()})
+    if not ids:
+        return 0
+
+    # Use job_current as the canonical latest status snapshot.
+    cur_rows = get_job_current(conn, job_ids=ids, limit=None, schema=schema)
+    cur_by_job = {str(r.get("job_id") or "").strip(): r for r in cur_rows}
+
+    n = 0
+    with conn.cursor() as cur:
+        for jid in ids:
+            row = cur_by_job.get(jid) or {}
+            status_raw = str(row.get("status") or "").strip()
+            is_closed = "closed" in status_raw.lower() if status_raw else False
+
+            cur.execute(
+                pg_sql.SQL(
+                    """
+                    INSERT INTO {} (
+                        job_id, enqueued_run_id, first_seen_at, eligible_at, last_seen_at, last_status,
+                        closed_seen_at, reopened_seen_at, state
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        NOW(),
+                        NOW() + (INTERVAL '1 minute' * %s),
+                        NOW(),
+                        %s,
+                        CASE WHEN %s THEN NOW() ELSE NULL END,
+                        NULL,
+                        'pending'
+                    )
+                    ON CONFLICT (job_id) DO UPDATE SET
+                        enqueued_run_id = COALESCE({}.enqueued_run_id, EXCLUDED.enqueued_run_id),
+                        last_seen_at = NOW(),
+                        last_status  = EXCLUDED.last_status,
+                        closed_seen_at = CASE
+                            WHEN {}.closed_seen_at IS NULL AND %s THEN NOW()
+                            ELSE {}.closed_seen_at
+                        END,
+                        reopened_seen_at = CASE
+                            WHEN {}.reopened_seen_at IS NULL
+                                 AND {}.closed_seen_at IS NOT NULL
+                                 AND NOT %s
+                            THEN NOW()
+                            ELSE {}.reopened_seen_at
+                        END,
+                        state = CASE
+                            WHEN {}.state = 'pending' THEN 'pending'
+                            ELSE {}.state
+                        END
+                    RETURNING (xmax = 0) AS inserted, eligible_at, first_seen_at, enqueued_run_id;
+                    """
+                ).format(q, q, q, q, q, q, q, q, q, q, q, q),
+                (
+                    jid,
+                    int(run_id) if run_id is not None else None,
+                    int(delay_minutes),
+                    status_raw or None,
+                    bool(is_closed),
+                    bool(is_closed),
+                    bool(is_closed),
+                ),
+            )
+            ret = cur.fetchone() or (None, None, None, None)
+            inserted = bool(ret[0]) if ret[0] is not None else False
+            eligible_at = ret[1]
+            first_seen_at = ret[2]
+            enqueued_run_id = ret[3]
+
+            n += 1
+    conn.commit()
+    return n
+
+
+def process_due_sf_patch_queue(
+    conn,
+    *,
+    run_id: Optional[int] = None,
+    schema: str = "public",
+    limit: int = 250,
+) -> tuple[int, int, int]:
+    """
+    Process pending Salesforce patch queue entries whose eligible_at has passed.
+
+    Returns (processed_count, skipped_count, deferred_count).
+
+    Notes:
+    - If a job is not mapped (no sf_job_id), it is **deferred** (left pending) so it can be
+      patched later once mapping is resolved.
+    - If a job first became Closed before eligibility and is still Closed at processing time,
+      it is **skipped** and never patched to Salesforce (but all job_content history remains).
+    """
+    if conn is None or not HAS_PSYCOPG2 or pg_sql is None:
+        return (0, 0, 0)
+    schema = _validate_pg_identifier(schema, "schema")
+    q = _tbl(schema, "sf_patch_queue")
+
+    processed = 0
+    skipped = 0
+    deferred = 0
+
+    with conn.cursor() as cur:
+        cur.execute(
+            pg_sql.SQL(
+                """
+                SELECT
+                    job_id, enqueued_run_id, first_seen_at, eligible_at, last_seen_at,
+                    last_status, closed_seen_at, reopened_seen_at
+                FROM {}
+                WHERE state = 'pending'
+                  AND eligible_at <= NOW()
+                ORDER BY eligible_at ASC
+                LIMIT %s;
+                """
+            ).format(q),
+            (int(limit),),
+        )
+        due = cur.fetchall() or []
+
+    if not due:
+        return (0, 0, 0)
+
+    # Load latest job_current rows in one shot.
+    due_ids = [str(r[0] or "").strip() for r in due if str(r[0] or "").strip()]
+    cur_rows = get_job_current(conn, job_ids=due_ids, limit=None, schema=schema)
+    cur_by_job = {str(r.get("job_id") or "").strip(): r for r in cur_rows}
+
+    from utils.sf_scrape_sync import sync_missing_scrape_fields_to_salesforce
+
+    with conn.cursor() as cur:
+        for (
+            jid,
+            enqueued_run_id,
+            first_seen_at,
+            eligible_at,
+            last_seen_at,
+            last_status,
+            closed_seen_at,
+            reopened_seen_at,
+        ) in due:
+            job_id = str(jid or "").strip()
+            if not job_id:
+                continue
+
+            row = dict(cur_by_job.get(job_id) or {})
+            status_raw = str(row.get("status") or "").strip()
+            is_closed_now = "closed" in status_raw.lower() if status_raw else False
+
+            # Skip if closed before eligible AND still closed now (and not reopened after close).
+            closed_before_eligible = False
+            try:
+                closed_before_eligible = (
+                    closed_seen_at is not None
+                    and eligible_at is not None
+                    and closed_seen_at < eligible_at
+                )
+            except Exception:
+                closed_before_eligible = False
+
+            reopened_after_close = False
+            try:
+                reopened_after_close = (
+                    reopened_seen_at is not None
+                    and closed_seen_at is not None
+                    and reopened_seen_at > closed_seen_at
+                )
+            except Exception:
+                reopened_after_close = False
+
+            origin_run_id = int(enqueued_run_id) if enqueued_run_id is not None else None
+
+            if is_closed_now and closed_before_eligible and not reopened_after_close:
+                cur.execute(
+                    pg_sql.SQL(
+                        """
+                        UPDATE {} SET
+                            state = 'skipped',
+                            processed_at = NOW(),
+                            processed_run_id = %s
+                        WHERE job_id = %s;
+                        """
+                    ).format(q),
+                    (int(run_id) if run_id is not None else None, job_id),
+                )
+                log_job_event(
+                    conn,
+                    job_id=job_id,
+                    event_type="sf_scrape_fields_skip",
+                    run_id=origin_run_id,
+                    schema=schema,
+                    payload={
+                        "reason": "short_lived_closed_before_eligible",
+                        "status": status_raw or None,
+                        "first_seen_at": str(first_seen_at) if first_seen_at is not None else None,
+                        "eligible_at": str(eligible_at) if eligible_at is not None else None,
+                        "closed_seen_at": str(closed_seen_at) if closed_seen_at is not None else None,
+                        "reopened_seen_at": str(reopened_seen_at) if reopened_seen_at is not None else None,
+                    },
+                )
+                skipped += 1
+                continue
+
+            # Defer if not mapped yet (don't lose it).
+            sfid = str(row.get("sf_job_id") or "").strip()
+            if not sfid:
+                log_job_event(
+                    conn,
+                    job_id=job_id,
+                    event_type="sf_sync_skipped_no_mapping",
+                    run_id=origin_run_id,
+                    schema=schema,
+                    payload={
+                        "reason": "no_sf_job_id_on_job_current",
+                        "status": status_raw or None,
+                        "first_seen_at": str(first_seen_at) if first_seen_at is not None else None,
+                        "eligible_at": str(eligible_at) if eligible_at is not None else None,
+                    },
+                )
+                deferred += 1
+                continue
+
+            # Attempt patch using existing logic (it already logs patched/skip/error details).
+            try:
+                r = sync_missing_scrape_fields_to_salesforce(
+                    dict(row),
+                    conn=conn,
+                    job_id_for_log=job_id,
+                    schema=schema,
+                    run_id=origin_run_id,
+                )
+            except Exception as e:
+                log_job_event(
+                    conn,
+                    job_id=job_id,
+                    event_type="sf_scrape_fields_error",
+                    run_id=origin_run_id,
+                    schema=schema,
+                    payload={
+                        "error": str(e)[:2000],
+                        "status": status_raw or None,
+                        "eligible_at": str(eligible_at) if eligible_at is not None else None,
+                    },
+                )
+                # Keep pending for retry.
+                deferred += 1
+                continue
+
+            ok = bool(r.get("ok"))
+            patched = bool(r.get("patched"))
+            reason = str(r.get("reason") or "").strip() or None
+
+            cur.execute(
+                pg_sql.SQL(
+                    """
+                    UPDATE {} SET
+                        state = 'processed',
+                        processed_at = NOW(),
+                        processed_run_id = %s
+                    WHERE job_id = %s;
+                    """
+                ).format(q),
+                (int(run_id) if run_id is not None else None, job_id),
+            )
+            processed += 1
+
+    conn.commit()
+    return (processed, skipped, deferred)

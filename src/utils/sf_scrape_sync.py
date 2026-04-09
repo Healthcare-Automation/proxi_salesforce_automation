@@ -1,8 +1,11 @@
 """
-After a Kimedics scrape, push a small set of Job__c fields to Salesforce whenever we have
-``sf_job_id``. We PATCH only the fields whose desired value differs from the current SF value.
+After a Kimedics scrape, push Job__c fields to Salesforce whenever we have ``sf_job_id``.
 
-Fields: External Job ID / Link, Job_Ranking__c (default ``B`` when SF blank), + org-specific test fields.
+By default we compute the desired field set with the same rules as ``prepare_payload_for_write``
+(full mapped/updateable fields + canonical description).
+
+Org-specific **test** fields (``test_status__c``, ``test_posted_date__c``) are included only when
+``PROXI_SF_TEST_MODE=true``.
 """
 
 from __future__ import annotations
@@ -11,7 +14,7 @@ import os
 from datetime import datetime
 from typing import Any, Optional, Union
 
-from utils.sf_job_payload import _truncate_external_job_id, external_job_link_from_job_row
+from utils.sf_job_payload import _truncate_external_job_id, external_job_link_from_job_row, prepare_payload_for_write
 from utils.sf_job_rest_minimal import DEFAULT_REST_VERSION, describe_sobject, rest_json, update_job_record
 from utils.sf_partial_update import prepare_patch_payload
 from utils.salesforce import get_token_auto
@@ -21,21 +24,12 @@ from utils.salesforce import get_token_auto
 SF_FIELD_TEST_STATUS = "test_status__c"
 SF_FIELD_TEST_POSTED_DATE = "test_posted_date__c"
 
-SCRAPE_SYNC_FIELD_ORDER: tuple[str, ...] = (
-    "External_Job_ID__c",
-    "External_Job_Link__c",
-    "Job_Ranking__c",
-    SF_FIELD_TEST_STATUS,
-    SF_FIELD_TEST_POSTED_DATE,
-)
+def _env_truthy(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes")
 
 
-def _sf_field_empty(val: Any) -> bool:
-    if val is None:
-        return True
-    if isinstance(val, bool):
-        return False
-    return str(val).strip() == ""
+def _canonical_description_use_html() -> bool:
+    return _env_truthy("PROXI_JOB_DESCRIPTION_HTML")
 
 
 def _normalize_sf_compare_value(val: Any) -> str:
@@ -162,21 +156,41 @@ def sync_missing_scrape_fields_to_salesforce(
         return out
 
     instance_url, access_token = tok
-    desired = desired_scrape_sync_fields_from_job_row(job_row)
+
+    describe = describe_sobject(instance_url, access_token, job_object_name)
+    desired = prepare_payload_for_write(
+        job_row,
+        describe,
+        use_canonical_description=True,
+        for_update=True,
+        description_use_html=_canonical_description_use_html(),
+    )
+    if conn and jid_log and not (job_row.get("sf_worksite_account_id") or "").strip():
+        _maybe_log(
+            conn,
+            jid_log,
+            "sf_worksite_missing_on_job_row",
+            schema,
+            {
+                "sf_job_id": sf_job_id or None,
+                "message": "sf_worksite_account_id empty; Job_Worksite_Location_1__c omitted from payload (no default Id).",
+            },
+            run_id=run_id,
+        )
+    if _env_truthy("PROXI_SF_TEST_MODE"):
+        desired.update(desired_scrape_sync_fields_from_job_row(job_row))
+
     if not desired:
         out["ok"] = True
         out["reason"] = "nothing_to_send"
         _maybe_log(conn, jid_log, "sf_scrape_fields_skip", schema, {"reason": out["reason"]}, run_id=run_id)
         return out
 
-    describe = describe_sobject(instance_url, access_token, job_object_name)
-    current = _get_job_fields(instance_url, access_token, sf_job_id, SCRAPE_SYNC_FIELD_ORDER)
+    field_names = tuple(sorted(desired.keys()))
+    current = _get_job_fields(instance_url, access_token, sf_job_id, field_names)
 
     patch: dict[str, Any] = {}
-    for fname in SCRAPE_SYNC_FIELD_ORDER:
-        if fname not in desired:
-            continue
-        want = desired[fname]
+    for fname, want in desired.items():
         if want is None or (isinstance(want, str) and not want.strip()):
             continue
         have = current.get(fname)
@@ -192,7 +206,7 @@ def sync_missing_scrape_fields_to_salesforce(
             jid_log,
             "sf_scrape_fields_skip",
             schema,
-            {"reason": out["reason"], "checked": list(SCRAPE_SYNC_FIELD_ORDER)},
+            {"reason": out["reason"], "checked": list(field_names)},
             run_id=run_id,
         )
         return out

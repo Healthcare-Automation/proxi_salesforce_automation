@@ -649,6 +649,7 @@ _RESOLVER_JOB_FIELDS: tuple[str, ...] = (
     "Id",
     "Job_Client_Job_Id__c",
     "Job_Worksite_Location_1__c",
+    "External_Job_ID__c",
 )
 
 

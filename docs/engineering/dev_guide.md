@@ -312,7 +312,7 @@ ORDER BY created_at;
 → Check that `Job_Client_Job_Id__c` and `Job_Worksite_Location_1__c` are accessible to the integration user (Field-Level Security in Salesforce Setup).
 
 **`sf_scrape_fields_error` — Required fields are missing: [Job_Ranking__c]**
-→ Salesforce requires `Job_Ranking__c` on PATCH even when we're only updating other fields. Add it to `SCRAPE_SYNC_FIELD_ORDER` in `sf_scrape_sync.py` or make it optional in the SF org.
+→ `sf_scrape_sync` builds PATCH bodies from `prepare_payload_for_write` (includes `Job_Ranking__c`). If PATCH still fails on required fields, fix the org’s field requirements or extend `job_row_to_salesforce_fields` in `sf_job_payload.py`.
 
 **`mapping_no_match` when you know the job exists in SF**
 → First check if the AI fallback was attempted (`ai_attempted: true` in the payload). If so, the facility number (e.g. `3185`) doesn't exist in Salesforce at all — the job may not be created there yet.

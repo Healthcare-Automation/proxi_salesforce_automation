@@ -224,7 +224,8 @@ def scrape_gmail_job():
                     view_job_link=view_link,
                 )
 
-            # After logging, resolve sf_job_id + worksite id; patch Salesforce.
+            # After logging, resolve sf_job_id + worksite id; enqueue for delayed Salesforce patching,
+            # then process any due queue entries (including from prior runs).
             if touched_job_ids:
                 try:
                     from utils.sf_job_supabase_resolve import resolve_sf_ids_for_job_ids
@@ -237,17 +238,26 @@ def scrape_gmail_job():
                     print(f"SF id resolution step skipped (error): {e}")
 
                 try:
-                    from utils.sf_scrape_sync import sync_missing_scrape_fields_for_job_ids
-                    att, patched = sync_missing_scrape_fields_for_job_ids(
+                    from utils.supabase_db import enqueue_sf_patch_jobs
+                    enq = enqueue_sf_patch_jobs(
                         conn, sorted(touched_job_ids), schema="public", run_id=link_run_id,
                     )
-                    if patched:
-                        print(
-                            f"Patched Salesforce scrape fields for "
-                            f"{patched}/{att} mapped job(s)."
-                        )
+                    if enq:
+                        print(f"Enqueued {enq}/{len(touched_job_ids)} touched job(s) for delayed SF patching.")
                 except Exception as e:
-                    print(f"SF scrape-field sync skipped (error): {e}")
+                    print(f"SF patch enqueue skipped (error): {e}")
+
+            try:
+                from utils.supabase_db import process_due_sf_patch_queue
+                proc, skipped, deferred = process_due_sf_patch_queue(
+                    conn, schema="public", run_id=link_run_id, limit=250,
+                )
+                if proc or skipped or deferred:
+                    print(
+                        f"SF patch queue processed={proc}, skipped={skipped}, deferred={deferred}."
+                    )
+            except Exception as e:
+                print(f"SF patch queue processing skipped (error): {e}")
 
             if link_run_id:
                 log_run_finish(conn, link_run_id)
