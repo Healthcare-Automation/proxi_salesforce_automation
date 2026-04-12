@@ -1,9 +1,9 @@
 """
-Modal jobs: scraping pipeline (every 30 min) + daily summary report.
+Modal jobs: scraping pipeline (every 10 min) + daily summary report.
 
 Functions
 ---------
-scrape_gmail_job   — Gmail → Playwright → Supabase → Salesforce (every 30 min)
+scrape_gmail_job   — Gmail → Playwright → Supabase → Salesforce (every 10 min)
 daily_summary_job  — Query Supabase, validate quality, send digest email (daily 9 AM ET)
 
 Secrets (salesforce-automation): GMAIL_APP_PASSWORD, GMAIL_EMAIL, DB_PASSWORD,
@@ -29,7 +29,7 @@ _src_root  = _modal_dir.parent
 # Full image: Playwright + psycopg2 (for scrape runs)
 _full_image = (
     modal.Image.debian_slim()
-    .pip_install("psycopg2-binary", "playwright", "python-dotenv")
+    .pip_install("psycopg2-binary", "playwright", "python-dotenv", "openai>=1.0.0")
     .run_commands("playwright install chromium", "playwright install-deps chromium")
     .add_local_dir(_src_root / "utils", remote_path="/root/utils")
 )
@@ -51,11 +51,11 @@ SUPABASE_LOOKBACK_HOURS = 2.0
 _WARN_THRESHOLD = 3   # 3+ warnings → send alert even without CRITICAL
 
 
-# ── Scrape pipeline (every 30 min) ────────────────────────────────────────────
+# ── Scrape pipeline (every 10 min) ────────────────────────────────────────────
 
 @app.function(
     image=_full_image,
-    schedule=modal.Period(minutes=30),
+    schedule=modal.Period(minutes=10),
     secrets=[modal.Secret.from_name("salesforce-automation")],
     timeout=600,
 )
@@ -70,17 +70,10 @@ def scrape_gmail_job():
         get_connection_string,
         get_existing_email_keys,
         log_email_scrapes,
-        log_job_content,
         log_run_finish,
         log_run_start,
     )
-    from utils.scrape_validator import (
-        validate_scraped_job,
-        should_send_immediate_alert,
-        issues_as_text,
-        issues_summary,
-    )
-    from utils.alert_email import send_scrape_alert
+    from utils.pipeline_link_scrape import process_link_scrape_batch
 
     email_account    = os.environ.get("GMAIL_EMAIL", "proxi@scrubnetwork.com")
     email_password   = os.environ.get("GMAIL_APP_PASSWORD", "")
@@ -123,13 +116,11 @@ def scrape_gmail_job():
 
         if not new_rows:
             print("No new emails in the window (all already logged)")
-            conn.close()
             return 0
 
         csv_fields = ["job_post_id", "location", "action_or_change", "view_job_link", "subject", "date", "from_"]
         run_id = log_run_start(conn, "gmail", csv_fields)
         if not run_id:
-            conn.close()
             return 0
         email_scrape_ids = log_email_scrapes(conn, run_id, new_rows, csv_fields)
         log_run_finish(conn, run_id)
@@ -158,107 +149,12 @@ def scrape_gmail_job():
     with get_conn() as conn:
         if conn:
             link_run_id = log_run_start(conn, "link_batch", ["job_post_id", "error"])
-            sf_cache: dict         = {}
-            touched_job_ids: set[str] = set()
-
-            for r in scrape_results:
-                cl          = r.get("cleaned") or {}
-                jid         = str(cl.get("job_id") or r.get("job_post_id") or "").strip()
-                job_post_id = str(r.get("job_post_id") or "").strip()
-                view_link   = r.get("view_job_link", "")
-                scrape_err  = r.get("error", "")
-
-                if jid:
-                    touched_job_ids.add(jid)
-
-                # ── Validation ───────────────────────────────────────────────
-                issues = validate_scraped_job(cl, job_post_id=job_post_id)
-                summary = issues_summary(issues)
-
-                if scrape_err:
-                    # Playwright itself threw — always alert
-                    print(f"  [SCRAPE ERROR] Job #{job_post_id}: {scrape_err}")
-                    try:
-                        send_scrape_alert(
-                            job_post_id=job_post_id,
-                            issues=issues,
-                            cleaned=cl,
-                            view_job_link=view_link,
-                        )
-                    except Exception as mail_err:
-                        print(f"  [alert_email] Could not send error alert: {mail_err}")
-                elif should_send_immediate_alert(issues):
-                    print(
-                        f"  [VALIDATION] Job #{job_post_id}: "
-                        f"{summary['critical']} critical, {summary['warning']} warnings — sending alert"
-                    )
-                    try:
-                        send_scrape_alert(
-                            job_post_id=job_post_id,
-                            issues=issues,
-                            cleaned=cl,
-                            view_job_link=view_link,
-                        )
-                    except Exception as mail_err:
-                        print(f"  [alert_email] Could not send validation alert: {mail_err}")
-                elif issues:
-                    print(
-                        f"  [VALIDATION] Job #{job_post_id}: "
-                        f"{summary['info']} info — logged, no alert"
-                    )
-                else:
-                    print(f"  [VALIDATION] Job #{job_post_id}: all checks passed ✓")
-
-                if issues:
-                    print(issues_as_text(issues, job_post_id))
-
-                # ── Persist ──────────────────────────────────────────────────
-                log_job_content(
-                    conn,
-                    link_run_id,
-                    r["job_post_id"],
-                    r["email_received_date"],
-                    cl,
-                    email_scrape_id=r.get("email_scrape_id"),
-                    sf_lookup_cache=sf_cache,
-                    view_job_link=view_link,
-                )
-
-            # After logging, resolve sf_job_id + worksite id; enqueue for delayed Salesforce patching,
-            # then process any due queue entries (including from prior runs).
-            if touched_job_ids:
-                try:
-                    from utils.sf_job_supabase_resolve import resolve_sf_ids_for_job_ids
-                    updated = resolve_sf_ids_for_job_ids(
-                        conn, sorted(touched_job_ids), schema="public", run_id=link_run_id,
-                    )
-                    if updated:
-                        print(f"Resolved sf ids for {updated}/{len(touched_job_ids)} touched job(s).")
-                except Exception as e:
-                    print(f"SF id resolution step skipped (error): {e}")
-
-                try:
-                    from utils.supabase_db import enqueue_sf_patch_jobs
-                    enq = enqueue_sf_patch_jobs(
-                        conn, sorted(touched_job_ids), schema="public", run_id=link_run_id,
-                    )
-                    if enq:
-                        print(f"Enqueued {enq}/{len(touched_job_ids)} touched job(s) for delayed SF patching.")
-                except Exception as e:
-                    print(f"SF patch enqueue skipped (error): {e}")
-
-            try:
-                from utils.supabase_db import process_due_sf_patch_queue
-                proc, skipped, deferred = process_due_sf_patch_queue(
-                    conn, schema="public", run_id=link_run_id, limit=250,
-                )
-                if proc or skipped or deferred:
-                    print(
-                        f"SF patch queue processed={proc}, skipped={skipped}, deferred={deferred}."
-                    )
-            except Exception as e:
-                print(f"SF patch queue processing skipped (error): {e}")
-
+            process_link_scrape_batch(
+                conn,
+                link_run_id=link_run_id,
+                scrape_results=scrape_results,
+                schema="public",
+            )
             if link_run_id:
                 log_run_finish(conn, link_run_id)
 
@@ -301,11 +197,13 @@ def daily_summary_job():
 def _pair_runs(runs: list[dict]) -> list[dict]:
     """
     Pair consecutive gmail + link_batch runs into single combined entries.
-    A gmail run and the link_batch run that follows it within 5 minutes are
-    considered one logical pipeline execution.
+    A gmail run and the next link_batch whose ``started_at`` is within
+    ``_GMAIL_LINK_BATCH_PAIR_WINDOW_SEC`` of the gmail run's ``started_at`` are
+    treated as one pipeline (covers Gmail + Playwright + DB within Modal).
     Returns list ordered most-recent first.
     """
-    from datetime import timedelta
+    # Keep in sync with automation-hub ``PAIRED_CTE`` pairing window (gmail started_at → link_batch).
+    _GMAIL_LINK_BATCH_PAIR_WINDOW_SEC = 15 * 60
 
     def _secs(r: dict) -> float | None:
         s = r.get("started_at")
@@ -332,7 +230,6 @@ def _pair_runs(runs: list[dict]) -> list[dict]:
         if r["run_id"] in used:
             continue
         if r["run_type"] == "gmail":
-            # Look for a link_batch run that starts within 5 min of this gmail run
             partner = None
             for j in range(i + 1, len(runs)):
                 nxt = runs[j]
@@ -341,7 +238,7 @@ def _pair_runs(runs: list[dict]) -> list[dict]:
                 if nxt["run_type"] != "link_batch":
                     continue
                 gap = (nxt["started_at"] - r["started_at"]).total_seconds()
-                if 0 <= gap <= 300:
+                if 0 <= gap <= _GMAIL_LINK_BATCH_PAIR_WINDOW_SEC:
                     partner = nxt
                     break
             if partner:

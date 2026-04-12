@@ -16,10 +16,30 @@ from __future__ import annotations
 import html
 import os
 import re
-from typing import Iterable
+from typing import Iterable, Optional
 
 from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE, extract_pay_range_from_description
 from utils.us_state_expand import state_name_for_salesforce
+
+# Kimedics sometimes prepends ``M/D update: …`` without refreshing structured date/schedule fields.
+_KIMEDICS_TOP_DATES_UPDATE = re.compile(
+    r"^(?P<line>(?:\d{1,2}/\d{1,2})(?:/\d{2,4})?\s+update\s*:.*)$",
+    re.IGNORECASE,
+)
+
+
+def extract_kimedics_dates_update_preamble(description_full_text: str) -> Optional[str]:
+    """
+    If the description starts with a single-line ``4/8 update: …`` style note, return that line.
+
+    Deterministic only (no AI): avoids inventing text; only matches this header pattern.
+    """
+    t = (description_full_text or "").strip()
+    if not t:
+        return None
+    first = t.split("\n", 1)[0].strip()
+    m = _KIMEDICS_TOP_DATES_UPDATE.match(first)
+    return m.group("line").strip() if m else None
 
 
 def _e(s: str) -> str:
@@ -126,6 +146,7 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
     schedule = (row.get("standard_schedule") or "").strip()
 
     raw_desc_for_pay = (row.get("description_full_text") or "").strip()
+    kimedics_dates_update = extract_kimedics_dates_update_preamble(raw_desc_for_pay)
     pay_line = (extract_pay_range_from_description(raw_desc_for_pay) or "").strip()
 
     types_of_cases = (row.get("types_of_cases") or "").strip()
@@ -185,7 +206,12 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
 
         chunks.append(_spacer())
 
-        use_ai_intro = (os.environ.get("PROXI_JOB_DESCRIPTION_USE_AI", "").lower() in ("1", "true", "yes"))
+        # Default on (unset = try AI); set PROXI_JOB_DESCRIPTION_USE_AI=false to skip API calls.
+        use_ai_intro = (os.environ.get("PROXI_JOB_DESCRIPTION_USE_AI") or "true").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         if use_ai_intro:
             try:
                 from utils.job_description_ai import generate_ai_intro_html
@@ -220,6 +246,8 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
         meta_lines: list[str] = []
         if dates:
             meta_lines.append(f"<strong>Dates:</strong> {_e(dates)}")
+        if kimedics_dates_update:
+            meta_lines.append(f"<strong>Kimedics posting update:</strong> {_e(kimedics_dates_update)}")
         if schedule:
             meta_lines.append(f"<strong>Schedule:</strong> {_e(schedule)}")
         if meta_lines:
@@ -281,9 +309,11 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
     lines.append("")
     if dates:
         lines.append(f"Dates: {dates}")
+    if kimedics_dates_update:
+        lines.append(f"Kimedics posting update: {kimedics_dates_update}")
     if schedule:
         lines.append(f"Schedule: {schedule}")
-    if dates or schedule:
+    if dates or schedule or kimedics_dates_update:
         lines.append("")
     if pay_line:
         lines.append(f"Pay Range: {pay_line}")

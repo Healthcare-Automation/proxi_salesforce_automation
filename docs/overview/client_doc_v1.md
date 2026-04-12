@@ -9,7 +9,7 @@
 ```
   ┌─────────────────────────────────────────────────────────────────────┐
   │                     MODAL  (Cloud Scheduler)                        │
-  │              Runs automatically every 30 minutes, 24/7              │
+  │              Runs automatically every 10 minutes, 24/7              │
   └────────────────────────────┬────────────────────────────────────────┘
                                │
             ┌──────────────────▼──────────────────┐
@@ -49,7 +49,7 @@
 | 2   | **Kimedics**   | The automation logs in and reads each full job posting        |
 | 3   | **Supabase**   | Private cloud database -- permanent record of everything      |
 | 4   | **Salesforce** | CRM where job records are updated automatically               |
-| 5   | **Modal**      | Cloud scheduler that runs the pipeline every 30 minutes, 24/7 |
+| 5   | **Modal**      | Cloud scheduler that runs the pipeline every 10 minutes, 24/7 |
 
 
 ---
@@ -58,7 +58,7 @@
 
 ### Step 1 -- Inbox Monitoring
 
-Every 30 minutes, the automation checks the Gmail inbox for new emails from Kimedics. It only processes emails it has not seen before, so nothing gets handled twice.
+Every 10 minutes, the automation checks the Gmail inbox for new emails from Kimedics. It only processes emails it has not seen before, so nothing gets handled twice.
 
 Kimedics sends three types of notifications, and the automation captures all of them:
 
@@ -302,15 +302,15 @@ Nothing is ever silently dropped. If something goes wrong, there is always a rec
 
 2:05 PM -- 3 Kimedics emails arrive in the inbox.
 
-2:30 PM -- Automation runs again.
+2:10 PM -- Automation runs again.
             Sees 3 new emails -- scrapes job pages -- updates database + Salesforce.
             Done in approximately 2-3 minutes.
 
-3:00 PM -- Automation runs again.
+2:20 PM -- Automation runs again.
             Those 3 emails already logged -- skipped. Done in seconds.
 ```
 
-Maximum delay from email arrival to Salesforce update: **30 minutes.**
+Maximum delay from email arrival to Salesforce update: **10 minutes** (one scheduling interval).
 
 ---
 

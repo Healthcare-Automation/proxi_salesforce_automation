@@ -56,7 +56,7 @@ python src/local/local_run_scrape_gmail.py
 ### Modal job (scheduled, Supabase + optional Playwright)
 
 - **Script:** `src/production/scrape_gmail_modal.py`
-- **Schedule:** Every 30 minutes.
+- **Schedule:** Every 10 minutes.
 - **Secrets:** Modal secret **salesforce-automation** (e.g. `GMAIL_APP_PASSWORD`, `DB_PASSWORD`, Kimedics creds for link scrape).
 
 **Deploy / run once:** see [docs/engineering/dev_guide.md](docs/engineering/dev_guide.md).

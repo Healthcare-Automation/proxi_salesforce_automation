@@ -12,7 +12,8 @@ Implementation lives in:
 - `src/dev/create_test_job_salesforce.py` — **Lever 2**: create one obvious test row (`--yes` / `--auth-check`)
 - `src/utils/sf_worksite_create.py` — create worksite **Account** + `sf_worksite_location_map` upsert
 - `src/utils/sf_job_supabase_resolve.py` — practice / external-id matching + optional **create** `Job__c`
-- `src/utils/sf_scrape_sync.py` — delayed PATCH using full payload + optional test fields
+- `src/utils/sf_scrape_sync.py` — PATCH Job__c after scrape (same pipeline run) using full payload + optional test fields
+- `src/utils/pipeline_link_scrape.py` — link batch: persist rows, resolve ids, then call `sf_scrape_sync`
 
 ---
 
@@ -40,7 +41,7 @@ Optional Account fields at create time: JSON object in env `**PROXI_SF_ACCOUNT_C
 
 **New `Job__c` when unmapped:** If practice + **External_Job_ID__c** + AI all yield **no** 1:1 match, the resolver logs `mapping_no_match`. When `**PROXI_SF_CREATE_JOBS=true`**, it POSTs a new `Job__c` from `prepare_payload_for_write(..., for_update=False)` and stores the new Id on `job_current` / `job_content` (`event_type`: `job_created_in_salesforce`). Ambiguous (**N>1**) matches **never** auto-create.
 
-**Delayed PATCH after scrape** (`utils.sf_scrape_sync`): builds desired fields with `**prepare_payload_for_write(..., for_update=True)`** (same rules as manual lever 1) and PATCHes diffs. Org-specific **test** custom fields are included only when `**PROXI_SF_TEST_MODE=true`**. When `**sf_worksite_account_id`** is still empty on `job_current`, the sync writes `**job_event_log.event_type` = `sf_worksite_missing_on_job_row**` (payload includes `sf_job_id` and a short message) so the gap is auditable; the worksite field is not back-filled with a placeholder Id.
+**PATCH after scrape** (`utils.sf_scrape_sync`, invoked from `utils.pipeline_link_scrape` in the same Modal run as Playwright): builds desired fields with `**prepare_payload_for_write(..., for_update=True)`** (same rules as manual lever 1) and PATCHes diffs. Org-specific **test** custom fields are included only when `**PROXI_SF_TEST_MODE=true`**. When `**sf_worksite_account_id`** is still empty on `job_current`, the sync writes `**job_event_log.event_type` = `sf_worksite_missing_on_job_row**` (payload includes `sf_job_id` and a short message) so the gap is auditable; the worksite field is not back-filled with a placeholder Id.
 
 ---
 
@@ -78,15 +79,16 @@ Parsed from Kimedics pages into `job_content` / `job_current` (see `utils/job_co
 
 | Source column                               | Salesforce field                                          | Notes                                                                                                                         |
 | ------------------------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `status`                                    | `Job_Status__c`                                           |                                                                                                                               |
+| `status`                                    | `Job_Status__c`                                           | Push-only: only **Open** or **Closed**. **Active, accepting new providers** (any casing) → **Open**; all other non-empty Kimedics statuses (e.g. not accepting, Inactive) → **Closed**. |
 | `city`                                      | `Job_City__c`                                             | Title-cased in parser                                                                                                         |
 | `state`                                     | `Job_State__c`                                            | **Full state name** at push (TX → Texas): `us_state_expand.state_name_for_salesforce`                                         |
-| `insight`                                   | `Insight__c`                                              | Parser: lines starting with `*`                                                                                               |
+| `insight`                                   | `Insight__c`                                              | Parser: `*` / `**` segments; **deduped** at push (case/whitespace-insensitive) so repeated bullets are not sent twice.        |
 | `dates_needed`                              | `Job_Dates_Needed__c`                                     | Heuristic + optional AI (`utils/job_content_ai.py`)                                                                           |
 | `standard_schedule`                         | `Job_Standard_Schedule__c`                                | Heuristic + optional AI                                                                                                       |
+| `standard_schedule`                         | `Standard_Schedule_Hours__c`                              | Same source as schedule line; hours-style field on Job__c                                                                     |
 | `types_of_cases`                            | `Job_Types_of_Cases__c`                                   | Join of “Required procedures” + “Additional requirements” in parser; AI can refine                                            |
 | `support_staff`                             | `Job_Support_Staff__c`                                    | e.g. “Clinical Staff” line; AI can refine                                                                                     |
-| `priority`                                  | `Job_Recruitment_Level__c`                                |                                                                                                                               |
+| `priority`                                  | —                                                         | Parsed into Supabase only; **not** sent to Salesforce (`Job_Recruitment_Level__c` excluded from push).                         |
 | `job_ranking`                               | `Job_Ranking__c`                                          | Default `B` if missing                                                                                                        |
 | `practice_value`                            | `Job_Facility_Display__c`                                 |                                                                                                                               |
 | `practice_value`                            | `Job_Client_Job_Id__c`                                    | Practice identifier used for SF matching; should mirror Kimedics practice label                                               |
@@ -107,10 +109,10 @@ Parsed from Kimedics pages into `job_content` / `job_current` (see `utils/job_co
 
 When `use_canonical_description=True` (default on `update_salesforce_job.py`), the body is built with `build_proxi_job_posting_description()`:
 
-- **Default output is HTML** (`<p>`, `<strong>`, `<ul>`/`<li>`, `<br/>`, `<hr/>`) so **Rich Text Area** fields show bold section titles and lists. Set env `**PROXI_JOB_DESCRIPTION_HTML=false`** for plain text (use when `Job_Client_Job_Description__c` is a **Long Text Area** — otherwise HTML tags would appear literally).
-- **Opening:** two plain paragraphs (role + location, then value prop) — no bold in the intro.
-- `**insight` / Kimedics `*` lines:** one line, **“Source notes (from Kimedics): …”** as joined sentences (no stacked “posting” block).
-- **Dates** and **Schedule** from `dates_needed` / `standard_schedule`
+- **Default output is HTML** (`<p>`, `<strong>`, `<ul>`/`<li>`, `<br/>`, `<hr/>`) so **Rich Text Area** fields show bold section titles and lists. Set env `**PROXI_JOB_DESCRIPTION_HTML=false`** for plain text (use when `Job_Client_Job_Description__c` is a **Long Text Area** — otherwise HTML tags would appear literally). The automated scrape → Salesforce sync (`sf_scrape_sync`) uses the same default as `sf_job_payload` (HTML when the variable is unset).
+- **Opening:** by default, `**PROXI_JOB_DESCRIPTION_USE_AI**` is treated as on (unset → try OpenAI intro via `job_description_ai.generate_ai_intro_html`; requires `OPENAI_API_KEY`). Set to `false` to use the fixed template paragraphs only. On API/key failures the template falls back without failing the push.
+- **Insight__c** is deduped from Kimedics `*` / `**` bullets (`utils.insight_sanitize`); the long-form **Job_Client_Job_Description__c** template does not repeat insight as “source notes” (keeps client-facing copy clean).
+- **Dates** and **Schedule** from `dates_needed` / `standard_schedule`. If `description_full_text` **starts** with a single line matching `M/D update:` or `M/D/YY(YY) update:` (Kimedics admin note), that line is copied **verbatim** into the description block as **Kimedics posting update** (deterministic match only—no AI).
 - **Pay Range** line aligned with `Salary_Pay_Range__c` (extract from raw text or default)
 - **Patient Mix**, **Clinical Scope** (from `types_of_cases` or sensible defaults)
 - **Support Staff** from `support_staff`

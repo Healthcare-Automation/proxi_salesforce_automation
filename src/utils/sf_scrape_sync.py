@@ -14,7 +14,12 @@ import os
 from datetime import datetime
 from typing import Any, Optional, Union
 
-from utils.sf_job_payload import _truncate_external_job_id, external_job_link_from_job_row, prepare_payload_for_write
+from utils.sf_job_payload import (
+    _canonical_description_use_html,
+    _truncate_external_job_id,
+    external_job_link_from_job_row,
+    prepare_payload_for_write,
+)
 from utils.sf_job_rest_minimal import DEFAULT_REST_VERSION, describe_sobject, rest_json, update_job_record
 from utils.sf_partial_update import prepare_patch_payload
 from utils.salesforce import get_token_auto
@@ -26,10 +31,6 @@ SF_FIELD_TEST_POSTED_DATE = "test_posted_date__c"
 
 def _env_truthy(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes")
-
-
-def _canonical_description_use_html() -> bool:
-    return _env_truthy("PROXI_JOB_DESCRIPTION_HTML")
 
 
 def _normalize_sf_compare_value(val: Any) -> str:
@@ -59,6 +60,18 @@ def posted_date_to_salesforce_date(raw: Optional[str]) -> Optional[str]:
         except ValueError:
             continue
     return None
+
+
+def _nonempty_desired_field_names(desired: dict[str, Any]) -> list[str]:
+    """API names we intend to sync (non-null, non-blank string values)."""
+    out: list[str] = []
+    for fname, want in desired.items():
+        if want is None:
+            continue
+        if isinstance(want, str) and not want.strip():
+            continue
+        out.append(fname)
+    return sorted(out)
 
 
 def desired_scrape_sync_fields_from_job_row(row: Optional[dict]) -> dict[str, Any]:
@@ -201,12 +214,23 @@ def sync_missing_scrape_fields_to_salesforce(
     if not patch:
         out["ok"] = True
         out["reason"] = "already_matches_salesforce"
+        compared = _nonempty_desired_field_names(desired)
+        prev_full = {k: current.get(k) for k in compared}
+        next_full = {k: desired.get(k) for k in compared}
         _maybe_log(
             conn,
             jid_log,
             "sf_scrape_fields_skip",
             schema,
-            {"reason": out["reason"], "checked": list(field_names)},
+            {
+                "reason": out["reason"],
+                "sf_job_id": sf_job_id or None,
+                "checked": list(field_names),
+                "fields_compared": compared,
+                "fields_changed": [],
+                "prev": prev_full,
+                "next": next_full,
+            },
             run_id=run_id,
         )
         return out
@@ -241,8 +265,14 @@ def sync_missing_scrape_fields_to_salesforce(
     out["ok"] = True
     out["patched"] = True
     out["fields"] = sorted(body.keys())
-    prev_vals = {k: current.get(k) for k in out["fields"]}
-    next_vals = {k: body.get(k) for k in out["fields"]}
+    compared = _nonempty_desired_field_names(desired)
+    prev_full = {k: current.get(k) for k in compared}
+    next_full: dict[str, Any] = {}
+    for k in compared:
+        if k in body:
+            next_full[k] = body[k]
+        else:
+            next_full[k] = current.get(k)
     _maybe_log(
         conn,
         jid_log,
@@ -251,8 +281,9 @@ def sync_missing_scrape_fields_to_salesforce(
         {
             "sf_job_id": sf_job_id or None,
             "fields_changed": out["fields"],
-            "prev": prev_vals,
-            "next": next_vals,
+            "fields_compared": compared,
+            "prev": prev_full,
+            "next": next_full,
         },
         run_id=run_id,
     )

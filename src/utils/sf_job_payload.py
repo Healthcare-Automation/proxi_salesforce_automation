@@ -13,10 +13,12 @@ See ``docs/salesforce_job_push_rules.md`` for the full rule set.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from datetime import datetime
 from typing import Any, Optional
 
+from utils.insight_sanitize import sanitize_insight_for_salesforce
 from utils.job_description_proxi_template import build_proxi_job_posting_description
 from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE, extract_pay_range_from_description
 from utils.us_state_expand import state_name_for_salesforce
@@ -92,6 +94,29 @@ def external_job_id_match_key(job_id: Optional[str]) -> Optional[str]:
     """Lowercase truncated key for matching Kimedics ``job_id`` ↔ ``External_Job_ID__c``."""
     t = _truncate_external_job_id(job_id)
     return (t or "").strip().lower() or None
+
+
+def job_status_for_salesforce_push(raw_status: Any) -> Optional[str]:
+    """
+    Map ``job_current.status`` → ``Job_Status__c`` at Salesforce push time only (Supabase unchanged).
+
+    Salesforce only receives **Open** or **Closed** (never raw Kimedics labels like Inactive).
+
+      * **Active, accepting new providers** (any casing) → **Open**
+      * Everything else non-empty (e.g. not accepting, Inactive, Closed) → **Closed**
+    """
+    s = str(raw_status or "").strip()
+    if not s:
+        return None
+    low = re.sub(r"\s+", " ", s.lower())
+    # Must run before the "accepting new provider" check ("not accepting" still contains "accepting").
+    if "not accepting" in low:
+        return "Closed"
+    if "accepting new provider" in low:
+        return "Open"
+    if low == "open":
+        return "Open"
+    return "Closed"
 
 
 def _mdy_to_iso(d: Optional[str]) -> Optional[str]:
@@ -199,16 +224,16 @@ def job_row_to_salesforce_fields(
         "Job_Client_Job_Id__c": (r.get("practice_value") or "").strip() or None,
         "Job_Client_Job_Description__c": body or None,
         "External_Job_Link__c": external_job_link_from_job_row(r),
-        "Job_Status__c": (r.get("status") or "").strip() or None,
+        "Job_Status__c": job_status_for_salesforce_push(r.get("status")),
         "Job_State__c": state_sf or None,
         "Job_City__c": city or None,
-        "Insight__c": (r.get("insight") or "").strip() or None,
-        "Job_Recruitment_Level__c": (r.get("priority") or "").strip() or None,
+        "Insight__c": sanitize_insight_for_salesforce(r.get("insight")),
         "Job_Facility_Display__c": (r.get("practice_value") or "").strip() or None,
         "Job_Street_Address__c": (r.get("address_line") or "").strip() or None,
         "Job_Point_of_Contact__c": (r.get("point_of_contact") or "").strip() or None,
         "Job_Dates_Needed__c": (r.get("dates_needed") or "").strip() or None,
         "Job_Standard_Schedule__c": (r.get("standard_schedule") or "").strip() or None,
+        "Standard_Schedule_Hours__c": (r.get("standard_schedule") or "").strip() or None,
         "Job_Types_of_Cases__c": (r.get("types_of_cases") or "").strip() or None,
         "Job_Support_Staff__c": support if (support and str(support).strip()) else None,
         "Job_Provider_Start_Date__c": _mdy_to_iso(r.get("provider_start_date")),

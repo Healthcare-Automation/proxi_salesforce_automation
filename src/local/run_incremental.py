@@ -1,6 +1,6 @@
 """
 Incremental Gmail + Supabase run: last 1 hour only, skip already-logged emails.
-Use for 30-min cadence: fetch last 1h, check Supabase for (job_post_id, date), log only new.
+Use for 10-min Modal cadence: fetch last 1h, check Supabase for (job_post_id, date), log only new.
 Accuracy: we never skip an email that hasn't been logged (exact match by job_post_id + date).
 
 Usage (from project root):

@@ -15,7 +15,7 @@ This automation watches that email inbox, reads the job details automatically, a
 ## The big picture
 
 ```
-  Every 30 minutes
+  Every 10 minutes
         │
         ▼
 ┌───────────────────┐
@@ -53,7 +53,7 @@ This automation watches that email inbox, reads the job details automatically, a
 
 ### Step 1 — Watch the inbox
 
-Every 30 minutes, the automation checks the Gmail inbox for emails from Kimedics. It only processes emails it hasn't seen before, so nothing gets double-processed.
+Every 10 minutes, the automation checks the Gmail inbox for emails from Kimedics. It only processes emails it hasn't seen before, so nothing gets double-processed.
 
 Each email tells us:
 - Which job it's about (a job number like `19571`)
@@ -148,16 +148,16 @@ Timeline (example: emails arrive at 2:05 PM)
 
   2:05 PM ─── 3 job emails arrive in inbox
 
-  2:30 PM ─── Automation runs again
+  2:10 PM ─── Automation runs again
                Sees 3 new emails → scrapes job pages → updates Supabase + Salesforce
                Done in ~2–3 minutes
 
-  3:00 PM ─── Automation runs again
+  2:20 PM ─── Automation runs again
                Those 3 emails already logged → skipped
                Done in seconds
 ```
 
-**Maximum delay from email to Salesforce:** ~30 minutes (one scheduling interval).
+**Maximum delay from email to Salesforce:** ~10 minutes (one scheduling interval).
 
 **In practice:** Most emails that arrive just after a run will be picked up on the next cycle. The 1-hour lookback window means emails are never missed even if a run fails and retries.
 
@@ -249,7 +249,7 @@ Any `sf_scrape_fields_error` rows need attention — they mean Salesforce reject
 | **Kimedics** | The job management platform that sends email notifications |
 | **Supabase** | Our database — stores all emails, job data, and event history |
 | **Salesforce** | The CRM where job records live (`Job__c` records) |
-| **Modal** | The cloud platform that runs the automation every 30 minutes |
+| **Modal** | The cloud platform that runs the automation every 10 minutes |
 | **practice_value** | The facility identifier Kimedics uses (e.g. `2387 - Benton Harbor, MI`) |
 | **Job_Client_Job_Id__c** | The matching field in Salesforce — must match practice_value |
 | **sf_job_id** | The Salesforce record ID (18-char, starts with `a01...`) |

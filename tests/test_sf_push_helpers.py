@@ -3,12 +3,62 @@
 from utils.sf_job_payload import (
     EXTERNAL_JOB_LINK_MAX_LEN,
     KIMEDICS_PORTAL_JOB_POST_URL_PREFIX,
+    _canonical_description_use_html,
     _truncate_external_job_link,
     external_job_id_match_key,
     external_job_link_from_job_row,
+    job_row_to_salesforce_fields,
+    job_status_for_salesforce_push,
 )
 from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE, extract_pay_range_from_description
 from utils.us_state_expand import state_name_for_salesforce
+
+
+def test_canonical_description_html_true_when_env_unset(monkeypatch):
+    monkeypatch.delenv("PROXI_JOB_DESCRIPTION_HTML", raising=False)
+    assert _canonical_description_use_html() is True
+
+
+def test_canonical_description_html_false_when_env_false(monkeypatch):
+    monkeypatch.setenv("PROXI_JOB_DESCRIPTION_HTML", "false")
+    assert _canonical_description_use_html() is False
+
+
+def test_job_status_accepting_new_providers_maps_to_open():
+    assert job_status_for_salesforce_push("Active, accepting new providers") == "Open"
+    assert job_status_for_salesforce_push("Active, Accepting New Providers") == "Open"
+
+
+def test_job_status_not_accepting_maps_to_closed():
+    assert job_status_for_salesforce_push("Active, not accepting new providers") == "Closed"
+    assert job_status_for_salesforce_push("Active, Not Accepting New Providers") == "Closed"
+
+
+def test_job_status_non_accepting_phrases_map_to_closed():
+    assert job_status_for_salesforce_push("ACTIVE — open") == "Closed"
+    assert job_status_for_salesforce_push("Inactive") == "Closed"
+    assert job_status_for_salesforce_push("Closed") == "Closed"
+
+
+def test_job_status_literal_open_label_maps_to_open():
+    assert job_status_for_salesforce_push("Open") == "Open"
+
+
+def test_job_status_empty_is_none():
+    assert job_status_for_salesforce_push("") is None
+
+
+def test_standard_schedule_hours_matches_job_standard_schedule():
+    row = {
+        "job_id": "19999",
+        "city": "Testville",
+        "state": "TX",
+        "standard_schedule": "Mon–Thu 8a–6p; Fri 8a–1p",
+        "description_full_text": "Pay Range: $125 – $145 per hour",
+    }
+    out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    assert out["Standard_Schedule_Hours__c"] == row["standard_schedule"]
+    assert out["Job_Standard_Schedule__c"] == row["standard_schedule"]
 
 
 def test_state_name_for_salesforce_abbrev():

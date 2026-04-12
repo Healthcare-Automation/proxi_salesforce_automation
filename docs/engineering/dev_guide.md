@@ -44,22 +44,26 @@ All of these must also be added to the **Modal secret** named `salesforce-automa
 
 ## Modal — production pipeline
 
-The single production job is `src/production/scrape_gmail_modal.py`. It runs every 30 minutes via a Modal scheduled function.
+The single production job is `src/production/scrape_gmail_modal.py`. It runs every 10 minutes via a Modal scheduled function.
 
 ### Deploy
+
 ```bash
 modal deploy src/production/scrape_gmail_modal.py
 ```
 
 ### Run once (without waiting for schedule)
+
 ```bash
 modal run src/production/scrape_gmail_modal.py
 ```
 
 ### Check logs
+
 Modal dashboard → Apps → `salesforce-automation` → Logs.
 
 ### What the scheduled job does
+
 1. Fetch Gmail emails from the last 1 hour (`donotreply@kimedics.com`)
 2. Dedup against Supabase `email_scrapes` (skip already-logged by `job_post_id` + date)
 3. Log new emails → `scrape_runs` + `email_scrapes`
@@ -86,24 +90,29 @@ python src/local/run_incremental.py --pg-schema public --production-ok --scrape
 `--scrape` chains in the Playwright batch after the email step. Without it, only Gmail → Supabase runs.
 
 ### Run the Gmail scrape step only (last 30 days)
+
 ```bash
 python src/local/local_run_scrape_gmail.py --pg-schema staging --append
 ```
 
 ### Run the Playwright batch from a CSV
+
 ```bash
 python tests/scrape_kimedics_batch_playwright.py --csv data/job_emails.csv --pg-schema staging
 ```
 
 ### Pull Salesforce jobs (read-only export)
+
 ```bash
 python src/local/pull_salesforce_jobs.py
 ```
 
 ### Inspect Salesforce field metadata
+
 ```bash
 python src/local/pull_salesforce_jobs.py --describe
 ```
+
 Prints all `Job__c` fields split into required vs optional, with API names and types.
 
 ---
@@ -123,6 +132,7 @@ The staging schema is a full mirror of `public` (same tables, same columns). Use
 These are for when you need to push data to an existing Salesforce record manually, outside the automated pipeline.
 
 ### Update an existing `Job__c` record (Lever 1)
+
 ```bash
 # Dry run — shows what would be sent
 python src/dev/update_salesforce_job.py \
@@ -140,6 +150,7 @@ python src/dev/update_salesforce_job.py \
 Or use the notebook: `manual/triggers/update_existing_job.ipynb`
 
 ### Create a test `Job__c` record (Lever 2)
+
 ```bash
 python src/dev/create_test_job_salesforce.py --auth-check  # auth only, no insert
 python src/dev/create_test_job_salesforce.py --yes          # insert one test row
@@ -209,22 +220,26 @@ Every scraped Kimedics job must be linked to a Salesforce `Job__c` record (`sf_j
 
 ### Resolution order
 
-| Step | Source | Condition | Notes |
-|---|---|---|---|
-| 1 | `job_current` cache | Both IDs already set | Fast path — no SF call needed |
-| 2 | `job_content` history | Any previous scrape for this `job_id` has an ID | Carry-forward from older scrapes |
-| 3 | Deterministic practice match | `practice_key(practice_value)` == `practice_key(Job_Client_Job_Id__c)` and exactly 1 hit | Normalizes Unicode dashes, case, punctuation |
-| 4 | **AI fuzzy match** | Step 3 found 0 hits | `gpt-4o-mini` via `sf_ai_matcher.py` (see below) |
-| — | `mapping_no_match` | All above failed | Job flagged as unmapped; won't be pushed to SF |
+
+| Step | Source                       | Condition                                                                                | Notes                                            |
+| ---- | ---------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| 1    | `job_current` cache          | Both IDs already set                                                                     | Fast path — no SF call needed                    |
+| 2    | `job_content` history        | Any previous scrape for this `job_id` has an ID                                          | Carry-forward from older scrapes                 |
+| 3    | Deterministic practice match | `practice_key(practice_value)` == `practice_key(Job_Client_Job_Id__c)` and exactly 1 hit | Normalizes Unicode dashes, case, punctuation     |
+| 4    | **AI fuzzy match**           | Step 3 found 0 hits                                                                      | `gpt-4o-mini` via `sf_ai_matcher.py` (see below) |
+| —    | `mapping_no_match`           | All above failed                                                                         | Job flagged as unmapped; won't be pushed to SF   |
+
 
 ### AI fuzzy matching (`sf_ai_matcher.py`)
 
 The deterministic `practice_key` normalizer handles most differences (dashes, case, punctuation) but fails on two recurring patterns:
 
-| Pattern | Kimedics example | Salesforce example |
-|---|---|---|
-| Apostrophe in city name | `3185 - St. Joseph, MO` | `3185- St. Joseph's, MO` |
-| Extra location suffix | `4140 - Suffolk, VA` | `4140 - Suffolk, VA- Downtown` |
+
+| Pattern                 | Kimedics example        | Salesforce example             |
+| ----------------------- | ----------------------- | ------------------------------ |
+| Apostrophe in city name | `3185 - St. Joseph, MO` | `3185- St. Joseph's, MO`       |
+| Extra location suffix   | `4140 - Suffolk, VA`    | `4140 - Suffolk, VA- Downtown` |
+
 
 The AI fallback resolves these without any manual intervention:
 
@@ -288,33 +303,35 @@ ORDER BY created_at;
 
 ### Event types
 
-| `event_type` | Meaning |
-|---|---|
-| `sf_mapping_skipped` | SF credentials missing from env/Modal secret |
-| `sf_mapping_pull_failed` | SOQL query to Salesforce failed (payload has `error`) |
-| `mapping_cache_hit` | Both SF ids already on `job_current`; no lookup needed |
-| `mapping_ambiguous` | Multiple `Job__c` records matched the same practice key |
-| `mapping_ai_match` | Deterministic match failed; AI fuzzy-matched the practice value (payload has `kimedics_practice`, `sf_matched_value`, `confidence`) |
-| `mapping_no_match` | No Salesforce match found — neither deterministic nor AI (payload has `ai_attempted` flag) |
-| `sf_ids_update` | SF ids written to Supabase (payload has `prev`/`next` diff) |
-| `sf_sync_skipped_no_mapping` | Scrape sync skipped — no `sf_job_id` on this job yet (resolver didn't find a match) |
-| `sf_scrape_fields_patched` | Fields patched on Salesforce successfully |
-| `sf_scrape_fields_error` | Salesforce PATCH rejected (payload has `error` + attempted fields) |
+
+| `event_type`                 | Meaning                                                                                                                             |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `sf_mapping_skipped`         | SF credentials missing from env/Modal secret                                                                                        |
+| `sf_mapping_pull_failed`     | SOQL query to Salesforce failed (payload has `error`)                                                                               |
+| `mapping_cache_hit`          | Both SF ids already on `job_current`; no lookup needed                                                                              |
+| `mapping_ambiguous`          | Multiple `Job__c` records matched the same practice key                                                                             |
+| `mapping_ai_match`           | Deterministic match failed; AI fuzzy-matched the practice value (payload has `kimedics_practice`, `sf_matched_value`, `confidence`) |
+| `mapping_no_match`           | No Salesforce match found — neither deterministic nor AI (payload has `ai_attempted` flag)                                          |
+| `sf_ids_update`              | SF ids written to Supabase (payload has `prev`/`next` diff)                                                                         |
+| `sf_sync_skipped_no_mapping` | Scrape sync skipped — no `sf_job_id` on this job yet (resolver didn't find a match)                                                 |
+| `sf_scrape_fields_patched`   | Fields patched on Salesforce successfully                                                                                           |
+| `sf_scrape_fields_error`     | Salesforce PATCH rejected (payload has `error` + attempted fields)                                                                  |
+
 
 ---
 
 ## Common issues
 
-**`sf_mapping_skipped` on every job**
-→ SF credentials are missing from the Modal secret. Add all `SALESFORCE_*` vars to `salesforce-automation` in Modal dashboard, then redeploy.
+`**sf_mapping_skipped` on every job**
+→ SF credentials are missing from the Modal secret. Add all `SALESFORCE_`* vars to `salesforce-automation` in Modal dashboard, then redeploy.
 
-**`sf_mapping_pull_failed` with SOQL error**
+`**sf_mapping_pull_failed` with SOQL error**
 → Check that `Job_Client_Job_Id__c` and `Job_Worksite_Location_1__c` are accessible to the integration user (Field-Level Security in Salesforce Setup).
 
-**`sf_scrape_fields_error` — Required fields are missing: [Job_Ranking__c]**
+`**sf_scrape_fields_error` — Required fields are missing: [Job_Ranking__c]**
 → `sf_scrape_sync` builds PATCH bodies from `prepare_payload_for_write` (includes `Job_Ranking__c`). If PATCH still fails on required fields, fix the org’s field requirements or extend `job_row_to_salesforce_fields` in `sf_job_payload.py`.
 
-**`mapping_no_match` when you know the job exists in SF**
+`**mapping_no_match` when you know the job exists in SF**
 → First check if the AI fallback was attempted (`ai_attempted: true` in the payload). If so, the facility number (e.g. `3185`) doesn't exist in Salesforce at all — the job may not be created there yet.
 
 If `ai_attempted: false`, the `practice_value` was blank — check the scrape for that job.
