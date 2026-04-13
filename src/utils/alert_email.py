@@ -13,6 +13,8 @@ send_scrape_alert(job_post_id, issues, cleaned, view_job_link)
 send_daily_summary(stats)
     Daily digest with counts, examples, and health metrics.
     Called by the Modal daily_summary scheduled function.
+    If there were no emails, no job_content rows, and no pipeline runs in the
+    period, returns False without sending (quiet day).
 """
 
 from __future__ import annotations
@@ -263,6 +265,9 @@ def send_daily_summary(stats: dict) -> bool:
     """
     Send the daily digest email.
 
+    When ``emails_received``, ``scrape_attempts``, and ``runs`` are all empty
+    for the period, skips sending and returns False (no SMTP traffic on quiet days).
+
     Expected keys in stats (all optional / gracefully handled if missing):
       period_label        str
       emails_received     int
@@ -298,6 +303,13 @@ def send_daily_summary(stats: dict) -> bool:
     examples         = g("example_jobs",        [])
     issue_log        = g("issue_log",           [])
     runs             = g("runs",                [])
+
+    if emails == 0 and attempts == 0 and not runs:
+        print(
+            "[alert_email] Daily summary skipped — no emails, scrapes, or "
+            "pipeline runs in the reporting period"
+        )
+        return False
 
     # Overall health badge
     sf_map_rate = round(sf_mapped / success * 100) if success else 0

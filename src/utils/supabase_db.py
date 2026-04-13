@@ -12,7 +12,7 @@ import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 # Optional: only use if psycopg2 is available
 try:
@@ -163,6 +163,11 @@ def migrate_job_tables_extra_columns(conn, schema: str = "public") -> None:
                     _tbl(schema, tbl_name), pg_sql.Identifier("view_job_link")
                 )
             )
+        cur.execute(
+            pg_sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT;").format(
+                jc, pg_sql.Identifier("scrape_change_summary")
+            )
+        )
         # Legacy: required_procedures + additional_requirements → types_of_cases, then drop old cols.
         for tbl_name in ("job_content", "job_current"):
             cur.execute(
@@ -567,7 +572,8 @@ def _create_job_current_table(conn, schema: str) -> None:
 #    - For each row: scrapes the job URL, then inserts/updates job_content.
 #    - email_scrape_id is found by (job_post_id, date) using FULL timestamp so each email row
 #      maps to exactly one email_scrapes.id.
-#    - At most one job_content row per email_scrape_id (upsert by email_scrape_id).
+#    - At most one job_content row per email_scrape_id (insert new row or update the existing row
+#      for that email — keyed by email_scrape_id).
 #
 # Result: each email_scrapes row has at most one job_content row; each job_content row has
 # exactly one email_scrape_id (when linked). So 1:1 between the two tables.
@@ -640,6 +646,7 @@ def ensure_tables(conn) -> None:
                 sf_job_id TEXT,
                 description_full_text TEXT,
                 raw_columns_json JSONB,
+                scrape_change_summary TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
@@ -1238,6 +1245,144 @@ def _types_of_cases(cleaned: dict) -> Optional[str]:
     return rp or ar
 
 
+# Columns compared for ``scrape_change_summary`` (human-readable “what changed” vs email subject).
+_JOB_CONTENT_SUMMARY_COLUMNS: tuple[str, ...] = (
+    "job_post_id",
+    "email_received_date",
+    "view_job_link",
+    "job_id",
+    "title_line",
+    "location_line",
+    "practice_value",
+    "city",
+    "state",
+    "address_line",
+    "job_title",
+    "posting_org",
+    "priority",
+    "status",
+    "point_of_contact",
+    "provider_start_date",
+    "provider_end_date",
+    "posted_date",
+    "insight",
+    "dates_needed",
+    "standard_schedule",
+    "types_of_cases",
+    "support_staff",
+    "sf_primary_account_id",
+    "sf_worksite_account_id",
+    "sf_worksite_display_label",
+    "sf_job_id",
+    "description_full_text",
+)
+
+_SUMMARY_LABELS: dict[str, str] = {
+    "job_post_id": "job post ID",
+    "email_received_date": "email date",
+    "view_job_link": "job link",
+    "job_id": "Kimedics job ID",
+    "title_line": "title line",
+    "location_line": "location line",
+    "practice_value": "practice",
+    "city": "city",
+    "state": "state",
+    "address_line": "address",
+    "job_title": "job title",
+    "posting_org": "posting org",
+    "priority": "priority",
+    "status": "status",
+    "point_of_contact": "point of contact",
+    "provider_start_date": "provider start date",
+    "provider_end_date": "provider end date",
+    "posted_date": "posted date",
+    "insight": "insight",
+    "dates_needed": "dates needed",
+    "standard_schedule": "standard schedule",
+    "types_of_cases": "types of cases",
+    "support_staff": "support staff",
+    "sf_primary_account_id": "SF primary account",
+    "sf_worksite_account_id": "SF worksite account",
+    "sf_worksite_display_label": "SF worksite label",
+    "sf_job_id": "SF job Id",
+    "description_full_text": "job description",
+}
+
+
+def _norm_for_scrape_summary(val) -> str:
+    if val is None:
+        return ""
+    if hasattr(val, "isoformat"):
+        try:
+            s = val.isoformat()
+            return str(s)[:10] if len(str(s)) >= 10 else str(s).strip()
+        except Exception:
+            pass
+    return str(val).strip()
+
+
+def _job_content_snapshot_for_summary(
+    *,
+    job_post_id: str,
+    date_only,
+    resolved_link: str,
+    cleaned: dict,
+) -> dict[str, Any]:
+    """Shape aligned with ``_JOB_CONTENT_SUMMARY_COLUMNS`` for diffing."""
+    c = cleaned
+    return {
+        "job_post_id": (job_post_id or "").strip(),
+        "email_received_date": date_only,
+        "view_job_link": (resolved_link or "").strip() or None,
+        "job_id": _txt(c, "job_id") if c.get("job_id") is not None else None,
+        "title_line": c.get("title_line"),
+        "location_line": c.get("location_line"),
+        "practice_value": c.get("practice_value"),
+        "city": _txt(c, "city"),
+        "state": _txt(c, "state"),
+        "address_line": _txt(c, "address_line"),
+        "job_title": c.get("job_title"),
+        "posting_org": c.get("posting_org"),
+        "priority": c.get("priority"),
+        "status": c.get("status"),
+        "point_of_contact": c.get("point_of_contact"),
+        "provider_start_date": c.get("provider_start_date"),
+        "provider_end_date": c.get("provider_end_date"),
+        "posted_date": _txt(c, "posted_date"),
+        "insight": _txt(c, "insight"),
+        "dates_needed": _txt(c, "dates_needed"),
+        "standard_schedule": _txt(c, "standard_schedule"),
+        "types_of_cases": _types_of_cases(c),
+        "support_staff": _txt(c, "support_staff"),
+        "sf_primary_account_id": _txt(c, "sf_primary_account_id"),
+        "sf_worksite_account_id": _txt(c, "sf_worksite_account_id"),
+        "sf_worksite_display_label": _txt(c, "sf_worksite_display_label"),
+        "sf_job_id": _txt(c, "sf_job_id"),
+        "description_full_text": c.get("description_full_text"),
+    }
+
+
+def _build_scrape_change_summary(
+    *,
+    updating_existing_row: bool,
+    prev: Optional[dict],
+    new_row: dict[str, Any],
+) -> str:
+    if not updating_existing_row:
+        return "First capture from Kimedics scrape for this email."
+    if not prev:
+        return "Updated job row from scrape (no prior snapshot to compare)."
+    changed: list[str] = []
+    for col in _JOB_CONTENT_SUMMARY_COLUMNS:
+        if _norm_for_scrape_summary(prev.get(col)) != _norm_for_scrape_summary(new_row.get(col)):
+            changed.append(_SUMMARY_LABELS.get(col, col.replace("_", " ")))
+    if not changed:
+        return (
+            "Scrape re-run saved; no changes to stored job fields vs the prior version for this email."
+        )
+    return "Updated from scrape vs prior saved row: " + ", ".join(changed)
+
+
 def log_job_content(
     conn,
     run_id: int,
@@ -1309,19 +1454,31 @@ def log_job_content(
         cleaned.get("description_full_text"),
         raw_json,
     )
+    row_snap = _job_content_snapshot_for_summary(
+        job_post_id=(job_post_id or "").strip(),
+        date_only=date_only,
+        resolved_link=resolved_link,
+        cleaned=cleaned,
+    )
     content_id = None
-    with conn.cursor() as cur:
+    _sel_cols = pg_sql.SQL(", ").join(
+        [pg_sql.Identifier("id")]
+        + [pg_sql.Identifier(c) for c in _JOB_CONTENT_SUMMARY_COLUMNS]
+    )
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
         if email_scrape_id is not None:
             cur.execute(
-                pg_sql.SQL("SELECT id, raw_columns_json FROM {} WHERE email_scrape_id = %s;").format(
-                    jt
-                ),
+                pg_sql.SQL("SELECT {} FROM {} WHERE email_scrape_id = %s;").format(_sel_cols, jt),
                 (email_scrape_id,),
             )
             existing = cur.fetchone()
             if existing:
-                prev_content_id = existing[0]
-                prev_raw = existing[1] if len(existing) > 1 else None
+                prev = {k: existing.get(k) for k in _JOB_CONTENT_SUMMARY_COLUMNS}
+                summary = _build_scrape_change_summary(
+                    updating_existing_row=True,
+                    prev=prev,
+                    new_row=row_snap,
+                )
                 cur.execute(
                     pg_sql.SQL(
                         """
@@ -1336,15 +1493,16 @@ def log_job_content(
                             types_of_cases = %s, support_staff = %s,
                             sf_primary_account_id = %s, sf_worksite_account_id = %s, sf_worksite_display_label = %s,
                             sf_job_id = %s,
-                            description_full_text = %s, raw_columns_json = %s
+                            description_full_text = %s, raw_columns_json = %s,
+                            scrape_change_summary = %s
                         WHERE email_scrape_id = %s
                         RETURNING id;
                         """
                     ).format(jt),
-                    (vals[0], *vals[2:], email_scrape_id),
+                    (vals[0], *vals[2:], summary, email_scrape_id),
                 )
                 row = cur.fetchone()
-                content_id = row[0] if row else None
+                content_id = int(row["id"]) if row and row.get("id") is not None else None
                 if content_id is not None:
                     _upsert_job_current(
                         conn,
@@ -1356,6 +1514,11 @@ def log_job_content(
                         run_id=run_id,
                     )
                 return content_id
+        summary_ins = _build_scrape_change_summary(
+            updating_existing_row=False,
+            prev=None,
+            new_row=row_snap,
+        )
         cur.execute(
             pg_sql.SQL(
                 """
@@ -1368,18 +1531,18 @@ def log_job_content(
                     support_staff,
                     sf_primary_account_id, sf_worksite_account_id, sf_worksite_display_label,
                     sf_job_id,
-                    description_full_text, raw_columns_json
+                    description_full_text, raw_columns_json, scrape_change_summary
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 RETURNING id;
                 """
             ).format(jt),
-            vals,
+            (*vals, summary_ins),
         )
         row = cur.fetchone()
-        content_id = row[0] if row else None
+        content_id = int(row["id"]) if row and row.get("id") is not None else None
     if content_id is not None:
         _upsert_job_current(
             conn,
@@ -1412,7 +1575,13 @@ def _upsert_job_current(
     if not job_id:
         return
     with conn.cursor() as cur:
-        # Capture SF ids before the UPSERT so we can log accurate prev/next.
+        # Capture SF ids before insert/update so we can log accurate prev/next.
+        cur.execute(
+            pg_sql.SQL("SELECT 1 FROM {} WHERE job_id = %s LIMIT 1;").format(jcur),
+            (job_id,),
+        )
+        had_existing_job_current = cur.fetchone() is not None
+
         cur.execute(
             pg_sql.SQL(
                 "SELECT sf_worksite_account_id, sf_job_id FROM {} WHERE job_id = %s LIMIT 1;"
@@ -1521,11 +1690,16 @@ def _upsert_job_current(
             log_job_event(
                 conn,
                 job_id=job_id,
-                event_type="job_current_upsert",
+                event_type="job_current_sf_ids_changed",
                 run_id=run_id,
                 schema=schema,
                 payload={
-                    "source": "job_current_upsert",
+                    "source": "job_current_table",
+                    "saved_as": (
+                        "updated_existing_latest_row"
+                        if had_existing_job_current
+                        else "inserted_new_latest_row"
+                    ),
                     "fields_changed": changed_fields,
                     "prev": {"sf_worksite_account_id": prev_w or None, "sf_job_id": prev_j or None},
                     "next": {"sf_worksite_account_id": next_w or None, "sf_job_id": next_j or None},
@@ -1557,7 +1731,7 @@ def get_job_content(
         "insight, dates_needed, standard_schedule, types_of_cases, support_staff, "
         "sf_primary_account_id, sf_worksite_account_id, sf_worksite_display_label, "
         "sf_job_id, "
-        "description_full_text, raw_columns_json, created_at"
+        "description_full_text, raw_columns_json, scrape_change_summary, created_at"
     )
     cursor_factory = RealDictCursor if HAS_PSYCOPG2 else None
     with conn.cursor(cursor_factory=cursor_factory) as cur:

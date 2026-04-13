@@ -160,12 +160,37 @@ def sync_missing_scrape_fields_to_salesforce(
 
     if not sf_job_id:
         out["reason"] = "no_sf_job_id"
+        _maybe_log(
+            conn,
+            jid_log,
+            "sf_sync_skipped_no_mapping",
+            schema,
+            {
+                "reason": "no_sf_job_id",
+                "job_id": jid_log or None,
+                "detail": (
+                    "sync_missing_scrape_fields_to_salesforce was invoked without sf_job_id on the job row; "
+                    "no Salesforce write was attempted."
+                ),
+            },
+            run_id=run_id,
+        )
         return out
 
     tok = _rest_token_from_env()
     if not tok:
         out["reason"] = "no_salesforce_credentials"
-        _maybe_log(conn, jid_log, "sf_scrape_fields_skip", schema, {"reason": out["reason"]}, run_id=run_id)
+        _maybe_log(
+            conn,
+            jid_log,
+            "sf_scrape_fields_skip",
+            schema,
+            {
+                "reason": out["reason"],
+                "detail": "Salesforce API credentials are not configured in the runtime environment, so no field write was attempted.",
+            },
+            run_id=run_id,
+        )
         return out
 
     instance_url, access_token = tok
@@ -196,7 +221,17 @@ def sync_missing_scrape_fields_to_salesforce(
     if not desired:
         out["ok"] = True
         out["reason"] = "nothing_to_send"
-        _maybe_log(conn, jid_log, "sf_scrape_fields_skip", schema, {"reason": out["reason"]}, run_id=run_id)
+        _maybe_log(
+            conn,
+            jid_log,
+            "sf_scrape_fields_skip",
+            schema,
+            {
+                "reason": out["reason"],
+                "detail": "After mapping the scrape to Salesforce fields, there was nothing non-empty to compare or send for this job.",
+            },
+            run_id=run_id,
+        )
         return out
 
     field_names = tuple(sorted(desired.keys()))
@@ -224,6 +259,7 @@ def sync_missing_scrape_fields_to_salesforce(
             schema,
             {
                 "reason": out["reason"],
+                "detail": "Compared desired values from the scrape to Salesforce; all fields already matched, so no write was sent.",
                 "sf_job_id": sf_job_id or None,
                 "checked": list(field_names),
                 "fields_compared": compared,
@@ -246,6 +282,19 @@ def sync_missing_scrape_fields_to_salesforce(
         out["patched"] = True
         out["fields"] = sorted(body.keys())
         out["dry_run_body"] = body
+        _maybe_log(
+            conn,
+            jid_log,
+            "sf_scrape_fields_skip",
+            schema,
+            {
+                "reason": "dry_run",
+                "detail": "Dry-run mode: computed Salesforce update body but did not send the API request.",
+                "sf_job_id": sf_job_id or None,
+                "would_update": sorted(body.keys()),
+            },
+            run_id=run_id,
+        )
         return out
 
     try:
@@ -335,7 +384,15 @@ def sync_missing_scrape_fields_for_job_ids(
                 event_type="sf_sync_skipped_no_mapping",
                 run_id=run_id,
                 schema=schema,
-                payload={"reason": "no sf_job_id on job_current"},
+                payload={
+                    "reason": "no_sf_job_id",
+                    "job_id": jid,
+                    "detail": (
+                        "The latest scraped row for this job has no Salesforce Job__c Id yet "
+                        "(sf_job_id is empty). Field sync runs only after mapping resolves a Job record. "
+                        "This is expected for brand-new jobs until Salesforce and mapping catch up."
+                    ),
+                },
             )
             continue
         attempted += 1

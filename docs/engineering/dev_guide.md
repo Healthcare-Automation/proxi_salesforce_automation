@@ -325,9 +325,11 @@ ORDER BY created_at;
 | `mapping_ai_match`           | Deterministic match failed; AI fuzzy-matched the practice value (payload has `kimedics_practice`, `sf_matched_value`, `confidence`) |
 | `mapping_no_match`           | No Salesforce match found — neither deterministic nor AI (payload has `ai_attempted` flag)                                          |
 | `sf_ids_update`              | SF ids written to Supabase (payload has `prev`/`next` diff)                                                                         |
-| `sf_sync_skipped_no_mapping` | Scrape sync skipped — no `sf_job_id` on this job yet (resolver didn't find a match)                                                 |
-| `sf_scrape_fields_patched`   | Fields patched on Salesforce successfully                                                                                           |
-| `sf_scrape_fields_error`     | Salesforce PATCH rejected (payload has `error` + attempted fields)                                                                  |
+| `sf_sync_skipped_no_mapping` | Scrape sync skipped — no `sf_job_id` on this job yet (payload includes `detail` + `job_id`)                                        |
+| `sf_scrape_fields_patched`   | Fields updated on Salesforce successfully (payload has `fields_changed`, `prev`/`next`)                                           |
+| `sf_scrape_fields_error`     | Salesforce update rejected (payload has `error` + attempted fields)                                                                 |
+| `job_current_sf_ids_changed` | `job_current` row got new/changed `sf_job_id` or `sf_worksite_account_id` (`saved_as`: inserted vs updated latest row)               |
+| `job_current_upsert`         | Legacy name for the above — older runs only                                                                                        |
 
 
 ---

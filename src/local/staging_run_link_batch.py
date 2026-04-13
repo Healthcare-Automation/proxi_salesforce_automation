@@ -27,7 +27,7 @@ Usage (project root)::
   python src/local/staging_run_link_batch.py --dry-run
 
 **Refresh existing rows (step 3):** do **not** pass ``--only-missing``. Playwright re-visits each link and
-``log_job_content`` upserts by ``email_scrape_id``, so ``view_job_link``, ``standard_schedule``, and
+``log_job_content`` inserts or updates the row for each ``email_scrape_id``, so ``view_job_link``, ``standard_schedule``, and
 ``raw_columns_json`` are rewritten.
 
 **Refill bad scrapes** (empty / short ``description_full_text``, e.g. after session timeout): use
@@ -158,7 +158,7 @@ def main() -> int:
     elif args.refill_sparse:
         mode = f"refill sparse job_content (description < {args.min_desc_chars} chars)"
     else:
-        mode = "all links (upsert / refresh)"
+        mode = "all links (insert or update / refresh)"
     print(f"Selected {len(rows)} row(s) with view_job_link — {mode}.")
     if args.dry_run:
         for r in rows[:5]:
