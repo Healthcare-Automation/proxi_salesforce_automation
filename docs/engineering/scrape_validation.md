@@ -185,13 +185,13 @@ def _check_formats(c: dict, issues: list) -> None:
 
 ```bash
 # From project root
-modal deploy src/production/scrape_gmail_modal.py
+modal deploy src/production/scrape_gmail_modal.py   # deploys scrape + daily_summary together
 
-# Test daily summary right now
-modal run src/production/scrape_gmail_modal.py::daily_summary_job
+# Test daily summary right now (same as scheduled job)
+modal run src/production/scrape_gmail_modal.py::run_daily_summary_once
 
 # Test scrape pipeline right now
-modal run src/production/scrape_gmail_modal.py::scrape_gmail_job
+modal run src/production/scrape_gmail_modal.py::run_once
 ```
 
 ---

@@ -9,12 +9,15 @@ daily_summary_job  — Query Supabase, validate quality, send digest email (dail
 Secrets (salesforce-automation): GMAIL_APP_PASSWORD, GMAIL_EMAIL, DB_PASSWORD,
 KIMEDICS_EMAIL, KIMEDICS_PASSWORD, OPENAI_API_KEY, plus Salesforce env vars.
 
-Deploy (from project root):
+Deploy (from project root) — registers **both** scheduled functions on app ``salesforce-automation``:
   modal deploy src/production/scrape_gmail_modal.py
 
-Run once:
-  modal run src/production/scrape_gmail_modal.py::scrape_gmail_job
-  modal run src/production/scrape_gmail_modal.py::daily_summary_job
+  - ``scrape_gmail_job`` — every 10 min; Gmail → Kimedics → Supabase → SF; per-job validation + alert emails
+  - ``daily_summary_job`` — daily cron (13:00 UTC ≈ 9 AM Eastern); 24 h Supabase stats + validation rollup digest email
+
+Run once (manual):
+  modal run src/production/scrape_gmail_modal.py::run_once
+  modal run src/production/scrape_gmail_modal.py::run_daily_summary_once
 """
 
 import os
@@ -444,6 +447,13 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
 
 @app.local_entrypoint()
 def run_once():
-    """Run the incremental scrape once (same as scheduled job)."""
+    """Run the incremental scrape once (same as scheduled ``scrape_gmail_job``)."""
     n = scrape_gmail_job.remote()
     print(f"Done: {n} new email(s) logged")
+
+
+@app.local_entrypoint()
+def run_daily_summary_once():
+    """Run the daily summary + validation digest once (same as scheduled ``daily_summary_job``)."""
+    ok = daily_summary_job.remote()
+    print(f"Done: daily summary email sent={ok}")

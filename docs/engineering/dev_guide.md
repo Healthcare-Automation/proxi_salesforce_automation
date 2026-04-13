@@ -44,9 +44,14 @@ All of these must also be added to the **Modal secret** named `salesforce-automa
 
 ## Modal — production pipeline
 
-The single production job is `src/production/scrape_gmail_modal.py`. It runs every 10 minutes via a Modal scheduled function.
+Production entrypoint: **`src/production/scrape_gmail_modal.py`**. One **`modal deploy`** registers **two** scheduled functions on app **`salesforce-automation`**:
 
-### Deploy
+| Function | Schedule | Role |
+|----------|----------|------|
+| **`scrape_gmail_job`** | Every **10 minutes** | Gmail → Playwright → Supabase → Salesforce; **`utils.scrape_validator`** on each job + **`send_scrape_alert`** when rules fire |
+| **`daily_summary_job`** | Cron **`0 13 * * *`** (13:00 UTC ≈ 9 AM Eastern during EDT) | Last **24 h** stats from Supabase; runs **`validate_scraped_job`** across recent `job_content`; **`send_daily_summary`** digest email |
+
+### Deploy (both jobs)
 
 ```bash
 modal deploy src/production/scrape_gmail_modal.py
@@ -55,21 +60,28 @@ modal deploy src/production/scrape_gmail_modal.py
 ### Run once (without waiting for schedule)
 
 ```bash
-modal run src/production/scrape_gmail_modal.py
+modal run src/production/scrape_gmail_modal.py::run_once
+modal run src/production/scrape_gmail_modal.py::run_daily_summary_once
 ```
 
 ### Check logs
 
-Modal dashboard → Apps → `salesforce-automation` → Logs.
+Modal dashboard → Apps → `salesforce-automation` → Logs (filter by function name if needed).
 
-### What the scheduled job does
+### What `scrape_gmail_job` does
 
 1. Fetch Gmail emails from the last 1 hour (`donotreply@kimedics.com`)
 2. Dedup against Supabase `email_scrapes` (skip already-logged by `job_post_id` + date)
 3. Log new emails → `scrape_runs` + `email_scrapes`
-4. For each new email with a job link: Playwright → scrape the Kimedics job page → parse → write `job_content` + upsert `job_current`
+4. For each new email with a job link: Playwright → scrape the Kimedics job page → parse → write `job_content` + upsert `job_current` (**validation + alerts** in `utils.pipeline_link_scrape`)
 5. Resolve Salesforce `sf_job_id` + `sf_worksite_account_id` for touched jobs (practice match → AI fallback → unmapped)
 6. Patch blank Salesforce fields on already-mapped jobs (External ID, External Link, status, posted date)
+
+### What `daily_summary_job` does
+
+1. Query `email_scrapes`, `scrape_runs` (paired gmail + link_batch), and `job_content` for the last 24 hours
+2. Re-run scrape validation on each row for counts and issue lists
+3. Send the HTML digest via `utils.alert_email.send_daily_summary`
 
 ---
 

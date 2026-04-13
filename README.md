@@ -53,17 +53,19 @@ Reads your inbox (e.g. **proxi@scrubnetwork.com**) for emails from **donotreply@
 python src/local/local_run_scrape_gmail.py
 ```
 
-### Modal job (scheduled, Supabase + optional Playwright)
+### Modal jobs (scheduled, same app)
 
-- **Script:** `src/production/scrape_gmail_modal.py`
-- **Schedule:** Every 10 minutes.
+- **Script:** `src/production/scrape_gmail_modal.py` — one deploy registers **both** functions on app `salesforce-automation`.
+- **`scrape_gmail_job`:** every **10 minutes** — Gmail → Kimedics (Playwright) → Supabase → Salesforce; **per-job validation** with immediate alert emails when thresholds hit.
+- **`daily_summary_job`:** **daily** (13:00 UTC ≈ 9 AM Eastern during EDT) — last **24 h** Supabase activity, **validation rollup**, digest email.
 - **Secrets:** Modal secret **salesforce-automation** (e.g. `GMAIL_APP_PASSWORD`, `DB_PASSWORD`, Kimedics creds for link scrape).
 
 **Deploy / run once:** see [docs/engineering/dev_guide.md](docs/engineering/dev_guide.md).
 
 ```bash
 modal deploy src/production/scrape_gmail_modal.py
-modal run src/production/scrape_gmail_modal.py::scrape_gmail_job
+modal run src/production/scrape_gmail_modal.py::run_once
+modal run src/production/scrape_gmail_modal.py::run_daily_summary_once
 ```
 
 ### Gmail App Password
@@ -193,7 +195,7 @@ Use a `.env` file in the **project root** (or export in the shell). `.env` is no
 | Scrape Kimedics emails → CSV | `python src/local/local_run_scrape_gmail.py` |
 | Incremental Gmail → Supabase | `python src/local/run_incremental.py` |
 | Scrape view_job_link content | `python src/local/scrape_link_content.py` (needs job_emails.csv) |
-| Deploy Modal Gmail job | `modal deploy src/production/scrape_gmail_modal.py` (see `docs/engineering/dev_guide.md`) |
+| Deploy Modal (scrape + daily summary) | `modal deploy src/production/scrape_gmail_modal.py` (see `docs/engineering/dev_guide.md`) |
 | Pull Salesforce jobs → CSV | `python src/local/pull_salesforce_jobs.py` |
 | Create one test Job__c (writes SF) | `python src/dev/create_test_job_salesforce.py --yes` |
 | Run scraping + Gmail tests | `pytest tests/ -v` |
