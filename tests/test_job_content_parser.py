@@ -104,6 +104,70 @@ def test_parse_extracts_required_and_additional_from_description():
     assert "ppe" in (out.get("additional_requirements") or "").lower()
 
 
+def test_avg_patients_per_day_from_labeled_line_in_description():
+    body = (
+        "Title #1\n"
+        "Location: City, ST\n"
+        "Practice\n"
+        "Some practice\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "Clinical Staff: 2 DA\n"
+        "Avg patients per day: 10-12\n"
+        "Additional requirements: none\n"
+    )
+    out = parse_job_content_txt(body)
+    assert (out.get("avg_patients_per_day") or "").strip() == "10-12"
+
+
+def test_roster_only_true_when_phrase_in_description():
+    body = (
+        "Title #1\n"
+        "X, ST\n"
+        "Practice\n"
+        "Practice val\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "This is a Roster Only opportunity.\n"
+    )
+    out = parse_job_content_txt(body)
+    assert (out.get("roster_only") or "").strip() == "true"
+
+
+def test_roster_only_false_when_absent():
+    body = (
+        "Title #1\n"
+        "X, ST\n"
+        "Practice\n"
+        "Practice val\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "Regular locums posting.\n"
+    )
+    out = parse_job_content_txt(body)
+    assert (out.get("roster_only") or "").strip() == "false"
+
+
+def test_roster_only_detects_roster_hyphen_only():
+    out = parse_job_content_txt("Title #9\nLoc\nPractice\nP\n--- Description (full text) ---\nRoster-only shift.\n")
+    assert (out.get("roster_only") or "").strip() == "true"
+
+
+def test_avg_patients_per_day_from_section_heading():
+    body = (
+        "Title #99\n"
+        "X, ST\n"
+        "Practice\n"
+        "999 - X, ST\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "Avg patients per day\n"
+        "8 to 10 on busy days.\n"
+    )
+    out = parse_job_content_txt(body)
+    assert "8 to 10" in (out.get("avg_patients_per_day") or "")
+
+
 def test_practice_value_backfilled_from_facility_when_header_has_job_title_on_line_3():
     body = (
         "Title #1\n"
@@ -303,6 +367,22 @@ def test_combined_types_of_cases_joins_procedures_and_additional():
     assert "\n" in bundle
     assert "surgical extractions" in bundle.lower()
     assert "limitations" in bundle.lower()
+
+
+def test_active_needs_are_overrides_dates_needed_including_labeled_dates_line():
+    """Active needs clause wins over Dates: labeled line and prior header-derived values."""
+    body = (
+        "Title #1\n"
+        "Loc, ST\n"
+        "Practice\n"
+        "x\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "4/8 update: May closed. Active needs are Fridays June 5, 12.\n"
+        "Dates: Monday only\n"
+    )
+    out = parse_job_content_txt(body)
+    assert (out.get("dates_needed") or "").strip() == "Fridays June 5, 12."
 
 
 def test_standard_schedule_cleared_when_not_hours_like():

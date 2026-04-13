@@ -18,7 +18,7 @@ import os
 import re
 from typing import Iterable, Optional
 
-from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE, extract_pay_range_from_description
+from utils.sf_pay_range import extract_pay_range_from_description
 from utils.us_state_expand import state_name_for_salesforce
 
 # Kimedics sometimes prepends ``M/D update: …`` without refreshing structured date/schedule fields.
@@ -26,6 +26,61 @@ _KIMEDICS_TOP_DATES_UPDATE = re.compile(
     r"^(?P<line>(?:\d{1,2}/\d{1,2})(?:/\d{2,4})?\s+update\s*:.*)$",
     re.IGNORECASE,
 )
+
+# Kimedics admin line may end with ``Active needs are …`` — that clause wins over structured ``dates_needed``.
+_ACTIVE_NEEDS_ARE = re.compile(r"(?i)active\s+needs\s+are\s+")
+
+# Kimedics internal phrasing for account managers — must not appear in candidate-facing copy.
+_PRESENTATION_NOTATE = re.compile(
+    r"(?i)(?:\s*[,;]+\s*)?(?:(?:\s+[-–—]\s+)|(?<=[\w\d])[-–—]\s*)?please\s+notate\s+any\s+limitations\s+in\s+presentation\.?",
+)
+
+
+def strip_internal_presentation_phrases(text: str) -> str:
+    """
+    Remove ``please notate any limitations in presentation`` (and the leading comma / dash / `` - ``),
+    including forms like ``full mouth- please notate…``.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    prev = None
+    while prev != t:
+        prev = t
+        t = _PRESENTATION_NOTATE.sub("", t)
+    t = re.sub(r",\s*,+", ", ", t)
+    # Collapse horizontal spaces only (preserve newlines in plain-text descriptions).
+    t = re.sub(r"[ \t]{2,}", " ", t).strip()
+    t = re.sub(r"[-–—]\s*$", "", t).strip()
+    t = re.sub(r",\s*$", "", t).strip()
+    return t
+
+
+def extract_active_needs_dates(description_full_text: str) -> Optional[str]:
+    """
+    If any line in ``description_full_text`` contains ``Active needs are `` (case-insensitive),
+    return the text after that phrase on the **same line** (trimmed). First match wins.
+    """
+    t = (description_full_text or "").strip()
+    if not t:
+        return None
+    for line in t.splitlines():
+        m = _ACTIVE_NEEDS_ARE.search(line)
+        if m:
+            rest = line[m.end() :].strip()
+            return rest if rest else None
+    return None
+
+
+def effective_dates_needed(row: dict) -> str:
+    """
+    Dates for Job copy and ``Job_Dates_Needed__c``: ``Active needs are …`` from ``description_full_text``
+    overrides ``dates_needed`` when present.
+    """
+    active = extract_active_needs_dates((row.get("description_full_text") or "").strip())
+    if active:
+        return active
+    return (row.get("dates_needed") or "").strip()
 
 
 def extract_kimedics_dates_update_preamble(description_full_text: str) -> Optional[str]:
@@ -81,6 +136,17 @@ def _bullets_html(lines: Iterable[str]) -> str:
     ul_style = "margin-top:0;margin-bottom:0;padding-left:20px;"
     li_style = "margin:0 0 4px 0;"
     return f"<ul style=\"{ul_style}\">" + "".join(f"<li style=\"{li_style}\">{it}</li>" for it in items) + "</ul>"
+
+
+def _capitalize_first_letter_bullet(s: str) -> str:
+    """Ensure the first alphabetic character is uppercase (Kimedics lines often start lowercase)."""
+    t = (s or "").strip()
+    if not t:
+        return t
+    for i, ch in enumerate(t):
+        if ch.isalpha():
+            return t[:i] + ch.upper() + t[i + 1 :]
+    return t
 
 
 def _as_sentence(fragment: str) -> str:
@@ -142,28 +208,26 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
     else:
         prose_loc = title_loc or "the listed location"
 
-    dates = (row.get("dates_needed") or "").strip()
+    dates = effective_dates_needed(row)
     schedule = (row.get("standard_schedule") or "").strip()
 
     raw_desc_for_pay = (row.get("description_full_text") or "").strip()
-    kimedics_dates_update = extract_kimedics_dates_update_preamble(raw_desc_for_pay)
     pay_line = (extract_pay_range_from_description(raw_desc_for_pay) or "").strip()
 
-    types_of_cases = (row.get("types_of_cases") or "").strip()
+    types_of_cases = strip_internal_presentation_phrases((row.get("types_of_cases") or "").strip())
     support_staff = (row.get("support_staff") or "").strip()
     # We intentionally do not include "source notes" in the client-facing description.
     # Keep parsing available in case we need it later.
     _ = _insight_bullet_items(row.get("insight") or "")
 
     state_license = (row.get("state_license_required") or "").strip()
-    raw_desc = (row.get("description_full_text") or "").strip()
 
     clinical_bullets: list[str] = []
     if types_of_cases:
         for segment in types_of_cases.split("\n"):
             seg = segment.strip()
             if seg:
-                clinical_bullets.append(seg)
+                clinical_bullets.append(_capitalize_first_letter_bullet(seg))
 
     support_bullets: list[str] = []
     if support_staff:
@@ -246,8 +310,6 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
         meta_lines: list[str] = []
         if dates:
             meta_lines.append(f"<strong>Dates:</strong> {_e(dates)}")
-        if kimedics_dates_update:
-            meta_lines.append(f"<strong>Kimedics posting update:</strong> {_e(kimedics_dates_update)}")
         if schedule:
             meta_lines.append(f"<strong>Schedule:</strong> {_e(schedule)}")
         if meta_lines:
@@ -269,8 +331,8 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
             chunks.append(_spacer())
             chunks.append(
                 "<p>"
-                "Full mouth extractions may be required. Any clinical limitations can be discussed during the "
-                "presentation process."
+                "Full mouth extractions may be required when clinically appropriate. Discuss any clinical "
+                "limitations with the Proxi team before the assignment."
                 "</p>"
             )
 
@@ -284,7 +346,7 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
             chunks.append("<p><strong>Requirements</strong></p>")
             chunks.append(_bullets_html(req_bullets))
 
-        return "".join(chunks).strip()
+        return strip_internal_presentation_phrases("".join(chunks).strip())
 
     # ----- Plain text (Long Text Area): spacing + section labels, no HTML -----
     lines: list[str] = []
@@ -309,11 +371,9 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
     lines.append("")
     if dates:
         lines.append(f"Dates: {dates}")
-    if kimedics_dates_update:
-        lines.append(f"Kimedics posting update: {kimedics_dates_update}")
     if schedule:
         lines.append(f"Schedule: {schedule}")
-    if dates or schedule or kimedics_dates_update:
+    if dates or schedule:
         lines.append("")
     if pay_line:
         lines.append(f"Pay Range: {pay_line}")
@@ -328,7 +388,8 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
         lines.append(_bullets_plain(clinical_bullets))
         lines.append("")
         lines.append(
-            "Full mouth extractions may be required. Any clinical limitations can be discussed during the presentation process."
+            "Full mouth extractions may be required when clinically appropriate. Discuss any clinical "
+            "limitations with the Proxi team before the assignment."
         )
         lines.append("")
     if support_bullets:
@@ -339,4 +400,4 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
         lines.append("REQUIREMENTS")
         lines.append(_bullets_plain(req_bullets))
 
-    return "\n".join(lines).strip()
+    return strip_internal_presentation_phrases("\n".join(lines).strip())

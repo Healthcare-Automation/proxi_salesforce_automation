@@ -7,8 +7,12 @@ Order:
 3. **Practice** match: normalized ``practice_value`` ↔ ``Job_Client_Job_Id__c`` (1:1 only; N>1 → ambiguous, no update).
 4. **External Job ID** match: Kimedics ``job_id`` ↔ ``External_Job_ID__c`` (1:1 only; same truncation as push).
 5. **AI** fallback on practice string when practice key had 0 hits.
-6. **No match**: log ``mapping_no_match``; if ``PROXI_SF_CREATE_JOBS=true``, **POST** a new ``Job__c``
-   (needs a worksite Account Id from ``sf_worksite_location_map`` or ``PROXI_SF_CREATE_WORKSITES=true``).
+6. **No match**: log ``mapping_no_match``; if ``PROXI_SF_CREATE_JOBS=true`` and ``PROXI_SF_UPDATE_JOBS``
+   is not false, **POST** a new ``Job__c`` (needs a worksite Account Id from ``sf_worksite_location_map``
+   or ``PROXI_SF_CREATE_WORKSITES=true``).
+
+Before POST, a **direct SOQL** by ``External_Job_ID__c`` runs so an existing ``Job__c`` (e.g. after
+Supabase was reset but Salesforce was not) **re-links** instead of duplicate-create failing.
 
 Does not create jobs when mapping is ambiguous (1:N).
 """
@@ -19,6 +23,7 @@ import os
 from typing import Sequence, Optional
 
 from utils.sf_practice_key import practice_key
+from utils.sf_write_flags import proxi_sf_writes_enabled
 
 
 def _env_truthy(name: str) -> bool:
@@ -67,16 +72,32 @@ def _try_create_sf_job_after_no_match(
         update_sf_ids_for_job,
         fetch_worksite_account_id_for_location,
     )
-    from utils.sf_job_payload import prepare_payload_for_write
+    from utils.sf_job_payload import _truncate_external_job_id, prepare_payload_for_write
     from utils.sf_job_rest_minimal import (
         create_job_record,
         describe_sobject,
         filter_createable_fields,
+        is_salesforce_deleted_entity_error,
     )
+    from utils.salesforce import query_jobs_by_external_id_exact
     from utils.sf_worksite_create import fetch_or_create_worksite_account_id
 
     jid = (job_id or "").strip()
     if not jid or conn is None:
+        return False
+
+    if not proxi_sf_writes_enabled():
+        log_job_event(
+            conn,
+            job_id=jid,
+            event_type="job_create_skipped",
+            schema=schema,
+            run_id=run_id,
+            payload={
+                "reason": "PROXI_SF_UPDATE_JOBS=false",
+                "detail": "Job__c auto-create is disabled when Salesforce writes are off.",
+            },
+        )
         return False
 
     cur = get_job_current(conn, job_ids=[jid], limit=1, schema=schema)
@@ -112,6 +133,7 @@ def _try_create_sf_job_after_no_match(
                 state,
                 instance_url=instance_url,
                 access_token=access_token,
+                address_line=(latest.get("address_line") or "").strip() or None,
                 schema=schema,
                 run_id=run_id,
                 job_id_for_log=jid,
@@ -130,6 +152,52 @@ def _try_create_sf_job_after_no_match(
         return False
 
     latest["sf_worksite_account_id"] = w
+
+    eid_trim = _truncate_external_job_id(jid)
+    if eid_trim:
+        try:
+            ex_hits = query_jobs_by_external_id_exact(
+                instance_url, access_token, eid_trim, job_object_name=job_object_name
+            )
+        except Exception:
+            ex_hits = []
+        if len(ex_hits) == 1:
+            rec = ex_hits[0]
+            sfid = (rec.get("Id") or "").strip()
+            wid_sf = (rec.get("Job_Worksite_Location_1__c") or "").strip()
+            wid_use = wid_sf or w
+            if sfid:
+                update_sf_ids_for_job(
+                    conn,
+                    job_id=jid,
+                    sf_job_id=sfid,
+                    sf_worksite_account_id=wid_use,
+                    source="sf_existing_by_external_id_query",
+                    mapping_status="resolved",
+                    mapping_detail=(
+                        "Existing Job__c with same External_Job_ID__c (re-link; avoids duplicate POST "
+                        "after Supabase SF ids cleared)"
+                    ),
+                    run_id=run_id,
+                    schema=schema,
+                )
+                return True
+        if len(ex_hits) > 1:
+            log_job_event(
+                conn,
+                job_id=jid,
+                event_type="mapping_ambiguous",
+                schema=schema,
+                run_id=run_id,
+                payload={
+                    "source": "sf_external_job_id_direct_query",
+                    "external_id": eid_trim,
+                    "hits": len(ex_hits),
+                    "candidate_sf_job_ids": [(r.get("Id") or "").strip() for r in ex_hits],
+                },
+            )
+            return False
+
     try:
         from utils.job_sf_enrichment import enrich_cleaned_row_salesforce_fields
 
@@ -138,30 +206,96 @@ def _try_create_sf_job_after_no_match(
         pass
 
     use_html = os.environ.get("PROXI_JOB_DESCRIPTION_HTML", "true").lower() in ("1", "true", "yes")
-    try:
-        describe = describe_sobject(instance_url, access_token, job_object_name)
-        fields = prepare_payload_for_write(
-            latest,
-            describe,
-            for_update=False,
-            use_canonical_description=True,
-            description_use_html=use_html,
-        )
-        fields = filter_createable_fields(describe, fields)
-        if not fields:
-            raise RuntimeError("create payload empty after createable filter")
-        resp = create_job_record(instance_url, access_token, job_object_name, fields)
-        new_job_id = (resp.get("id") or "").strip()
-        if not new_job_id:
-            raise RuntimeError(f"create Job__c returned no id: {resp!r}")
-    except Exception as e:
+    describe = describe_sobject(instance_url, access_token, job_object_name)
+    new_job_id = ""
+    attempt = 0
+    last_exc: Optional[BaseException] = None
+    while attempt < 2:
+        try:
+            fields = prepare_payload_for_write(
+                latest,
+                describe,
+                for_update=False,
+                use_canonical_description=True,
+                description_use_html=use_html,
+            )
+            fields = filter_createable_fields(describe, fields)
+            if not fields:
+                raise RuntimeError("create payload empty after createable filter")
+            resp = create_job_record(instance_url, access_token, job_object_name, fields)
+            new_job_id = (resp.get("id") or "").strip()
+            if not new_job_id:
+                raise RuntimeError(f"create Job__c returned no id: {resp!r}")
+            last_exc = None
+            break
+        except Exception as e:
+            last_exc = e
+            if (
+                attempt == 0
+                and is_salesforce_deleted_entity_error(e)
+                and city
+                and state
+            ):
+                from utils.supabase_db import (
+                    delete_worksite_location_map_by_salesforce_account_id,
+                    delete_worksite_location_map_for_location,
+                )
+
+                n_map = 0
+                if w:
+                    n_map += delete_worksite_location_map_by_salesforce_account_id(
+                        conn, w, schema=schema
+                    )
+                n_map += delete_worksite_location_map_for_location(conn, city, state, schema=schema)
+                log_job_event(
+                    conn,
+                    job_id=jid,
+                    event_type="worksite_stale_map_cleared",
+                    schema=schema,
+                    run_id=run_id,
+                    payload={
+                        "reason": "salesforce_entity_deleted_on_create",
+                        "detail": str(e)[:1500],
+                        "prior_sf_worksite_account_id": w or None,
+                        "map_rows_deleted": n_map,
+                    },
+                )
+                latest["sf_worksite_account_id"] = ""
+                if _env_truthy("PROXI_SF_CREATE_WORKSITES"):
+                    w = (
+                        fetch_or_create_worksite_account_id(
+                            conn,
+                            city,
+                            state,
+                            instance_url=instance_url,
+                            access_token=access_token,
+                            address_line=(latest.get("address_line") or "").strip() or None,
+                            schema=schema,
+                            run_id=run_id,
+                            job_id_for_log=jid,
+                            skip_location_lookup=True,
+                        )
+                        or ""
+                    )
+                else:
+                    w = ""
+                if not w:
+                    break
+                latest["sf_worksite_account_id"] = w
+                attempt += 1
+                continue
+            break
+
+    if last_exc is not None or not new_job_id:
         log_job_event(
             conn,
             job_id=jid,
             event_type="job_create_failed",
             schema=schema,
             run_id=run_id,
-            payload={"error": str(e)[:2000]},
+            payload={
+                "error": (str(last_exc)[:2000] if last_exc else "create returned no id"),
+            },
         )
         return False
 
@@ -182,7 +316,16 @@ def _try_create_sf_job_after_no_match(
         event_type="job_created_in_salesforce",
         schema=schema,
         run_id=run_id,
-        payload={"sf_job_id": new_job_id, "sf_worksite_account_id": w},
+        payload={
+            "sf_job_id": new_job_id,
+            "sf_worksite_account_id": w,
+            # Stable keys for automation-hub (and other consumers) to detect auto-create vs match.
+            "automation_kind": "salesforce_job_auto_created",
+            "summary": (
+                "POST created a new Job__c after no 1:1 practice / External_Job_ID__c / AI match "
+                "(PROXI_SF_CREATE_JOBS)."
+            ),
+        },
     )
     return True
 

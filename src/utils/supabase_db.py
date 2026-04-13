@@ -111,7 +111,7 @@ def get_conn():
 #
 # Logical column order (used in INSERT/UPDATE/SELECT and fresh CREATE TABLE):
 #   provenance → identity & location (incl. practice, city, state, address_line) → org/status/POC/dates
-#   → parsed description fields (insight, scheduling, clinical incl. types_of_cases) → Salesforce ids
+#   → parsed description fields (insight, scheduling, clinical incl. types_of_cases, avg_patients_per_day, roster_only) → Salesforce ids
 #   → description_full_text (+ raw_columns_json on job_content) → updated/created metadata.
 # Existing databases keep their physical column order; code always lists columns explicitly.
 JOB_TABLE_EXTRA_TEXT_COLUMNS: tuple[str, ...] = (
@@ -124,6 +124,8 @@ JOB_TABLE_EXTRA_TEXT_COLUMNS: tuple[str, ...] = (
     "standard_schedule",
     "types_of_cases",
     "support_staff",
+    "avg_patients_per_day",
+    "roster_only",
     "sf_primary_account_id",
     "sf_worksite_account_id",
     "sf_worksite_display_label",
@@ -245,6 +247,19 @@ def _ensure_sf_mapping_tables(conn, schema: str = "public") -> None:
                 """
             ).format(wmap)
         )
+        # Existing DBs (e.g. older staging) may already have this table without city/state;
+        # CREATE TABLE IF NOT EXISTS does not add new columns, so migrate before indexing.
+        for alter_tail in (
+            "ADD COLUMN IF NOT EXISTS location_key TEXT",
+            "ADD COLUMN IF NOT EXISTS city TEXT",
+            "ADD COLUMN IF NOT EXISTS state TEXT",
+            "ADD COLUMN IF NOT EXISTS salesforce_account_id TEXT",
+            "ADD COLUMN IF NOT EXISTS display_label TEXT",
+            "ADD COLUMN IF NOT EXISTS source TEXT",
+            "ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
+            "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
+        ):
+            cur.execute(pg_sql.SQL("ALTER TABLE {} " + alter_tail + ";").format(wmap))
         cur.execute(
             pg_sql.SQL(
                 "CREATE INDEX IF NOT EXISTS sf_worksite_location_map_city_state ON {} (city, state);"
@@ -337,6 +352,219 @@ def upsert_worksite_account_id_for_location(
             ),
         )
     conn.commit()
+
+
+def delete_worksite_location_map_for_location(
+    conn,
+    city: str,
+    state: str,
+    *,
+    schema: str = "public",
+) -> int:
+    """
+    Remove the ``sf_worksite_location_map`` row for normalized (city, state).
+
+    Used when Salesforce returns **entity is deleted** for a worksite Account Id still stored
+    in the map so the next create can POST a new Account and upsert a fresh Id.
+    """
+    if conn is None or not HAS_PSYCOPG2 or pg_sql is None:
+        return 0
+    schema = _validate_pg_identifier(schema, "schema")
+    key = _normalize_location_key(city, state)
+    if not key:
+        return 0
+    wmap = _tbl(schema, "sf_worksite_location_map")
+    with conn.cursor() as cur:
+        cur.execute(pg_sql.SQL("DELETE FROM {} WHERE location_key = %s;").format(wmap), (key,))
+        return int(cur.rowcount or 0)
+
+
+def delete_worksite_location_map_by_salesforce_account_id(
+    conn,
+    salesforce_account_id: str,
+    *,
+    schema: str = "public",
+) -> int:
+    """Delete any map row pointing at a Salesforce Account Id (e.g. after SF admin deleted the Account)."""
+    if conn is None or not HAS_PSYCOPG2 or pg_sql is None:
+        return 0
+    sid = (salesforce_account_id or "").strip()
+    if not sid:
+        return 0
+    schema = _validate_pg_identifier(schema, "schema")
+    wmap = _tbl(schema, "sf_worksite_location_map")
+    with conn.cursor() as cur:
+        cur.execute(
+            pg_sql.SQL("DELETE FROM {} WHERE salesforce_account_id = %s;").format(wmap),
+            (sid,),
+        )
+        return int(cur.rowcount or 0)
+
+
+def delete_all_records_for_job_id(
+    conn,
+    job_id: str,
+    *,
+    schema: str = "public",
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """
+    Remove all pipeline rows tied to a Kimedics ``job_id`` (same value as ``job_post_id`` in emails).
+
+    Deletes (in order respecting FKs):
+
+    - ``job_event_log`` rows for this ``job_id``
+    - Clears ``job_current.last_job_content_id``, then ``job_content``, then ``job_current``
+    - ``email_scrapes`` with ``job_post_id`` = ``job_id``
+    - ``scrape_runs`` that end up with no remaining ``email_scrapes``, ``job_content``, or ``job_event_log`` rows
+
+    Does **not** delete ``sf_worksite_location_map`` or ``sf_account_reference`` (not keyed by job).
+
+    Returns per-step row counts (``dry_run`` uses SELECT counts only; no mutations).
+    """
+    if conn is None or not HAS_PSYCOPG2 or pg_sql is None:
+        raise RuntimeError("psycopg2 connection required")
+    jid = (job_id or "").strip()
+    if not jid:
+        raise ValueError("job_id must be non-empty")
+    schema = _validate_pg_identifier(schema, "schema")
+    jc = _tbl(schema, "job_content")
+    jcur = _tbl(schema, "job_current")
+    jel = _tbl(schema, "job_event_log")
+    es = _tbl(schema, "email_scrapes")
+    sr = _tbl(schema, "scrape_runs")
+
+    stats: dict[str, int] = {
+        "job_event_log": 0,
+        "job_current_last_content_nulled": 0,
+        "job_content": 0,
+        "job_current": 0,
+        "email_scrapes": 0,
+        "scrape_runs_orphans": 0,
+    }
+
+    with conn.cursor() as cur:
+        cur.execute(
+            pg_sql.SQL(
+                """
+                SELECT DISTINCT run_id FROM {} WHERE run_id IS NOT NULL AND (job_id = %s OR job_post_id = %s)
+                UNION
+                SELECT DISTINCT run_id FROM {} WHERE run_id IS NOT NULL AND job_post_id = %s;
+                """
+            ).format(jc, es),
+            (jid, jid, jid),
+        )
+        run_ids = sorted({int(r[0]) for r in cur.fetchall() if r[0] is not None})
+
+        cur.execute(
+            pg_sql.SQL("SELECT COUNT(*) FROM {} WHERE job_id = %s;").format(jel),
+            (jid,),
+        )
+        stats["job_event_log"] = int(cur.fetchone()[0])
+
+        cur.execute(
+            pg_sql.SQL(
+                "SELECT COUNT(*) FROM {} WHERE job_id = %s AND last_job_content_id IS NOT NULL;"
+            ).format(jcur),
+            (jid,),
+        )
+        stats["job_current_last_content_nulled"] = int(cur.fetchone()[0])
+
+        cur.execute(
+            pg_sql.SQL(
+                "SELECT COUNT(*) FROM {} WHERE job_id = %s OR job_post_id = %s;"
+            ).format(jc),
+            (jid, jid),
+        )
+        stats["job_content"] = int(cur.fetchone()[0])
+
+        cur.execute(
+            pg_sql.SQL("SELECT COUNT(*) FROM {} WHERE job_id = %s;").format(jcur),
+            (jid,),
+        )
+        stats["job_current"] = int(cur.fetchone()[0])
+
+        cur.execute(
+            pg_sql.SQL("SELECT COUNT(*) FROM {} WHERE job_post_id = %s;").format(es),
+            (jid,),
+        )
+        stats["email_scrapes"] = int(cur.fetchone()[0])
+
+        # After this job's rows would be removed, these runs would have no remaining children.
+        orphan_runs = 0
+        for rid in run_ids:
+            cur.execute(
+                pg_sql.SQL(
+                    "SELECT COUNT(*) FROM {} WHERE run_id = %s AND NOT (job_post_id IS NOT DISTINCT FROM %s);"
+                ).format(es),
+                (rid, jid),
+            )
+            n_es = int(cur.fetchone()[0])
+            cur.execute(
+                pg_sql.SQL(
+                    "SELECT COUNT(*) FROM {} WHERE run_id = %s "
+                    "AND NOT (job_id IS NOT DISTINCT FROM %s OR job_post_id IS NOT DISTINCT FROM %s);"
+                ).format(jc),
+                (rid, jid, jid),
+            )
+            n_jc = int(cur.fetchone()[0])
+            cur.execute(
+                pg_sql.SQL(
+                    "SELECT COUNT(*) FROM {} WHERE run_id = %s AND NOT (job_id IS NOT DISTINCT FROM %s);"
+                ).format(jel),
+                (rid, jid),
+            )
+            n_jel = int(cur.fetchone()[0])
+            if n_es == 0 and n_jc == 0 and n_jel == 0:
+                orphan_runs += 1
+        stats["scrape_runs_orphans"] = orphan_runs
+
+    if dry_run:
+        return stats
+
+    with conn.cursor() as cur:
+        cur.execute(pg_sql.SQL("DELETE FROM {} WHERE job_id = %s;").format(jel), (jid,))
+
+        cur.execute(
+            pg_sql.SQL("UPDATE {} SET last_job_content_id = NULL WHERE job_id = %s;").format(jcur),
+            (jid,),
+        )
+
+        cur.execute(
+            pg_sql.SQL("DELETE FROM {} WHERE job_id = %s OR job_post_id = %s;").format(jc),
+            (jid, jid),
+        )
+
+        cur.execute(pg_sql.SQL("DELETE FROM {} WHERE job_id = %s;").format(jcur), (jid,))
+
+        cur.execute(
+            pg_sql.SQL("DELETE FROM {} WHERE job_post_id = %s;").format(es),
+            (jid,),
+        )
+
+        deleted_runs = 0
+        for rid in run_ids:
+            cur.execute(
+                pg_sql.SQL("SELECT COUNT(*) FROM {} WHERE run_id = %s;").format(es),
+                (rid,),
+            )
+            n_es = int(cur.fetchone()[0])
+            cur.execute(
+                pg_sql.SQL("SELECT COUNT(*) FROM {} WHERE run_id = %s;").format(jc),
+                (rid,),
+            )
+            n_jc = int(cur.fetchone()[0])
+            cur.execute(
+                pg_sql.SQL("SELECT COUNT(*) FROM {} WHERE run_id = %s;").format(jel),
+                (rid,),
+            )
+            n_jel = int(cur.fetchone()[0])
+            if n_es == 0 and n_jc == 0 and n_jel == 0:
+                cur.execute(pg_sql.SQL("DELETE FROM {} WHERE id = %s;").format(sr), (rid,))
+                deleted_runs += int(cur.rowcount or 0)
+        stats["scrape_runs_orphans"] = deleted_runs
+
+    return stats
 
 
 def _ensure_job_event_log_table(conn, schema: str = "public") -> None:
@@ -496,6 +724,8 @@ def _create_job_content_table(conn, schema: str) -> None:
                     standard_schedule TEXT,
                     types_of_cases TEXT,
                     support_staff TEXT,
+                    avg_patients_per_day TEXT,
+                    roster_only TEXT,
                     sf_primary_account_id TEXT,
                     sf_worksite_account_id TEXT,
                     sf_worksite_display_label TEXT,
@@ -542,6 +772,8 @@ def _create_job_current_table(conn, schema: str) -> None:
                     standard_schedule TEXT,
                     types_of_cases TEXT,
                     support_staff TEXT,
+                    avg_patients_per_day TEXT,
+                    roster_only TEXT,
                     sf_primary_account_id TEXT,
                     sf_worksite_account_id TEXT,
                     sf_worksite_display_label TEXT,
@@ -640,6 +872,8 @@ def ensure_tables(conn) -> None:
                 standard_schedule TEXT,
                 types_of_cases TEXT,
                 support_staff TEXT,
+                avg_patients_per_day TEXT,
+                roster_only TEXT,
                 sf_primary_account_id TEXT,
                 sf_worksite_account_id TEXT,
                 sf_worksite_display_label TEXT,
@@ -673,6 +907,8 @@ def ensure_tables(conn) -> None:
                 standard_schedule TEXT,
                 types_of_cases TEXT,
                 support_staff TEXT,
+                avg_patients_per_day TEXT,
+                roster_only TEXT,
                 sf_primary_account_id TEXT,
                 sf_worksite_account_id TEXT,
                 sf_worksite_display_label TEXT,
@@ -1270,6 +1506,8 @@ _JOB_CONTENT_SUMMARY_COLUMNS: tuple[str, ...] = (
     "standard_schedule",
     "types_of_cases",
     "support_staff",
+    "avg_patients_per_day",
+    "roster_only",
     "sf_primary_account_id",
     "sf_worksite_account_id",
     "sf_worksite_display_label",
@@ -1301,6 +1539,8 @@ _SUMMARY_LABELS: dict[str, str] = {
     "standard_schedule": "standard schedule",
     "types_of_cases": "types of cases",
     "support_staff": "support staff",
+    "avg_patients_per_day": "avg patients per day",
+    "roster_only": "roster only",
     "sf_primary_account_id": "SF primary account",
     "sf_worksite_account_id": "SF worksite account",
     "sf_worksite_display_label": "SF worksite label",
@@ -1319,6 +1559,45 @@ def _norm_for_scrape_summary(val) -> str:
         except Exception:
             pass
     return str(val).strip()
+
+
+def _fetch_latest_prior_job_content_summary(
+    conn,
+    *,
+    canonical_job_key: str,
+    schema: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Most recent ``job_content`` row for the same Kimedics job (by ``job_id`` or ``job_post_id``),
+    for summarizing a **new** ``job_content`` insert (new email) vs prior notifications.
+    """
+    if (
+        not canonical_job_key
+        or conn is None
+        or not HAS_PSYCOPG2
+        or pg_sql is None
+    ):
+        return None
+    schema = _validate_pg_identifier(schema, "schema")
+    jt = _tbl(schema, "job_content")
+    idents = [pg_sql.Identifier(c) for c in _JOB_CONTENT_SUMMARY_COLUMNS]
+    _sel_cols = pg_sql.SQL(", ").join(idents)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            pg_sql.SQL(
+                """
+                SELECT {cols} FROM {jt}
+                WHERE job_id = %s OR job_post_id = %s
+                ORDER BY id DESC
+                LIMIT 1;
+                """
+            ).format(cols=_sel_cols, jt=jt),
+            (canonical_job_key, canonical_job_key),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {k: row.get(k) for k in _JOB_CONTENT_SUMMARY_COLUMNS}
 
 
 def _job_content_snapshot_for_summary(
@@ -1354,6 +1633,8 @@ def _job_content_snapshot_for_summary(
         "standard_schedule": _txt(c, "standard_schedule"),
         "types_of_cases": _types_of_cases(c),
         "support_staff": _txt(c, "support_staff"),
+        "avg_patients_per_day": _txt(c, "avg_patients_per_day"),
+        "roster_only": _txt(c, "roster_only"),
         "sf_primary_account_id": _txt(c, "sf_primary_account_id"),
         "sf_worksite_account_id": _txt(c, "sf_worksite_account_id"),
         "sf_worksite_display_label": _txt(c, "sf_worksite_display_label"),
@@ -1362,25 +1643,48 @@ def _job_content_snapshot_for_summary(
     }
 
 
+def _scrape_summary_changed_fields_truncated(
+    changed: list[str],
+    *,
+    max_labels: int = 5,
+) -> str:
+    """Comma-separated field labels, capped so summaries stay short in the UI."""
+    if not changed:
+        return ""
+    if len(changed) <= max_labels:
+        return ", ".join(changed)
+    head = ", ".join(changed[:max_labels])
+    return f"{head} (+{len(changed) - max_labels} more)"
+
+
 def _build_scrape_change_summary(
     *,
     updating_existing_row: bool,
     prev: Optional[dict],
     new_row: dict[str, Any],
+    prior_same_job_snapshot: Optional[dict] = None,
 ) -> str:
     if not updating_existing_row:
-        return "First capture from Kimedics scrape for this email."
+        if prior_same_job_snapshot is None:
+            return "First notify."
+        changed_ns: list[str] = []
+        for col in _JOB_CONTENT_SUMMARY_COLUMNS:
+            if _norm_for_scrape_summary(prior_same_job_snapshot.get(col)) != _norm_for_scrape_summary(
+                new_row.get(col)
+            ):
+                changed_ns.append(_SUMMARY_LABELS.get(col, col.replace("_", " ")))
+        if not changed_ns:
+            return "Later notify; no diffs."
+        return "Later notify: " + _scrape_summary_changed_fields_truncated(changed_ns)
     if not prev:
-        return "Updated job row from scrape (no prior snapshot to compare)."
+        return "Rescrape; no baseline."
     changed: list[str] = []
     for col in _JOB_CONTENT_SUMMARY_COLUMNS:
         if _norm_for_scrape_summary(prev.get(col)) != _norm_for_scrape_summary(new_row.get(col)):
             changed.append(_SUMMARY_LABELS.get(col, col.replace("_", " ")))
     if not changed:
-        return (
-            "Scrape re-run saved; no changes to stored job fields vs the prior version for this email."
-        )
-    return "Updated from scrape vs prior saved row: " + ", ".join(changed)
+        return "Rescrape; no diffs."
+    return "Rescrape: " + _scrape_summary_changed_fields_truncated(changed)
 
 
 def log_job_content(
@@ -1447,6 +1751,8 @@ def log_job_content(
         _txt(cleaned, "standard_schedule"),
         _types_of_cases(cleaned),
         _txt(cleaned, "support_staff"),
+        _txt(cleaned, "avg_patients_per_day"),
+        _txt(cleaned, "roster_only"),
         _txt(cleaned, "sf_primary_account_id"),
         _txt(cleaned, "sf_worksite_account_id"),
         _txt(cleaned, "sf_worksite_display_label"),
@@ -1490,7 +1796,7 @@ def log_job_content(
                             point_of_contact = %s, provider_start_date = %s, provider_end_date = %s,
                             posted_date = %s,
                             insight = %s, dates_needed = %s, standard_schedule = %s,
-                            types_of_cases = %s, support_staff = %s,
+                            types_of_cases = %s, support_staff = %s, avg_patients_per_day = %s, roster_only = %s,
                             sf_primary_account_id = %s, sf_worksite_account_id = %s, sf_worksite_display_label = %s,
                             sf_job_id = %s,
                             description_full_text = %s, raw_columns_json = %s,
@@ -1514,10 +1820,15 @@ def log_job_content(
                         run_id=run_id,
                     )
                 return content_id
+        canon = (str(cleaned.get("job_id") or "").strip() or str(job_post_id or "").strip())
+        prior_same = _fetch_latest_prior_job_content_summary(
+            conn, canonical_job_key=canon, schema=schema
+        )
         summary_ins = _build_scrape_change_summary(
             updating_existing_row=False,
             prev=None,
             new_row=row_snap,
+            prior_same_job_snapshot=prior_same,
         )
         cur.execute(
             pg_sql.SQL(
@@ -1528,13 +1839,13 @@ def log_job_content(
                     job_title, posting_org, priority, status, point_of_contact,
                     provider_start_date, provider_end_date, posted_date,
                     insight, dates_needed, standard_schedule, types_of_cases,
-                    support_staff,
+                    support_staff, avg_patients_per_day, roster_only,
                     sf_primary_account_id, sf_worksite_account_id, sf_worksite_display_label,
                     sf_job_id,
                     description_full_text, raw_columns_json, scrape_change_summary
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 RETURNING id;
                 """
@@ -1600,13 +1911,13 @@ def _upsert_job_current(
                     job_title, posting_org, priority, status, point_of_contact,
                     provider_start_date, provider_end_date, posted_date, view_job_link,
                     insight, dates_needed, standard_schedule, types_of_cases,
-                    support_staff,
+                    support_staff, avg_patients_per_day, roster_only,
                     sf_primary_account_id, sf_worksite_account_id, sf_worksite_display_label,
                     sf_job_id,
                     description_full_text, last_job_content_id, updated_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
                 )
                 ON CONFLICT (job_id) DO UPDATE SET
                     title_line = EXCLUDED.title_line,
@@ -1629,6 +1940,8 @@ def _upsert_job_current(
                     standard_schedule = EXCLUDED.standard_schedule,
                     types_of_cases = EXCLUDED.types_of_cases,
                     support_staff = EXCLUDED.support_staff,
+                    avg_patients_per_day = EXCLUDED.avg_patients_per_day,
+                    roster_only = EXCLUDED.roster_only,
                     sf_primary_account_id = EXCLUDED.sf_primary_account_id,
                     sf_worksite_account_id = EXCLUDED.sf_worksite_account_id,
                     sf_worksite_display_label = EXCLUDED.sf_worksite_display_label,
@@ -1660,6 +1973,8 @@ def _upsert_job_current(
                 _txt(cleaned, "standard_schedule"),
                 _types_of_cases(cleaned),
                 _txt(cleaned, "support_staff"),
+                _txt(cleaned, "avg_patients_per_day"),
+                _txt(cleaned, "roster_only"),
                 _txt(cleaned, "sf_primary_account_id"),
                 _txt(cleaned, "sf_worksite_account_id"),
                 _txt(cleaned, "sf_worksite_display_label"),
@@ -1729,6 +2044,7 @@ def get_job_content(
         "job_title, posting_org, priority, status, "
         "point_of_contact, provider_start_date, provider_end_date, posted_date, "
         "insight, dates_needed, standard_schedule, types_of_cases, support_staff, "
+        "avg_patients_per_day, roster_only, "
         "sf_primary_account_id, sf_worksite_account_id, sf_worksite_display_label, "
         "sf_job_id, "
         "description_full_text, raw_columns_json, scrape_change_summary, created_at"
@@ -1778,6 +2094,7 @@ def get_job_current(
         "job_title, posting_org, priority, status, point_of_contact, "
         "provider_start_date, provider_end_date, posted_date, view_job_link, "
         "insight, dates_needed, standard_schedule, types_of_cases, support_staff, "
+        "avg_patients_per_day, roster_only, "
         "sf_primary_account_id, sf_worksite_account_id, sf_worksite_display_label, "
         "sf_job_id, "
         "description_full_text, last_job_content_id, updated_at"

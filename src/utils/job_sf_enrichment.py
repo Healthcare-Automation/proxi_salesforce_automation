@@ -80,6 +80,7 @@ def enrich_cleaned_row_salesforce_fields(
                     state,
                     instance_url=iu,
                     access_token=at,
+                    address_line=(cleaned.get("address_line") or "").strip() or None,
                     schema=schema,
                     run_id=None,
                     job_id_for_log=jid_log,

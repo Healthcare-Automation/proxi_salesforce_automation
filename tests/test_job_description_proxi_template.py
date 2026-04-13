@@ -4,7 +4,9 @@ import pytest
 
 from utils.job_description_proxi_template import (
     build_proxi_job_posting_description,
+    extract_active_needs_dates,
     extract_kimedics_dates_update_preamble,
+    strip_internal_presentation_phrases,
 )
 
 
@@ -55,6 +57,56 @@ def test_build_plain_has_section_breaks():
     assert "HIGHLIGHTS" not in out
 
 
+def test_strip_internal_presentation_phrases_dash_before():
+    raw = "extractions could include simple/ surgical/ full mouth- please notate any limitations in presentation"
+    assert "notate" not in strip_internal_presentation_phrases(raw).lower()
+    assert "presentation" not in strip_internal_presentation_phrases(raw).lower()
+    assert "full mouth" in strip_internal_presentation_phrases(raw).lower()
+
+
+def test_clinical_scope_capitalizes_first_letter():
+    row = _minimal_row()
+    row["types_of_cases"] = "extractions could include simple and surgical\nrestorative procedures"
+    out = build_proxi_job_posting_description(row, use_html=True)
+    assert "Extractions could include" in out
+    assert "Restorative procedures" in out
+
+
+def test_strip_internal_phrases_in_html_clinical_scope():
+    row = _minimal_row()
+    row["types_of_cases"] = (
+        "Surgical extractions\n"
+        "restorative - please notate any limitations in presentation"
+    )
+    out = build_proxi_job_posting_description(row, use_html=True)
+    assert "please notate" not in out.lower()
+    assert "restorative" in out.lower()
+
+
+def test_extract_active_needs_dates():
+    line = (
+        "4/8 update: May dates are closed for internal alignment. "
+        "Partial confirmation for June/ July. "
+        "Active needs are Fridays June 5, 12, 19, 26, July 10, 17, 24, 31"
+    )
+    want = "Fridays June 5, 12, 19, 26, July 10, 17, 24, 31"
+    assert extract_active_needs_dates(line) == want
+    assert extract_active_needs_dates(f"{line}\n\nMore body") == want
+    assert extract_active_needs_dates("ACTIVE NEEDS ARE Mon–Wed") == "Mon–Wed"
+    assert extract_active_needs_dates("No marker here") is None
+
+
+def test_active_needs_dates_in_template_overrides_dates_needed_column():
+    row = _minimal_row()
+    row["dates_needed"] = "Monday only"
+    row["description_full_text"] = (
+        "4/8 update: x. Active needs are Fridays June 5, 12, 19.\n\nPay Range: $125 – $145 per hour\n"
+    )
+    out = build_proxi_job_posting_description(row, use_html=True)
+    assert "Fridays June 5, 12, 19" in out
+    assert "Monday only" not in out
+
+
 def test_extract_kimedics_dates_update_preamble():
     line = "4/8 update: May dates are closed for internal alignment."
     assert extract_kimedics_dates_update_preamble(f"{line}\n\nRequired procedures: …") == line
@@ -62,10 +114,15 @@ def test_extract_kimedics_dates_update_preamble():
     assert extract_kimedics_dates_update_preamble("No header here") is None
 
 
-def test_html_includes_kimedics_posting_update_in_dates_block():
+def test_kimedics_admin_preamble_not_in_client_job_description():
+    """Internal M/D update lines stay out of Job_Client_Job_Description__c (not client-facing)."""
     row = _minimal_row()
     note = "4/8 update: May dates are closed."
     row["description_full_text"] = f"{note}\n\nPay Range: $125 – $145 per hour\n"
-    out = build_proxi_job_posting_description(row, use_html=True)
-    assert "Kimedics posting update" in out
-    assert "4/8 update" in out
+    out_html = build_proxi_job_posting_description(row, use_html=True)
+    out_plain = build_proxi_job_posting_description(row, use_html=False)
+    assert "Kimedics posting update" not in out_html
+    assert "Kimedics posting update" not in out_plain
+    assert "4/8 update" not in out_html
+    assert "4/8 update" not in out_plain
+    assert extract_kimedics_dates_update_preamble(row["description_full_text"]) == note

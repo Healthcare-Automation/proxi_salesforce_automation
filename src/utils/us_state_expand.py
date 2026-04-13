@@ -76,3 +76,21 @@ def state_name_for_salesforce(state: Optional[str]) -> str:
     if len(s) == 2 and s.isalpha():
         return US_STATE_CODE_TO_NAME.get(s.upper(), s.upper())
     return s
+
+
+def state_abbrev_for_job_title(state: Optional[str]) -> str:
+    """
+    Two-letter state code for Job ``Name`` / header pattern (e.g. ``NY``, ``VA``).
+
+    Accepts either a code or a full state name (``Virginia`` → ``VA``). Unknown input returns ``""``.
+    """
+    s = (state or "").strip()
+    if not s:
+        return ""
+    if len(s) == 2 and s.isalpha():
+        u = s.upper()
+        return u if u in US_STATE_CODE_TO_NAME else ""
+    for abbr, full in US_STATE_CODE_TO_NAME.items():
+        if full.upper() == s.upper():
+            return abbr
+    return ""

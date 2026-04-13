@@ -46,8 +46,9 @@ _light_image = (
 
 app = modal.App("salesforce-automation")
 
-EMAIL_HOURS             = 1.0
-SUPABASE_LOOKBACK_HOURS = 2.0
+# TEMPORARY: 2 h Gmail window (was 1 h). Keep lookback ≥ email window for dedupe.
+EMAIL_HOURS             = 2.0
+SUPABASE_LOOKBACK_HOURS = 3.0
 
 # Immediately alert when a job triggers either of these thresholds.
 # (Matching logic lives in scrape_validator.should_send_immediate_alert)

@@ -16,6 +16,9 @@ import re
 from pathlib import Path
 from typing import Union, Optional
 
+from utils.address_display_format import format_us_address_line_for_display
+from utils.job_description_proxi_template import extract_active_needs_dates
+
 # Canonical columns we always output (for CSV): identity → location → org/status → scheduling →
 # clinical detail → insight → remaining Kimedics header fields → full description.
 JOB_CONTENT_COLUMNS = [
@@ -39,6 +42,8 @@ JOB_CONTENT_COLUMNS = [
     "required_procedures",
     "additional_requirements",
     "support_staff",
+    "avg_patients_per_day",
+    "roster_only",
     "insight",
     "basics_job_title",
     "number_of_open_positions",
@@ -141,6 +146,7 @@ def _is_following_section_start(line: str) -> bool:
         "standard schedule",
         "types of cases",
         "volume",
+        "avg patients",
         "insight",
         "point of contact",
         "facility:",
@@ -208,6 +214,8 @@ _DESC_LABELED_LINE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^Required\s+procedures?\s*:\s*(.*)$", re.I), "required_procedures"),
     (re.compile(r"^Clinical\s+staff\s*:\s*(.*)$", re.I), "support_staff"),
     (re.compile(r"^Support\s+staff\s*:\s*(.*)$", re.I), "support_staff"),
+    (re.compile(r"^Avg\.?\s*patients\s+per\s+day\s*:\s*(.*)$", re.I), "avg_patients_per_day"),
+    (re.compile(r"^Average\s+patients\s+per\s+day\s*:\s*(.*)$", re.I), "avg_patients_per_day"),
     (re.compile(r"^Dates\s+needed\s*:\s*(.*)$", re.I), "dates_needed"),
     (re.compile(r"^Dates\s*:\s*(.*)$", re.I), "dates_needed"),
     (re.compile(r"^Standard\s+schedule\s*:\s*(.*)$", re.I), "standard_schedule"),
@@ -282,6 +290,10 @@ def _fill_from_description_blocks(out: dict) -> None:
         return
     lines = desc.splitlines()
 
+    active_dates = extract_active_needs_dates(desc)
+    if active_dates:
+        out["dates_needed"] = active_dates
+
     if not (out.get("required_procedures") or "").strip():
         block = _section_after_heading(
             lines,
@@ -321,6 +333,14 @@ def _fill_from_description_blocks(out: dict) -> None:
         )
         if block:
             out["standard_schedule"] = block
+
+    if not (out.get("avg_patients_per_day") or "").strip():
+        block = _section_after_heading(
+            lines,
+            ("avg patients per day", "average patients per day", "avg. patients per day"),
+        )
+        if block:
+            out["avg_patients_per_day"] = block
 
 
 def _is_plausible_schedule_text(s: str) -> bool:
@@ -428,11 +448,11 @@ def _compose_full_address_line(out: dict) -> None:
 
 
 def _normalize_city_display(city: str) -> str:
-    """Title-case city for display (e.g. all-caps Kimedics labels → ``Los Lunas``)."""
+    """Title-style city for display (e.g. all-caps Kimedics labels → ``Los Angeles``)."""
     s = _collapse_whitespace(city)
     if not s:
         return ""
-    return s.title()
+    return format_us_address_line_for_display(s)
 
 
 def _finalize_field_normalizations(out: dict) -> None:
@@ -501,6 +521,17 @@ def _backfill_practice_value(out: dict, main_block: str) -> None:
             return
 
 
+# Kimedics job text (header + description): "roster only" / "roster-only" → Supabase ``roster_only`` = true/false.
+_ROSTER_ONLY_PHRASE = re.compile(r"roster\s*[-]?\s*only", re.IGNORECASE)
+
+
+def infer_roster_only_from_full_text(full_text: str) -> str:
+    """Return ``\"true\"`` or ``\"false\"`` for Supabase / row payloads."""
+    if not (full_text or "").strip():
+        return "false"
+    return "true" if _ROSTER_ONLY_PHRASE.search(full_text) else "false"
+
+
 def repair_flat_jobpost_text_missing_posted_date(flat_text: str, posted_date: Optional[str]) -> str:
     """
     Kimedics job UI often lays out metadata in two columns. Playwright's ``inner_text()`` on
@@ -529,6 +560,7 @@ def parse_job_content_txt(text: str) -> dict:
     """
     out = {c: "" for c in JOB_CONTENT_COLUMNS}
     if not (text or "").strip():
+        out["roster_only"] = "false"
         return out
 
     # Split description block
@@ -539,6 +571,7 @@ def parse_job_content_txt(text: str) -> dict:
 
     lines = [ln.strip() for ln in main_block.splitlines()]
     if not lines:
+        out["roster_only"] = infer_roster_only_from_full_text(text)
         return out
 
     # First line: title and job_id
@@ -596,6 +629,7 @@ def parse_job_content_txt(text: str) -> dict:
         "required_procedures",
         "additional_requirements",
         "support_staff",
+        "avg_patients_per_day",
     ):
         if not out.get(k):
             out[k] = ""
@@ -604,7 +638,9 @@ def parse_job_content_txt(text: str) -> dict:
     _sanitize_standard_schedule(out)
     _finalize_field_normalizations(out)
     _compose_full_address_line(out)
+    out["address_line"] = format_us_address_line_for_display(out.get("address_line") or "")
 
+    out["roster_only"] = infer_roster_only_from_full_text(text)
     return out
 
 

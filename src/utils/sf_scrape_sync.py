@@ -6,6 +6,9 @@ By default we compute the desired field set with the same rules as ``prepare_pay
 
 Org-specific **test** fields (``test_status__c``, ``test_posted_date__c``) are included only when
 ``PROXI_SF_TEST_MODE=true``.
+
+Set ``PROXI_SF_UPDATE_JOBS=false`` to skip all Salesforce **writes** from this module (no PATCH;
+see also ``utils.sf_write_flags`` for create-job / worksite-create gates).
 """
 
 from __future__ import annotations
@@ -15,14 +18,24 @@ from datetime import datetime
 from typing import Any, Optional, Union
 
 from utils.sf_job_payload import (
+    SF_PUSH_JOB_ROLE_DEFAULTS,
     _canonical_description_use_html,
     _truncate_external_job_id,
+    coerce_picklists_to_valid,
     external_job_link_from_job_row,
+    merge_job_role_defaults_for_empty_sf_fields,
     prepare_payload_for_write,
 )
-from utils.sf_job_rest_minimal import DEFAULT_REST_VERSION, describe_sobject, rest_json, update_job_record
+from utils.sf_job_rest_minimal import (
+    DEFAULT_REST_VERSION,
+    describe_sobject,
+    is_salesforce_deleted_entity_error,
+    rest_json,
+    update_job_record,
+)
 from utils.sf_partial_update import prepare_patch_payload
 from utils.salesforce import get_token_auto
+from utils.sf_write_flags import proxi_sf_writes_enabled
 
 # Custom fields created for this integration (safe to update).
 # NOTE: match your org's API names exactly (case-sensitive).
@@ -177,6 +190,26 @@ def sync_missing_scrape_fields_to_salesforce(
         )
         return out
 
+    if not proxi_sf_writes_enabled():
+        out["reason"] = "sf_writes_disabled"
+        out["ok"] = True
+        _maybe_log(
+            conn,
+            jid_log,
+            "sf_scrape_fields_skip",
+            schema,
+            {
+                "reason": out["reason"],
+                "detail": (
+                    "PROXI_SF_UPDATE_JOBS is false (or 0/no/off). No Salesforce API calls "
+                    "(including reads for compare) are made from scrape field sync."
+                ),
+                "sf_job_id": sf_job_id or None,
+            },
+            run_id=run_id,
+        )
+        return out
+
     tok = _rest_token_from_env()
     if not tok:
         out["reason"] = "no_salesforce_credentials"
@@ -234,8 +267,11 @@ def sync_missing_scrape_fields_to_salesforce(
         )
         return out
 
-    field_names = tuple(sorted(desired.keys()))
+    role_keys = tuple(SF_PUSH_JOB_ROLE_DEFAULTS.keys())
+    field_names = tuple(sorted(set(desired.keys()) | set(role_keys)))
     current = _get_job_fields(instance_url, access_token, sf_job_id, field_names)
+    merge_job_role_defaults_for_empty_sf_fields(desired, current)
+    coerce_picklists_to_valid(describe, desired)
 
     patch: dict[str, Any] = {}
     for fname, want in desired.items():
@@ -300,6 +336,68 @@ def sync_missing_scrape_fields_to_salesforce(
     try:
         update_job_record(instance_url, access_token, job_object_name, sf_job_id, body)
     except Exception as e:
+        body_retry = {
+            k: v for k, v in body.items() if k != "Job_Worksite_Location_1__c"
+        }
+        if (
+            is_salesforce_deleted_entity_error(e)
+            and "Job_Worksite_Location_1__c" in body
+            and body_retry
+        ):
+            try:
+                update_job_record(
+                    instance_url, access_token, job_object_name, sf_job_id, body_retry
+                )
+                body = body_retry
+            except Exception as e2:
+                out["error"] = str(e2)[:2000]
+                _maybe_log(
+                    conn,
+                    jid_log,
+                    "sf_scrape_fields_error",
+                    schema,
+                    {
+                        "error": out["error"],
+                        "attempt": body_retry,
+                        "prior_error": str(e)[:1500],
+                        "note": "Retry without Job_Worksite_Location_1__c also failed.",
+                    },
+                    run_id=run_id,
+                )
+                return out
+            compared = _nonempty_desired_field_names(desired)
+            prev_full = {k: current.get(k) for k in compared}
+            next_full: dict[str, Any] = {}
+            for k in compared:
+                if k in body:
+                    next_full[k] = body[k]
+                else:
+                    next_full[k] = current.get(k)
+            _maybe_log(
+                conn,
+                jid_log,
+                "sf_scrape_fields_patched",
+                schema,
+                {
+                    "sf_job_id": sf_job_id or None,
+                    "fields_changed": sorted(body.keys()),
+                    "fields_compared": compared,
+                    "prev": prev_full,
+                    "next": next_full,
+                    "retried_without_worksite_lookup": True,
+                    "detail": (
+                        "First PATCH failed (entity deleted on worksite Id); applied remaining "
+                        "fields without Job_Worksite_Location_1__c. Clear stale sf_worksite_account_id "
+                        "in Supabase / sf_worksite_location_map and fix the Account in Salesforce."
+                    ),
+                },
+                run_id=run_id,
+            )
+            out["ok"] = True
+            out["patched"] = True
+            out["fields"] = sorted(body.keys())
+            return out
+
         out["error"] = str(e)[:2000]
         _maybe_log(
             conn,
@@ -392,6 +490,21 @@ def sync_missing_scrape_fields_for_job_ids(
                         "(sf_job_id is empty). Field sync runs only after mapping resolves a Job record. "
                         "This is expected for brand-new jobs until Salesforce and mapping catch up."
                     ),
+                },
+            )
+            continue
+        if not proxi_sf_writes_enabled():
+            log_job_event(
+                conn,
+                job_id=jid,
+                event_type="sf_scrape_fields_skip",
+                run_id=run_id,
+                schema=schema,
+                payload={
+                    "reason": "sf_writes_disabled",
+                    "job_id": jid,
+                    "sf_job_id": (row.get("sf_job_id") or "").strip() or None,
+                    "detail": "PROXI_SF_UPDATE_JOBS is false; scrape sync does not call Salesforce.",
                 },
             )
             continue

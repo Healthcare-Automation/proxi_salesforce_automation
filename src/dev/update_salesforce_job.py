@@ -46,8 +46,18 @@ _env_path = _SRC.parent / ".env"
 load_dotenv(_env_path)
 
 from utils.salesforce import SalesforceLoginError, get_token_auto
-from utils.sf_job_payload import prepare_payload_for_write
-from utils.sf_job_rest_minimal import describe_sobject, update_job_record
+from utils.sf_job_payload import (
+    SF_PUSH_JOB_ROLE_DEFAULTS,
+    coerce_picklists_to_valid,
+    merge_job_role_defaults_for_empty_sf_fields,
+    prepare_payload_for_write,
+)
+from utils.sf_job_rest_minimal import (
+    DEFAULT_REST_VERSION,
+    describe_sobject,
+    rest_json,
+    update_job_record,
+)
 from utils.supabase_db import load_job_current_row_for_salesforce
 
 
@@ -144,6 +154,19 @@ def main() -> None:
         for_update=True,
     )
 
+    sf_id = args.sf_id.strip()
+    role_field_list = ",".join(SF_PUSH_JOB_ROLE_DEFAULTS.keys())
+    cur = rest_json(
+        instance_url,
+        access_token,
+        "GET",
+        f"sobjects/{job_object}/{sf_id}?fields={role_field_list}",
+        api_version=DEFAULT_REST_VERSION,
+    )
+    if isinstance(cur, dict):
+        merge_job_role_defaults_for_empty_sf_fields(body, cur)
+        coerce_picklists_to_valid(describe, body)
+
     print(json.dumps(body, indent=2, default=str))
 
     if args.dry_run or not args.yes:
@@ -151,8 +174,8 @@ def main() -> None:
             print("\nNo --yes: dry-run only. Add --yes to PATCH.", file=sys.stderr)
         return
 
-    update_job_record(instance_url, access_token, job_object, args.sf_id.strip(), body)
-    print(f"\nPATCH sent for {job_object} Id {args.sf_id.strip()}.")
+    update_job_record(instance_url, access_token, job_object, sf_id, body)
+    print(f"\nPATCH sent for {job_object} Id {sf_id}.")
 
 
 if __name__ == "__main__":

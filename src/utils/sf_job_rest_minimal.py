@@ -227,6 +227,20 @@ def filter_createable_fields(describe: dict, fields: dict) -> dict:
     return out
 
 
+def is_salesforce_deleted_entity_error(exc: BaseException) -> bool:
+    """
+    True when REST error text indicates a lookup target is deleted (recycle bin / hard delete).
+
+    Typical message: ``entity is deleted`` on POST/PATCH when ``Job_Worksite_Location_1__c`` or
+    ``Job_Account__c`` references an invalid Id.
+    """
+    msg = str(exc).lower()
+    if "entity is deleted" in msg:
+        return True
+    compact = msg.replace(" ", "").replace("_", "")
+    return "entityisdeleted" in compact or "isdeleted" in compact and "deleted" in msg
+
+
 def filter_updateable_fields(describe: dict, fields: dict) -> dict:
     updateable = {
         f["name"]

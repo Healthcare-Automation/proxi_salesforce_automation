@@ -7,7 +7,10 @@ Push-time only:
   - Salary range default unless extracted from Kimedics description text.
   - Full US state names on Job_State__c.
 
-See ``docs/salesforce_job_push_rules.md`` for the full rule set.
+See ``docs/engineering/salesforce_job_push_rules.md`` for the full rule set.
+
+The set ``CANONICAL_JOB_C_PUSH_FIELD_NAMES`` is the single allow-list of Job__c API names this module
+may emit before the Salesforce describe filter; add new mappings there and in the doc together.
 """
 
 from __future__ import annotations
@@ -19,12 +22,24 @@ from datetime import datetime
 from typing import Any, Optional
 
 from utils.insight_sanitize import sanitize_insight_for_salesforce
-from utils.job_description_proxi_template import build_proxi_job_posting_description
+from utils.job_description_proxi_template import (
+    build_proxi_job_posting_description,
+    effective_dates_needed,
+    strip_internal_presentation_phrases,
+)
 from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE, extract_pay_range_from_description
-from utils.us_state_expand import state_name_for_salesforce
+from utils.address_display_format import format_us_address_line_for_display
+from utils.sf_push_defaults import SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID
+from utils.us_state_expand import state_abbrev_for_job_title, state_name_for_salesforce
 
-# Default Salesforce Account Ids (hyperlink targets in UI; REST sends Id only).
-SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID = "0015f00000HH63kAAD"
+# Display string in Job ``Name`` (must match org / formula expectations; same org as primary account).
+SF_JOB_PRIMARY_ACCOUNT_DISPLAY_NAME = "Aspen Dental Management Inc."
+
+# Salesforce ``Name`` on Job__c is often limited to 80 characters.
+SF_JOB_NAME_MAX_LEN = 80
+
+# Checkbox (or boolean) on Job__c — API name must match Setup → Job__c → Fields exactly.
+ROSTER_ONLY_FIELD = "roster_only__c"
 
 # Kimedics id → Salesforce External_Job_ID__c (org may enforce max length on Text field).
 EXTERNAL_JOB_ID_MAX_LEN = 20
@@ -39,15 +54,80 @@ KIMEDICS_PORTAL_JOB_POST_URL_PREFIX = "https://portal.kimedics.com/app/workspace
 def _canonical_description_use_html() -> bool:
     return os.environ.get("PROXI_JOB_DESCRIPTION_HTML", "true").lower() in ("1", "true", "yes")
 
+# Role + job-source picklists — always on **create**; on PATCH only when Salesforce value is empty
+# (see :func:`merge_job_role_defaults_for_empty_sf_fields` and ``prepare_payload_for_write``).
+# ``Job_Job_Source__c`` is coerced to the org’s API value via :func:`coerce_picklists_to_valid`.
+SF_PUSH_JOB_ROLE_DEFAULTS: dict[str, str] = {
+    "Job_Position_Type__c": "Locums",
+    "Job_Specialty__c": "General Dentistry",
+    "Occupation_DJC__c": "Dentist",
+    "Job_Job_Source__c": "Shiftwise - Aspen Dental - AMN",
+}
+
 # Fixed at push — do not persist these in Supabase (see docs).
+# ``Occupation_DJC__c`` lives only under ``SF_PUSH_JOB_ROLE_DEFAULTS`` (same as primary role defaults).
 SF_PUSH_STATIC_DEFAULTS: dict[str, str] = {
+    **SF_PUSH_JOB_ROLE_DEFAULTS,
     "Position_Type_DJC__c": "Locums",
     "Specialty_DJC__c": "General Dentistry",
-    "Occupation_DJC__c": "Dentist",
     "Worksite_Parent__c": "Aspen Dental Management Inc.",
     "Job_Patient_Ages__c": "Mostly Adults",
     "Job_Volume__c": "Not Provided",
 }
+
+# Exact Job__c API names automation may send (before Salesforce describe filters FLS).
+# Must stay aligned with ``job_row_to_salesforce_fields`` + ``SF_PUSH_STATIC_DEFAULTS``
+# and ``docs/engineering/salesforce_job_push_rules.md``.
+CANONICAL_JOB_C_PUSH_FIELD_NAMES: frozenset[str] = frozenset(
+    {
+        "Name",
+        "External_Job_ID__c",
+        "Job_Account__c",
+        "Job_Worksite_Location_1__c",
+        "Job_Client_Job_Id__c",
+        "Job_Client_Job_Description__c",
+        "External_Job_Link__c",
+        "Job_Status__c",
+        "Job_State__c",
+        "Job_City__c",
+        "Insight__c",
+        "Job_Facility_Display__c",
+        "Job_Worksite_1_Address__c",
+        "Job_Point_of_Contact__c",
+        "Job_Dates_Needed__c",
+        "Job_Standard_Schedule__c",
+        "Standard_Schedule_Hours__c",
+        "Job_Types_of_Cases__c",
+        "Job_Support_Staff__c",
+        "Job_Provider_Start_Date__c",
+        "Job_Provider_End_Date__c",
+        "Salary_Pay_Range__c",
+        ROSTER_ONLY_FIELD,
+        "Job_Ranking__c",
+        "Job_Volume__c",
+        *SF_PUSH_STATIC_DEFAULTS.keys(),
+    }
+)
+
+
+def _sf_field_nonempty(val: Any) -> bool:
+    """True when Salesforce already has a value (non-null, non-blank string)."""
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val
+    return bool(str(val).strip())
+
+
+def merge_job_role_defaults_for_empty_sf_fields(target: dict[str, Any], current: dict[str, Any]) -> None:
+    """
+    Set role fields and ``Job_Job_Source__c`` on ``target`` only when ``current`` has no value for
+    that field (PATCH backfill without overwriting non-null SF).
+    """
+    for fname, default_v in SF_PUSH_JOB_ROLE_DEFAULTS.items():
+        if _sf_field_nonempty(current.get(fname)):
+            continue
+        target[fname] = default_v
 
 
 def _truncate_external_job_link(url: Optional[str]) -> Optional[str]:
@@ -119,6 +199,12 @@ def job_status_for_salesforce_push(raw_status: Any) -> Optional[str]:
     return "Closed"
 
 
+def roster_only_string_from_row(row: Optional[dict]) -> str:
+    """``\"true\"`` / ``\"false\"`` when Supabase ``roster_only`` reflects Kimedics ``roster only`` phrase."""
+    s = str((row or {}).get("roster_only") or "").strip().lower()
+    return "true" if s == "true" else "false"
+
+
 def _mdy_to_iso(d: Optional[str]) -> Optional[str]:
     if not d or not isinstance(d, str):
         return None
@@ -177,6 +263,28 @@ def coerce_picklists_to_valid(describe: dict, fields_map: dict) -> None:
         fields_map[fname] = fallback
 
 
+def build_salesforce_job_name(row: dict) -> Optional[str]:
+    """
+    Job record header pattern::
+
+        NY (Dunkirk) General Dentistry - Aspen Dental Management Inc. - Open
+
+    Uses the same specialty default as ``Specialty_DJC__c`` and mapped status labels.
+    """
+    abbr = state_abbrev_for_job_title(row.get("state"))
+    city = (row.get("city") or "").strip()
+    specialty = str(
+        SF_PUSH_STATIC_DEFAULTS.get("Job_Specialty__c")
+        or SF_PUSH_STATIC_DEFAULTS.get("Specialty_DJC__c")
+        or "General Dentistry"
+    ).strip()
+    st = job_status_for_salesforce_push(row.get("status")) or "Open"
+    name = f"{abbr} ({city}) {specialty} - {SF_JOB_PRIMARY_ACCOUNT_DISPLAY_NAME} - {st}"
+    if len(name) > SF_JOB_NAME_MAX_LEN:
+        name = name[: SF_JOB_NAME_MAX_LEN - 1].rstrip() + "…"
+    return name
+
+
 def job_row_to_salesforce_fields(
     row: dict,
     *,
@@ -214,10 +322,17 @@ def job_row_to_salesforce_fields(
         use_html = _canonical_description_use_html() if description_use_html is None else description_use_html
         body = build_proxi_job_posting_description(r, use_html=use_html)
     else:
-        body = desc_raw
+        body = strip_internal_presentation_phrases(desc_raw)
 
     support = r.get("support_staff")
+    toc_raw = (r.get("types_of_cases") or "").strip()
+    types_clean = strip_internal_presentation_phrases(toc_raw) if toc_raw else ""
+    addr_raw = (r.get("address_line") or "").strip()
+    addr = format_us_address_line_for_display(addr_raw) if addr_raw else None
+    if addr == "":
+        addr = None
     out: dict[str, Any] = {
+        "Name": build_salesforce_job_name(r),
         "External_Job_ID__c": _truncate_external_job_id(r.get("job_id")),
         "Job_Account__c": pid,
         "Job_Worksite_Location_1__c": wid if wid else None,
@@ -229,19 +344,30 @@ def job_row_to_salesforce_fields(
         "Job_City__c": city or None,
         "Insight__c": sanitize_insight_for_salesforce(r.get("insight")),
         "Job_Facility_Display__c": (r.get("practice_value") or "").strip() or None,
-        "Job_Street_Address__c": (r.get("address_line") or "").strip() or None,
+        "Job_Worksite_1_Address__c": addr,
         "Job_Point_of_Contact__c": (r.get("point_of_contact") or "").strip() or None,
-        "Job_Dates_Needed__c": (r.get("dates_needed") or "").strip() or None,
+        "Job_Dates_Needed__c": effective_dates_needed(r) or None,
         "Job_Standard_Schedule__c": (r.get("standard_schedule") or "").strip() or None,
         "Standard_Schedule_Hours__c": (r.get("standard_schedule") or "").strip() or None,
-        "Job_Types_of_Cases__c": (r.get("types_of_cases") or "").strip() or None,
+        "Job_Types_of_Cases__c": types_clean or None,
         "Job_Support_Staff__c": support if (support and str(support).strip()) else None,
         "Job_Provider_Start_Date__c": _mdy_to_iso(r.get("provider_start_date")),
         "Job_Provider_End_Date__c": _mdy_to_iso(r.get("provider_end_date")),
         "Salary_Pay_Range__c": salary_pay,
+        ROSTER_ONLY_FIELD: roster_only_string_from_row(r),
     }
     out.update(SF_PUSH_STATIC_DEFAULTS)
+    vol = (r.get("avg_patients_per_day") or "").strip()
+    if vol:
+        out["Job_Volume__c"] = vol
     out["Job_Ranking__c"] = str(r.get("job_ranking") or "B").strip() or "B"
+
+    extra = set(out.keys()) - CANONICAL_JOB_C_PUSH_FIELD_NAMES
+    if extra:
+        raise RuntimeError(
+            "job_row_to_salesforce_fields produced keys not in CANONICAL_JOB_C_PUSH_FIELD_NAMES: "
+            f"{sorted(extra)} — update the frozenset and docs together."
+        )
 
     return out
 
@@ -268,6 +394,9 @@ def prepare_payload_for_write(
         worksite_account_id=worksite_account_id,
         description_use_html=description_use_html,
     )
+    if for_update:
+        for k in SF_PUSH_JOB_ROLE_DEFAULTS:
+            raw.pop(k, None)
     coerce_picklists_to_valid(describe, raw)
     if for_update:
         return filter_updateable_fields(describe, raw)

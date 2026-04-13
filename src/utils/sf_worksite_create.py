@@ -1,7 +1,18 @@
 """
 Create Salesforce Account (worksite) records when no location mapping exists, and persist mapping in Supabase.
 
-Gated by env ``PROXI_SF_CREATE_WORKSITES=true``.
+New worksite **Account** POST includes:
+
+- ``Name`` — ``Aspen Dental - {City}, {ST}`` (2-letter state), see ``format_worksite_account_name``
+- ``ShippingStreet`` — Kimedics ``address_line`` (full single-line shipping address)
+- ``ParentId`` — Aspen Dental Management (``SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID``)
+- ``RecordTypeId`` — env ``PROXI_SF_ACCOUNT_WORKSITE_RECORD_TYPE_ID``, else describe ``Worksite`` record type
+
+Job rows receive the new Id on ``Job_Worksite_Location_1__c`` via resolver / enrichment; ``Job_Worksite_1_Address__c``
+is set from the same ``address_line`` in ``sf_job_payload``.
+
+Gated by env ``PROXI_SF_CREATE_WORKSITES=true``. Salesforce Account **POST** is also skipped when
+``PROXI_SF_UPDATE_JOBS=false`` (see ``utils.sf_write_flags``).
 """
 
 from __future__ import annotations
@@ -10,8 +21,14 @@ import json
 import os
 from typing import Any, Optional
 
+from utils.address_display_format import format_us_address_line_for_display
 from utils.sf_job_rest_minimal import create_account_record, filter_createable_fields, describe_sobject
-from utils.sf_push_defaults import format_worksite_display_label
+from utils.sf_push_defaults import (
+    SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID,
+    format_worksite_account_name,
+    worksite_account_record_type_id,
+)
+from utils.sf_write_flags import proxi_sf_writes_enabled
 
 
 def _env_truthy(name: str) -> bool:
@@ -36,6 +53,7 @@ def fetch_or_create_worksite_account_id(
     *,
     instance_url: str,
     access_token: str,
+    address_line: Optional[str] = None,
     schema: str = "public",
     run_id: Optional[int] = None,
     job_id_for_log: Optional[str] = None,
@@ -45,6 +63,9 @@ def fetch_or_create_worksite_account_id(
     Return Account Id for (city, state): from ``sf_worksite_location_map``, or create in Salesforce + upsert map.
 
     Requires non-empty city+state for a stable location_key. Returns None if creation disabled or fails.
+
+    **New Account body:** ``Name``, ``ShippingStreet`` (from ``address_line``), ``ParentId``, ``RecordTypeId``,
+    plus optional ``PROXI_SF_ACCOUNT_CREATE_EXTRA_JSON``. Only **createable** fields are sent (describe filter).
     """
     from utils.supabase_db import (
         fetch_worksite_account_id_for_location,
@@ -62,18 +83,37 @@ def fetch_or_create_worksite_account_id(
         if existing:
             return existing
 
+    if not proxi_sf_writes_enabled():
+        return None
+
     if not _env_truthy("PROXI_SF_CREATE_WORKSITES"):
         return None
 
-    display = format_worksite_display_label(c, st)
-    body: dict[str, Any] = {"Name": display}
+    display = format_worksite_account_name(c, st)
+    raw_ship = (address_line or "").strip()
+    ship_street = format_us_address_line_for_display(raw_ship) if raw_ship else None
+    if ship_street == "":
+        ship_street = None
+
+    body: dict[str, Any] = {
+        "Name": display,
+        "ParentId": SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID,
+    }
+    if ship_street:
+        body["ShippingStreet"] = ship_street
+
     body.update(_account_extra_fields())
 
     try:
         describe = describe_sobject(instance_url, access_token, "Account")
+        rt_id = worksite_account_record_type_id(describe)
+        if rt_id:
+            body["RecordTypeId"] = rt_id
+
         fields = filter_createable_fields(describe, body)
         if not fields.get("Name"):
             fields["Name"] = display
+        # ParentId / RecordTypeId may be stripped if not createable for the integration user — still attempt create.
         resp = create_account_record(instance_url, access_token, fields)
         new_id = (resp.get("id") or "").strip()
         if not new_id:
@@ -97,6 +137,9 @@ def fetch_or_create_worksite_account_id(
                 payload={
                     "city": c,
                     "state": st,
+                    "shipping_street_sent": bool(ship_street),
+                    "record_type_id_sent": bool(rt_id and fields.get("RecordTypeId")),
+                    "parent_id_sent": bool(fields.get("ParentId")),
                     "salesforce_account_id": new_id,
                     "display_label": display,
                 },

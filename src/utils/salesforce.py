@@ -690,6 +690,36 @@ def pull_jobs_for_id_resolve(
     return query_all(instance_url, access_token, soql, api_version)
 
 
+def query_jobs_by_external_id_exact(
+    instance_url: str,
+    access_token: str,
+    external_job_id: str,
+    *,
+    job_object_name: str = "Job__c",
+    api_version: str = DEFAULT_API_VERSION,
+) -> list[dict]:
+    """
+    Targeted SOQL for one ``External_Job_ID__c`` value (exact match, same truncation as push).
+
+    Used before POSTing a new ``Job__c`` so we **re-link** Supabase to an existing Salesforce row
+    after a DB reset, instead of failing on a duplicate external-id rule.
+
+    ``job_object_name`` must be a simple API name (alphanumeric + underscore).
+    """
+    import re
+
+    eid = (external_job_id or "").strip()
+    if not eid:
+        return []
+    oname = (job_object_name or "Job__c").strip()
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]*$", oname):
+        return []
+    safe = eid.replace("\\", "\\\\").replace("'", "\\'")
+    fields_str = ", ".join(_RESOLVER_JOB_FIELDS)
+    soql = f"SELECT {fields_str} FROM {oname} WHERE External_Job_ID__c = '{safe}'"
+    return query_all(instance_url, access_token, soql, api_version)
+
+
 def pull_all_jobs(
     consumer_key: str,
     consumer_secret: str,

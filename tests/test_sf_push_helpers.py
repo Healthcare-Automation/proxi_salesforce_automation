@@ -11,7 +11,11 @@ from utils.sf_job_payload import (
     job_status_for_salesforce_push,
 )
 from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE, extract_pay_range_from_description
-from utils.us_state_expand import state_name_for_salesforce
+from utils.sf_push_defaults import (
+    format_worksite_account_name,
+    worksite_account_record_type_id,
+)
+from utils.us_state_expand import state_abbrev_for_job_title, state_name_for_salesforce
 
 
 def test_canonical_description_html_true_when_env_unset(monkeypatch):
@@ -68,6 +72,65 @@ def test_state_name_for_salesforce_abbrev():
 
 def test_state_name_for_salesforce_full_name_passthrough():
     assert state_name_for_salesforce("Texas") == "Texas"
+
+
+def test_format_worksite_account_name():
+    assert format_worksite_account_name("Dunkirk", "NY") == "Aspen Dental - Dunkirk, NY"
+    assert format_worksite_account_name("Marshalltown", "Iowa") == "Aspen Dental - Marshalltown, IA"
+
+
+def test_worksite_account_record_type_id_from_describe(monkeypatch):
+    monkeypatch.delenv("PROXI_SF_ACCOUNT_WORKSITE_RECORD_TYPE_ID", raising=False)
+    d = {
+        "recordTypeInfos": [
+            {"name": "Master", "recordTypeId": "012BAD", "available": True},
+            {"name": "Worksite", "recordTypeId": "012GOOD", "available": True},
+        ]
+    }
+    assert worksite_account_record_type_id(d) == "012GOOD"
+
+
+def test_worksite_account_record_type_id_env_over_describe(monkeypatch):
+    monkeypatch.setenv("PROXI_SF_ACCOUNT_WORKSITE_RECORD_TYPE_ID", "012ENV")
+    d = {"recordTypeInfos": [{"name": "Worksite", "recordTypeId": "012GOOD", "available": True}]}
+    assert worksite_account_record_type_id(d) == "012ENV"
+
+
+def test_state_abbrev_for_job_title_from_code_or_name():
+    assert state_abbrev_for_job_title("NY") == "NY"
+    assert state_abbrev_for_job_title("ny") == "NY"
+    assert state_abbrev_for_job_title("Virginia") == "VA"
+    assert state_abbrev_for_job_title("") == ""
+
+
+def test_salesforce_job_name_pattern():
+    row = {
+        "job_id": "1",
+        "city": "Dunkirk",
+        "state": "NY",
+        "status": "Active, accepting new providers",
+        "description_full_text": "x",
+    }
+    out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    assert (
+        out["Name"]
+        == "NY (Dunkirk) General Dentistry - Aspen Dental Management Inc. - Open"
+    )
+
+
+def test_salesforce_job_name_uses_abbrev_when_state_is_full_name():
+    row = {
+        "job_id": "1",
+        "city": "Virginia Beach",
+        "state": "Virginia",
+        "status": "Open",
+        "description_full_text": "x",
+    }
+    out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    assert (
+        out["Name"]
+        == "VA (Virginia Beach) General Dentistry - Aspen Dental Management Inc. - Open"
+    )
 
 
 def test_extract_pay_range():
