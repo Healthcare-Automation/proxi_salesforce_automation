@@ -55,3 +55,16 @@ def test_strips_trailing_empty_segments_mixed_case_passthrough():
         format_us_address_line_for_display("100 Main St, Springfield, , ")
         == "100 Main St, Springfield"
     )
+
+
+def test_strips_trailing_commas_city_state_run_no_zip():
+    """Kimedics-style street + 'City ST' segment with empty trailing slots."""
+    assert (
+        format_us_address_line_for_display("6419 Reading Rd, Rosenberg TX, ,")
+        == "6419 Reading Rd, Rosenberg TX"
+    )
+
+
+def test_fullwidth_comma_treated_as_separator():
+    raw = "100 Main St，Springfield， ，"  # U+FF0C fullwidth commas
+    assert format_us_address_line_for_display(raw) == "100 Main St, Springfield"

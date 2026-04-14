@@ -82,6 +82,24 @@ def _strip_empty_comma_segments(s: str) -> str:
     return ", ".join(parts)
 
 
+def _normalize_comma_separators(s: str) -> str:
+    """Use ASCII commas so empty-segment cleanup runs on Kimedics/HTML pastes (fullwidth comma, etc.)."""
+    if not s:
+        return s
+    return s.replace("\uFF0C", ",").replace("\u060C", ",")
+
+
+def _strip_trailing_comma_junk(s: str) -> str:
+    """Remove trailing `,` / `, ,` / whitespace after final content (defensive)."""
+    t = (s or "").rstrip()
+    while t:
+        nxt = re.sub(r"(?:\s*,)+\s*$", "", t).rstrip()
+        if nxt == t:
+            break
+        t = nxt
+    return t
+
+
 def _uppercase_letter_ratio(s: str) -> float:
     letters = [c for c in s if c.isalpha()]
     if not letters:
@@ -161,7 +179,7 @@ def format_us_address_line_for_display(value: Optional[str]) -> str:
     - Leaves already mixed-case strings unchanged aside from whitespace and comma cleanup.
     - Splits on commas, formats segments (state + ZIP, trailing state, city/street runs).
     """
-    s = _collapse_ws(value or "")
+    s = _normalize_comma_separators(_collapse_ws(value or ""))
     if not s:
         return ""
     s = _strip_empty_comma_segments(s)
@@ -169,11 +187,18 @@ def format_us_address_line_for_display(value: Optional[str]) -> str:
         return ""
     letters = [c for c in s if c.isalpha()]
     if not letters:
-        return s
+        out = _strip_trailing_comma_junk(s)
+        return _strip_empty_comma_segments(out)
     if _uppercase_letter_ratio(s) < 0.5:
-        return s
+        out = _strip_trailing_comma_junk(s)
+        return _strip_empty_comma_segments(out)
     parts = [p.strip() for p in s.split(",")]
     parts = [p for p in parts if p]
     if not parts:
-        return s
-    return ", ".join(_format_comma_segment(p) for p in parts)
+        out = _strip_trailing_comma_junk(s)
+        return _strip_empty_comma_segments(out)
+    formatted = [_format_comma_segment(p) for p in parts]
+    formatted = [p for p in formatted if (p or "").strip()]
+    out = ", ".join(formatted)
+    out = _strip_trailing_comma_junk(out)
+    return _strip_empty_comma_segments(out)
