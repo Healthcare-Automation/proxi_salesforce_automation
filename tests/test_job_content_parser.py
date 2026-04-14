@@ -255,6 +255,40 @@ def test_address_line_keeps_complete_line_without_duplicating_city_state():
     assert (out.get("address_line") or "").strip() == "1643 County Route 64, Horseheads NY"
 
 
+def test_address_line_no_duplicate_when_street_has_city_abbrev_and_state_full_name():
+    """Row State: full name while Address ends with ``City ST`` — do not append state again."""
+    body = (
+        "Title #1\n"
+        "Loc, ST\n"
+        "Practice\n"
+        "x\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "Address: 3901 S Bolger Rd, Independence MO\n"
+        "City: Independence\n"
+        "State: Missouri\n"
+    )
+    out = parse_job_content_txt(body)
+    assert (out.get("address_line") or "").strip() == "3901 S Bolger Rd, Independence MO"
+
+
+def test_address_line_no_duplicate_when_street_has_full_state_and_row_has_abbrev():
+    """Row State: 2-letter while Address already spells full state name."""
+    body = (
+        "Title #1\n"
+        "Loc, ST\n"
+        "Practice\n"
+        "x\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "Address: 500 Oak Ln, Austin, Texas\n"
+        "City: Austin\n"
+        "State: TX\n"
+    )
+    out = parse_job_content_txt(body)
+    assert (out.get("address_line") or "").strip() == "500 Oak Ln, Austin, Texas"
+
+
 def test_address_line_city_state_only_when_no_address_label():
     body = (
         "Title #1\n"

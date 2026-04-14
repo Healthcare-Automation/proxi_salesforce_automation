@@ -19,6 +19,12 @@ from typing import Union, Optional
 from utils.address_display_format import format_us_address_line_for_display
 from utils.sf_text_normalize import strip_trailing_commas_from_sf_text
 from utils.job_description_proxi_template import extract_active_needs_dates
+from utils.us_state_expand import US_STATE_CODE_TO_NAME
+
+# Invert for "Missouri" row + "… Independence MO" street (abbrev vs full name).
+_STATE_FULL_NAME_UPPER_TO_CODE: dict[str, str] = {
+    name.upper(): code for code, name in US_STATE_CODE_TO_NAME.items()
+}
 
 # Canonical columns we always output (for CSV): identity → location → org/status → scheduling →
 # clinical detail → insight → remaining Kimedics header fields → full description.
@@ -414,16 +420,47 @@ def _city_appears_in_street(street: str, city: str) -> bool:
     return city.lower() in street.lower()
 
 
+def _us_state_row_match_tokens(state: str) -> list[str]:
+    """
+    Row ``state`` → uppercase strings to look for in the street line (2-letter and/or full name).
+
+    Kimedics often ends Address with ``City ST`` while City:/State: use full state name — without
+    both forms we duplicate (e.g. ``… Independence MO, Missouri``). Unknown / non-US values return
+    the trimmed upper string only (legacy token behavior).
+    """
+    s = (state or "").strip()
+    if not s:
+        return []
+    su = s.upper()
+    if len(su) == 2 and su.isalpha():
+        full = US_STATE_CODE_TO_NAME.get(su)
+        return [su] + ([full.upper()] if full else [])
+    code = _STATE_FULL_NAME_UPPER_TO_CODE.get(su)
+    if code:
+        return [code, su]
+    return [su]
+
+
+def _state_token_boundary_re(tok: str) -> re.Pattern[str]:
+    """Comma/start/end or whitespace boundary; allow digit after 2-letter (``TX 75001``)."""
+    if len(tok) == 2 and tok.isalpha():
+        return re.compile(rf"(?:^|[\s,]){re.escape(tok)}(?=$|[\s,\.]|\d)", re.IGNORECASE)
+    return re.compile(rf"(?:^|[\s,]){re.escape(tok)}(?=$|[\s,\.])", re.IGNORECASE)
+
+
 def _state_appears_in_street(street: str, state: str) -> bool:
-    """True if ``state`` appears as a token (2-letter US style), not as substring of a word."""
+    """True if the row state (abbrev or full US name) already appears as a segment in ``street``."""
     if not state or not street:
         return False
-    st = state.strip().upper()
-    if not st:
-        return False
-    return bool(
-        re.search(rf"(?:^|[\s,]){re.escape(st)}(?:$|[\s,\.])", street.upper())
-    )
+    toks = _us_state_row_match_tokens(state)
+    for tok in toks:
+        if _state_token_boundary_re(tok).search(street):
+            return True
+    # Legacy: uncommon / non-canonical state text (still token-bounded on the raw upper value).
+    raw = state.strip().upper()
+    if raw and raw not in toks and _state_token_boundary_re(raw).search(street):
+        return True
+    return False
 
 
 def _compose_full_address_line(out: dict) -> None:
