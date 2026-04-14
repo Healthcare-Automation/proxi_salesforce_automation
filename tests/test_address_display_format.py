@@ -1,6 +1,9 @@
 """US address display normalization (ALL CAPS → title-style)."""
 
-from utils.address_display_format import format_us_address_line_for_display
+from utils.address_display_format import (
+    format_us_address_line_for_display,
+    strip_redundant_city_state_from_shipping_street,
+)
 
 
 def test_leaves_mixed_case_unchanged():
@@ -68,3 +71,32 @@ def test_strips_trailing_commas_city_state_run_no_zip():
 def test_fullwidth_comma_treated_as_separator():
     raw = "100 Main St，Springfield， ，"  # U+FF0C fullwidth commas
     assert format_us_address_line_for_display(raw) == "100 Main St, Springfield"
+
+
+def test_strip_redundant_city_state_suffix_comma_city_abbr():
+    s = "5101 N Belt Hwy, Saint Joseph MO"
+    assert (
+        strip_redundant_city_state_from_shipping_street(s, city="Saint Joseph", state="Missouri")
+        == "5101 N Belt Hwy"
+    )
+
+
+def test_strip_redundant_city_state_suffix_state_abbr_input():
+    s = "5101 N Belt Hwy, Saint Joseph MO"
+    assert strip_redundant_city_state_from_shipping_street(s, city="Saint Joseph", state="MO") == "5101 N Belt Hwy"
+
+
+def test_strip_redundant_city_state_comma_city_full_state():
+    s = "5101 N Belt Hwy, Saint Joseph, Missouri"
+    assert (
+        strip_redundant_city_state_from_shipping_street(s, city="Saint Joseph", state="Missouri")
+        == "5101 N Belt Hwy"
+    )
+
+
+def test_strip_redundant_city_state_no_digit_remainder_returns_none():
+    assert strip_redundant_city_state_from_shipping_street("Saint Joseph MO", city="Saint Joseph", state="MO") is None
+
+
+def test_strip_redundant_city_state_no_duplicate_returns_none():
+    assert strip_redundant_city_state_from_shipping_street("5101 N Belt Hwy", city="Saint Joseph", state="MO") is None

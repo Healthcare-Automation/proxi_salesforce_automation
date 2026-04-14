@@ -2,6 +2,7 @@
 
 from utils.sf_job_payload import (
     CANONICAL_JOB_C_PUSH_FIELD_NAMES,
+    ROSTER_ONLY_FIELD,
     job_row_to_salesforce_fields,
 )
 
@@ -53,6 +54,18 @@ def test_volume_override_still_canonical():
     out = job_row_to_salesforce_fields(row)
     assert out.get("Job_Volume__c") == "10"
     assert set(out.keys()) <= CANONICAL_JOB_C_PUSH_FIELD_NAMES
+
+
+def test_roster_only_true_from_open_to_roster_in_description_when_column_false():
+    row = {
+        "job_id": "1",
+        "city": "X",
+        "state": "TX",
+        "roster_only": "false",
+        "description_full_text": "Open to roster. Pay Range: $100 – $120 per hour.\n",
+    }
+    out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    assert out.get(ROSTER_ONLY_FIELD) == "true"
 
 
 def test_trailing_commas_stripped_from_list_style_text_fields(monkeypatch):

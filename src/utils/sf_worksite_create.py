@@ -4,7 +4,8 @@ Create Salesforce Account (worksite) records when no location mapping exists, an
 New worksite **Account** POST includes:
 
 - ``Name`` — ``Aspen Dental - {City}, {ST}`` (2-letter state), see ``format_worksite_account_name``
-- ``ShippingStreet`` — Kimedics ``address_line`` (full single-line shipping address)
+- ``ShippingStreet`` — Kimedics ``address_line`` (normalized); trailing ``City, ST`` matching
+  structured city/state is removed so it does not duplicate ``ShippingCity``/``ShippingState``.
 - ``ParentId`` — Aspen Dental Management (``SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID``)
 - ``RecordTypeId`` — env ``PROXI_SF_ACCOUNT_WORKSITE_RECORD_TYPE_ID``, else describe ``Worksite`` record type
 
@@ -21,7 +22,10 @@ import json
 import os
 from typing import Any, Optional
 
-from utils.address_display_format import format_us_address_line_for_display
+from utils.address_display_format import (
+    format_us_address_line_for_display,
+    strip_redundant_city_state_from_shipping_street,
+)
 from utils.sf_job_rest_minimal import create_account_record, filter_createable_fields, describe_sobject
 from utils.sf_push_defaults import (
     SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID,
@@ -92,6 +96,12 @@ def fetch_or_create_worksite_account_id(
     display = format_worksite_account_name(c, st)
     raw_ship = (address_line or "").strip()
     ship_street = format_us_address_line_for_display(raw_ship) if raw_ship else None
+    if ship_street == "":
+        ship_street = None
+    if ship_street:
+        dedup = strip_redundant_city_state_from_shipping_street(ship_street, city=c, state=st)
+        if dedup:
+            ship_street = dedup
     if ship_street == "":
         ship_street = None
 

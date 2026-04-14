@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from utils.us_state_expand import US_STATE_CODE_TO_NAME
+from utils.us_state_expand import US_STATE_CODE_TO_NAME, state_abbrev_for_job_title, state_name_for_salesforce
 
 _US_STATE_CODES = frozenset(US_STATE_CODE_TO_NAME.keys())
 
@@ -202,3 +202,62 @@ def format_us_address_line_for_display(value: Optional[str]) -> str:
     out = ", ".join(formatted)
     out = _strip_trailing_comma_junk(out)
     return _strip_empty_comma_segments(out)
+
+
+def strip_redundant_city_state_from_shipping_street(
+    street: Optional[str],
+    *,
+    city: str,
+    state: str,
+) -> Optional[str]:
+    """
+    When ``ShippingStreet`` ends with the same city + state already represented in
+    ``ShippingCity`` / ``ShippingState`` (typical Kimedics ``address_line`` packed into Street),
+    return the street with that trailing duplicate removed so formula fields that concatenate
+    Street + City + State do not repeat the location.
+
+    Conservative: only strips when the remainder still contains a digit (street/building number)
+    and the match is anchored at the end of the string.
+
+    Returns ``None`` if there is no safe change.
+    """
+    s = _collapse_ws(street or "")
+    city_c = _collapse_ws(city or "")
+    state_raw = _collapse_ws(state or "")
+    if not s or not city_c or not state_raw:
+        return None
+
+    abbr = state_abbrev_for_job_title(state_raw)
+    if not abbr:
+        return None
+    full = state_name_for_salesforce(state_raw) if len(state_raw) == 2 else state_raw
+    if not full:
+        full = state_raw
+
+    city_re = re.escape(city_c)
+    abbr_re = re.escape(abbr)
+    full_re = re.escape(full)
+
+    # Longer / more specific patterns first (comma before duplicate tail is safest).
+    patterns = [
+        rf",\s*{city_re}\s*,\s*{full_re}\s*$",
+        rf",\s*{city_re}\s*,\s*{abbr_re}\s*$",
+        rf",\s*{city_re}\s+{abbr_re}\s*$",
+        rf",\s*{city_re}\s+{full_re}\s*$",
+        rf"\s+{city_re}\s+{abbr_re}\s*$",
+        rf"\s+{city_re}\s+{full_re}\s*$",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, s, flags=re.IGNORECASE)
+        if not m:
+            continue
+        candidate = _collapse_ws(s[: m.start()])
+        candidate = _strip_empty_comma_segments(_strip_trailing_comma_junk(candidate))
+        if not candidate or len(candidate) < 3 or candidate.casefold() == s.casefold():
+            continue
+        if not any(ch.isdigit() for ch in candidate):
+            continue
+        return candidate
+
+    return None

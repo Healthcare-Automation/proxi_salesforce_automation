@@ -29,7 +29,7 @@ from utils.job_description_proxi_template import (
 )
 from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE, extract_pay_range_from_description
 from utils.address_display_format import format_us_address_line_for_display
-from utils.job_content_parser import _parse_city_state
+from utils.job_content_parser import _parse_city_state, infer_roster_only_from_full_text
 from utils.sf_push_defaults import SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID
 from utils.sf_text_normalize import strip_trailing_commas_from_sf_text
 from utils.us_state_expand import state_abbrev_for_job_title, state_name_for_salesforce
@@ -262,9 +262,24 @@ def job_status_for_salesforce_push(raw_status: Any) -> Optional[str]:
 
 
 def roster_only_string_from_row(row: Optional[dict]) -> str:
-    """``\"true\"`` / ``\"false\"`` when Supabase ``roster_only`` reflects Kimedics ``roster only`` phrase."""
-    s = str((row or {}).get("roster_only") or "").strip().lower()
-    return "true" if s == "true" else "false"
+    """
+    ``\"true\"`` / ``\"false\"`` for ``roster_only__c``.
+
+    Uses Supabase ``roster_only`` when set; otherwise applies the same phrases as the parser
+    (``roster only`` / ``open to roster``, etc.) against description/insight/status so pushes stay
+    correct if the column was empty or stale.
+    """
+    r = row or {}
+    s = str(r.get("roster_only") or "").strip().lower()
+    if s == "true":
+        return "true"
+    blob = "\n".join(
+        str(r.get(k) or "")
+        for k in ("description_full_text", "insight", "status", "title_line")
+    )
+    if infer_roster_only_from_full_text(blob) == "true":
+        return "true"
+    return "false"
 
 
 def _mdy_to_iso(d: Optional[str]) -> Optional[str]:

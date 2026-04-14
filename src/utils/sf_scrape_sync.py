@@ -39,6 +39,7 @@ from utils.sf_job_rest_minimal import (
 from utils.sf_partial_update import prepare_patch_payload
 from utils.salesforce import get_token_auto
 from utils.sf_write_flags import proxi_sf_writes_enabled
+from utils.address_display_format import strip_redundant_city_state_from_shipping_street
 
 # Custom fields created for this integration (safe to update).
 # NOTE: match your org's API names exactly (case-sensitive).
@@ -172,6 +173,10 @@ def _sync_worksite_account_shipping_for_job_formula(
     """
     Job__c.Name is a formula using ``Job_Worksite_Location_1__r.ShippingCity/ShippingState``;
     keep those in sync with Job_City__c / Job_State__c when we have a worksite Account Id.
+
+    When ``ShippingStreet`` ends with the same city + state as structured fields (Kimedics
+    ``address_line`` was copied wholesale into Street), strip that trailing duplicate so
+    ``Job_Worksite_1_Address__c``-style formulas do not repeat city/state.
     """
     wid = (
         (job_row.get("sf_worksite_account_id") or "").strip()
@@ -198,7 +203,7 @@ def _sync_worksite_account_shipping_for_job_formula(
         instance_url,
         access_token,
         "GET",
-        f"sobjects/Account/{wid}?fields=ShippingCity,ShippingState",
+        f"sobjects/Account/{wid}?fields=ShippingStreet,ShippingCity,ShippingState",
         api_version=api_version,
     )
     if not isinstance(acc, dict):
@@ -210,6 +215,14 @@ def _sync_worksite_account_shipping_for_job_formula(
         patch_acc["ShippingCity"] = city
     if state and _normalize_sf_compare_value(acc.get("ShippingState")) != _normalize_sf_compare_value(state):
         patch_acc["ShippingState"] = state
+
+    st_raw = acc.get("ShippingStreet")
+    st_line = (st_raw if isinstance(st_raw, str) else "") or ""
+    if city and state and st_line.strip():
+        new_st = strip_redundant_city_state_from_shipping_street(st_line.strip(), city=city, state=state)
+        if new_st and _normalize_sf_compare_value(new_st) != _normalize_sf_compare_value(st_line):
+            patch_acc["ShippingStreet"] = new_st
+
     if not patch_acc:
         out["skipped_reason"] = "shipping_already_matches"
         return out
@@ -446,7 +459,7 @@ def sync_missing_scrape_fields_to_salesforce(
                 schema,
                 {
                     "reason": "dry_run",
-                    "detail": "Dry-run: would PATCH worksite Account ShippingCity/ShippingState only (Job fields already matched).",
+                    "detail": "Dry-run: would PATCH worksite Account shipping (City/State and Street dedupe if needed; Job fields already matched).",
                     "sf_job_id": sf_job_id or None,
                     "worksite_shipping_sync": shipping_sync,
                     "checked": list(field_names),
@@ -483,7 +496,7 @@ def sync_missing_scrape_fields_to_salesforce(
                 "sf_job_id": sf_job_id or None,
                 "fields_changed": [],
                 "worksite_account_shipping_updated": shipping_sync.get("account_fields"),
-                "detail": "Job fields already matched; updated worksite Account ShippingCity/ShippingState for Job Name formula.",
+                "detail": "Job fields already matched; updated worksite Account shipping (City/State and/or Street dedupe) for Job Name / address formulas.",
                 "worksite_shipping_sync": shipping_sync,
                 "checked": list(field_names),
                 "fields_compared": list(known_audit),

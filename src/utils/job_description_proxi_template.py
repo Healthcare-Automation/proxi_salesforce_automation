@@ -27,8 +27,18 @@ _KIMEDICS_TOP_DATES_UPDATE = re.compile(
     re.IGNORECASE,
 )
 
-# Kimedics admin line may end with ``Active needs are …`` — that clause wins over structured ``dates_needed``.
-_ACTIVE_NEEDS_ARE = re.compile(r"(?i)active\s+needs\s+are\s+")
+# Kimedics top-of-description lines often include ``Active need(s) …`` + dates; that clause wins over
+# structured ``dates_needed`` for both ``Job_Dates_Needed__c`` and canonical JD (``effective_dates_needed``).
+# Order: most specific / common phrasing first; first match on a line wins.
+_ACTIVE_NEED_LINE_PREFIXES: tuple[re.Pattern[str], ...] = (
+    # ``\b`` avoids matching ``active`` inside e.g. ``inactive``.
+    re.compile(r"(?i)\bactive\s+needs\s+are\s+"),
+    re.compile(r"(?i)\bactive\s+need\s+is\s+"),
+    re.compile(r"(?i)\bactive\s+needs\s+is\s+"),
+    re.compile(r"(?i)\bactive\s+need\s*:\s*"),
+    re.compile(r"(?i)\bactive\s+needs\s*:\s*"),
+    re.compile(r"(?i)\bactive\s+needs?\s*[-–—]\s*"),
+)
 
 # Kimedics internal phrasing for account managers — must not appear in candidate-facing copy.
 _PRESENTATION_NOTATE = re.compile(
@@ -58,24 +68,32 @@ def strip_internal_presentation_phrases(text: str) -> str:
 
 def extract_active_needs_dates(description_full_text: str) -> Optional[str]:
     """
-    If any line in ``description_full_text`` contains ``Active needs are `` (case-insensitive),
-    return the text after that phrase on the **same line** (trimmed). First match wins.
+    If any line contains an **Active need(s)** date clause (case-insensitive), return the text
+    after that phrase on the **same line** (trimmed). First matching line wins.
+
+    Recognized prefixes include ``Active needs are …``, ``Active need is …``, ``Active need: …``,
+    ``Active need – …``, etc., so top-of-post lines like
+    ``4/14 pending partial fill. Active need is May 20`` override structured ``dates_needed``.
     """
     t = (description_full_text or "").strip()
     if not t:
         return None
     for line in t.splitlines():
-        m = _ACTIVE_NEEDS_ARE.search(line)
-        if m:
-            rest = line[m.end() :].strip()
-            return rest if rest else None
+        for pat in _ACTIVE_NEED_LINE_PREFIXES:
+            m = pat.search(line)
+            if m:
+                rest = line[m.end() :].strip()
+                if rest:
+                    return rest
+                break
     return None
 
 
 def effective_dates_needed(row: dict) -> str:
     """
-    Dates for Job copy and ``Job_Dates_Needed__c``: ``Active needs are …`` from ``description_full_text``
-    overrides ``dates_needed`` when present.
+    Dates for Job copy and ``Job_Dates_Needed__c``: an **Active need(s) …** clause in
+    ``description_full_text`` (see :func:`extract_active_needs_dates`) overrides ``dates_needed``
+    when present.
     """
     active = extract_active_needs_dates((row.get("description_full_text") or "").strip())
     if active:

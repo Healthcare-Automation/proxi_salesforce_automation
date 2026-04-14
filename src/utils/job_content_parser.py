@@ -568,15 +568,20 @@ def _backfill_practice_value(out: dict, main_block: str) -> None:
             return
 
 
-# Kimedics job text (header + description): "roster only" / "roster-only" → Supabase ``roster_only`` = true/false.
+# Kimedics job text (header + description): "roster only" / "roster-only" / "open to roster" → ``roster_only`` = true/false.
 _ROSTER_ONLY_PHRASE = re.compile(r"roster\s*[-]?\s*only", re.IGNORECASE)
+_OPEN_TO_ROSTER_PHRASE = re.compile(r"\bopen\s+to\s+roster\b", re.IGNORECASE)
 
 
 def infer_roster_only_from_full_text(full_text: str) -> str:
     """Return ``\"true\"`` or ``\"false\"`` for Supabase / row payloads."""
     if not (full_text or "").strip():
         return "false"
-    return "true" if _ROSTER_ONLY_PHRASE.search(full_text) else "false"
+    if _ROSTER_ONLY_PHRASE.search(full_text):
+        return "true"
+    if _OPEN_TO_ROSTER_PHRASE.search(full_text):
+        return "true"
+    return "false"
 
 
 def repair_flat_jobpost_text_missing_posted_date(flat_text: str, posted_date: Optional[str]) -> str:

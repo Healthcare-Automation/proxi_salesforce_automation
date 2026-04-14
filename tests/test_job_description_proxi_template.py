@@ -96,6 +96,18 @@ def test_extract_active_needs_dates():
     assert extract_active_needs_dates("No marker here") is None
 
 
+def test_extract_active_need_singular_same_line_as_preamble():
+    """Kimedics often puts 'Active need is <date>' after a status fragment on the first line."""
+    line = "4/14 pending partial fill. Active need is May 20"
+    assert extract_active_needs_dates(line) == "May 20"
+    assert extract_active_needs_dates(f"{line}\n\nPay Range: $X\n") == "May 20"
+
+
+def test_extract_active_need_colon_and_dash_variants():
+    assert extract_active_needs_dates("Note. Active need: June 5 and 6") == "June 5 and 6"
+    assert extract_active_needs_dates("Active need – May 20 (tentative)") == "May 20 (tentative)"
+
+
 def test_active_needs_dates_in_template_overrides_dates_needed_column():
     row = _minimal_row()
     row["dates_needed"] = "Monday only"
@@ -104,6 +116,17 @@ def test_active_needs_dates_in_template_overrides_dates_needed_column():
     )
     out = build_proxi_job_posting_description(row, use_html=True)
     assert "Fridays June 5, 12, 19" in out
+    assert "Monday only" not in out
+
+
+def test_active_need_is_overrides_dates_in_job_description():
+    row = _minimal_row()
+    row["dates_needed"] = "Monday only"
+    row["description_full_text"] = (
+        "4/14 pending partial fill. Active need is May 20\n\nPay Range: $125 – $145 per hour\n"
+    )
+    out = build_proxi_job_posting_description(row, use_html=True)
+    assert "May 20" in out
     assert "Monday only" not in out
 
 

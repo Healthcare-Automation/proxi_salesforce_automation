@@ -153,6 +153,20 @@ def test_roster_only_detects_roster_hyphen_only():
     assert (out.get("roster_only") or "").strip() == "true"
 
 
+def test_roster_only_true_when_open_to_roster_in_description():
+    body = (
+        "Title #1\n"
+        "X, ST\n"
+        "Practice\n"
+        "Practice val\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "We are open to roster for this site.\n"
+    )
+    out = parse_job_content_txt(body)
+    assert (out.get("roster_only") or "").strip() == "true"
+
+
 def test_avg_patients_per_day_from_section_heading():
     body = (
         "Title #99\n"
@@ -432,6 +446,22 @@ def test_active_needs_are_overrides_dates_needed_including_labeled_dates_line():
     )
     out = parse_job_content_txt(body)
     assert (out.get("dates_needed") or "").strip() == "Fridays June 5, 12."
+
+
+def test_active_need_is_overrides_dates_needed():
+    """Singular 'Active need is …' on the first description line wins like 'Active needs are …'."""
+    body = (
+        "Title #1\n"
+        "Loc, ST\n"
+        "Practice\n"
+        "x\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "4/14 pending partial fill. Active need is May 20\n"
+        "Dates: Monday only\n"
+    )
+    out = parse_job_content_txt(body)
+    assert (out.get("dates_needed") or "").strip() == "May 20"
 
 
 def test_standard_schedule_cleared_when_not_hours_like():
