@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Union, Optional
 
 from utils.address_display_format import format_us_address_line_for_display
+from utils.sf_text_normalize import strip_trailing_commas_from_sf_text
 from utils.job_description_proxi_template import extract_active_needs_dates
 
 # Canonical columns we always output (for CSV): identity → location → org/status → scheduling →
@@ -400,7 +401,7 @@ def _normalize_support_staff(text: str) -> str:
     m = _SINGLE_COUNT_SUPPORT_STAFF.match(s)
     if m:
         return f"{int(m.group(1))} team members"
-    return s
+    return strip_trailing_commas_from_sf_text(s)
 
 
 def _collapse_whitespace(s: str) -> str:

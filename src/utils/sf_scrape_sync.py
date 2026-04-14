@@ -21,7 +21,6 @@ from utils.sf_job_payload import (
     SF_PUSH_JOB_ROLE_DEFAULTS,
     _canonical_description_use_html,
     _truncate_external_job_id,
-    build_salesforce_job_name,
     coerce_picklists_to_valid,
     external_job_link_from_job_row,
     merge_job_role_defaults_for_empty_sf_fields,
@@ -32,6 +31,7 @@ from utils.sf_job_rest_minimal import (
     describe_sobject,
     is_salesforce_deleted_entity_error,
     rest_json,
+    update_account_record,
     update_job_record,
 )
 from utils.sf_partial_update import prepare_patch_payload
@@ -132,6 +132,74 @@ def _rest_token_from_env() -> Optional[tuple[str, str]]:
     if not instance_url or not access_token:
         return None
     return instance_url, access_token
+
+
+def _sync_worksite_account_shipping_for_job_formula(
+    instance_url: str,
+    access_token: str,
+    *,
+    job_row: dict,
+    desired: dict[str, Any],
+    current: dict[str, Any],
+    dry_run: bool,
+    api_version: str = DEFAULT_REST_VERSION,
+) -> dict[str, Any]:
+    """
+    Job__c.Name is a formula using ``Job_Worksite_Location_1__r.ShippingCity/ShippingState``;
+    keep those in sync with Job_City__c / Job_State__c when we have a worksite Account Id.
+    """
+    wid = (
+        (job_row.get("sf_worksite_account_id") or "").strip()
+        or str(current.get("Job_Worksite_Location_1__c") or "").strip()
+        or str(desired.get("Job_Worksite_Location_1__c") or "").strip()
+    )
+    city = str(desired.get("Job_City__c") or current.get("Job_City__c") or "").strip()
+    state = str(desired.get("Job_State__c") or current.get("Job_State__c") or "").strip()
+    out: dict[str, Any] = {
+        "ok": True,
+        "worksite_account_id": wid or None,
+        "account_patched": False,
+        "account_fields": [],
+        "skipped_reason": None,
+        "error": None,
+    }
+    if not wid:
+        out["skipped_reason"] = "no_worksite_account_id"
+        return out
+    if not city and not state:
+        out["skipped_reason"] = "no_job_city_state"
+        return out
+    acc = rest_json(
+        instance_url,
+        access_token,
+        "GET",
+        f"sobjects/Account/{wid}?fields=ShippingCity,ShippingState",
+        api_version=api_version,
+    )
+    if not isinstance(acc, dict):
+        out["ok"] = False
+        out["error"] = "account_get_not_dict"
+        return out
+    patch_acc: dict[str, str] = {}
+    if city and _normalize_sf_compare_value(acc.get("ShippingCity")) != _normalize_sf_compare_value(city):
+        patch_acc["ShippingCity"] = city
+    if state and _normalize_sf_compare_value(acc.get("ShippingState")) != _normalize_sf_compare_value(state):
+        patch_acc["ShippingState"] = state
+    if not patch_acc:
+        out["skipped_reason"] = "shipping_already_matches"
+        return out
+    out["account_fields"] = sorted(patch_acc.keys())
+    if dry_run:
+        out["account_patched"] = True
+        out["skipped_reason"] = "dry_run"
+        return out
+    try:
+        update_account_record(instance_url, access_token, wid, patch_acc, api_version=api_version)
+        out["account_patched"] = True
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)[:2000]
+    return out
 
 
 def _get_job_fields(
@@ -273,14 +341,16 @@ def sync_missing_scrape_fields_to_salesforce(
     current = _get_job_fields(instance_url, access_token, sf_job_id, field_names)
     merge_job_role_defaults_for_empty_sf_fields(desired, current)
     coerce_picklists_to_valid(describe, desired)
-    # Name must use the same city/state as Job__c when the scrape row is sparse (e.g. ``4190 - Gloucester``).
-    desired["Name"] = build_salesforce_job_name(
-        job_row,
-        job_name_location_fallback={
-            "Job_City__c": current.get("Job_City__c"),
-            "Job_State__c": current.get("Job_State__c"),
-        },
+    # Job__c.Name is a formula — do not PATCH. Worksite Account Shipping* drives part of that formula.
+    shipping_sync = _sync_worksite_account_shipping_for_job_formula(
+        instance_url,
+        access_token,
+        job_row=job_row,
+        desired=desired,
+        current=current,
+        dry_run=dry_run,
     )
+    out["worksite_shipping_sync"] = shipping_sync
 
     patch: dict[str, Any] = {}
     for fname, want in desired.items():
@@ -291,7 +361,23 @@ def sync_missing_scrape_fields_to_salesforce(
             continue
         patch[fname] = want
 
-    if not patch:
+    if not patch and not shipping_sync.get("account_patched"):
+        if not shipping_sync.get("ok"):
+            out["reason"] = "worksite_shipping_sync_error"
+            _maybe_log(
+                conn,
+                jid_log,
+                "sf_scrape_fields_error",
+                schema,
+                {
+                    "reason": out["reason"],
+                    "error": shipping_sync.get("error"),
+                    "worksite_shipping_sync": shipping_sync,
+                    "sf_job_id": sf_job_id or None,
+                },
+                run_id=run_id,
+            )
+            return out
         out["ok"] = True
         out["reason"] = "already_matches_salesforce"
         compared = _nonempty_desired_field_names(desired)
@@ -304,13 +390,65 @@ def sync_missing_scrape_fields_to_salesforce(
             schema,
             {
                 "reason": out["reason"],
-                "detail": "Compared desired values from the scrape to Salesforce; all fields already matched, so no write was sent.",
+                "detail": "Compared desired values from the scrape to Salesforce; all Job fields already matched and worksite shipping is current.",
                 "sf_job_id": sf_job_id or None,
                 "checked": list(field_names),
                 "fields_compared": compared,
                 "fields_changed": [],
                 "prev": prev_full,
                 "next": next_full,
+                "worksite_shipping_sync": shipping_sync,
+            },
+            run_id=run_id,
+        )
+        return out
+
+    if not patch:
+        if dry_run:
+            out["ok"] = True
+            out["patched"] = True
+            out["fields"] = []
+            out["dry_run_worksite_shipping"] = shipping_sync
+            _maybe_log(
+                conn,
+                jid_log,
+                "sf_scrape_fields_skip",
+                schema,
+                {
+                    "reason": "dry_run",
+                    "detail": "Dry-run: would PATCH worksite Account ShippingCity/ShippingState only (Job fields already matched).",
+                    "sf_job_id": sf_job_id or None,
+                    "worksite_shipping_sync": shipping_sync,
+                },
+                run_id=run_id,
+            )
+            return out
+        if not shipping_sync.get("ok"):
+            out["reason"] = "worksite_shipping_sync_error"
+            out["error"] = shipping_sync.get("error")
+            _maybe_log(
+                conn,
+                jid_log,
+                "sf_scrape_fields_error",
+                schema,
+                {"reason": out["reason"], "worksite_shipping_sync": shipping_sync},
+                run_id=run_id,
+            )
+            return out
+        out["ok"] = True
+        out["patched"] = True
+        out["fields"] = []
+        _maybe_log(
+            conn,
+            jid_log,
+            "sf_scrape_fields_patched",
+            schema,
+            {
+                "sf_job_id": sf_job_id or None,
+                "fields_changed": [],
+                "worksite_account_shipping_updated": shipping_sync.get("account_fields"),
+                "detail": "Job fields already matched; updated worksite Account ShippingCity/ShippingState for Job Name formula.",
+                "worksite_shipping_sync": shipping_sync,
             },
             run_id=run_id,
         )

@@ -282,3 +282,26 @@ def update_job_record(
         api_version=api_version,
     )
     return out or {}
+
+
+def update_account_record(
+    instance_url: str,
+    access_token: str,
+    account_id: str,
+    fields: dict,
+    *,
+    api_version: str = DEFAULT_REST_VERSION,
+) -> dict:
+    """PATCH /sobjects/Account/{id}/ — for worksite Shipping* (Job Name formula path)."""
+    rid = (account_id or "").strip()
+    if not rid:
+        return {}
+    out = rest_json(
+        instance_url,
+        access_token,
+        "PATCH",
+        f"sobjects/Account/{rid}",
+        body=fields,
+        api_version=api_version,
+    )
+    return out or {}

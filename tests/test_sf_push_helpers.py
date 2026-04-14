@@ -113,8 +113,9 @@ def test_salesforce_job_name_pattern():
         "description_full_text": "x",
     }
     out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    assert "Name" not in out
     assert (
-        out["Name"]
+        build_salesforce_job_name(row)
         == "NY (Dunkirk) General Dentistry - Aspen Dental Management Inc. - Open"
     )
 
@@ -128,8 +129,9 @@ def test_salesforce_job_name_uses_abbrev_when_state_is_full_name():
         "description_full_text": "x",
     }
     out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    assert "Name" not in out
     assert (
-        out["Name"]
+        build_salesforce_job_name(row)
         == "VA (Virginia Beach) General Dentistry - Aspen Dental Management Inc. - Open"
     )
 
@@ -144,7 +146,8 @@ def test_salesforce_job_name_heartland_posting_org():
         "description_full_text": "x",
     }
     out = job_row_to_salesforce_fields(row, use_canonical_description=False)
-    assert out["Name"] == "SC (Summerville) General Dentistry - Heartland Dental - Open"
+    assert "Name" not in out
+    assert build_salesforce_job_name(row) == "SC (Summerville) General Dentistry - Heartland Dental - Open"
 
 
 def test_salesforce_job_name_midwest_posting_org():
@@ -157,7 +160,8 @@ def test_salesforce_job_name_midwest_posting_org():
         "description_full_text": "x",
     }
     out = job_row_to_salesforce_fields(row, use_canonical_description=False)
-    assert out["Name"] == "OH (Shelby) General Dentistry - Midwest Dental - Closed"
+    assert "Name" not in out
+    assert build_salesforce_job_name(row) == "OH (Shelby) General Dentistry - Midwest Dental - Closed"
 
 
 def test_salesforce_job_name_city_from_practice_value_when_city_blank():
@@ -171,8 +175,10 @@ def test_salesforce_job_name_city_from_practice_value_when_city_blank():
         "description_full_text": "x",
     }
     out = job_row_to_salesforce_fields(row, use_canonical_description=False)
-    assert "SC (Summerville)" in out["Name"]
-    assert "Heartland Dental" in out["Name"]
+    assert "Name" not in out
+    nm = build_salesforce_job_name(row)
+    assert "SC (Summerville)" in nm
+    assert "Heartland Dental" in nm
 
 
 def test_salesforce_job_name_no_empty_parens_when_city_unknown():
@@ -187,8 +193,10 @@ def test_salesforce_job_name_no_empty_parens_when_city_unknown():
         "description_full_text": "x",
     }
     out = job_row_to_salesforce_fields(row, use_canonical_description=False)
-    assert "()" not in out["Name"]
-    assert out["Name"] == "TX General Dentistry - Heartland Dental - Closed"
+    assert "Name" not in out
+    nm = build_salesforce_job_name(row)
+    assert "()" not in nm
+    assert nm == "TX General Dentistry - Heartland Dental - Closed"
 
 
 def test_extract_pay_range():

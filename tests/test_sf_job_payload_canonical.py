@@ -53,3 +53,20 @@ def test_volume_override_still_canonical():
     out = job_row_to_salesforce_fields(row)
     assert out.get("Job_Volume__c") == "10"
     assert set(out.keys()) <= CANONICAL_JOB_C_PUSH_FIELD_NAMES
+
+
+def test_trailing_commas_stripped_from_list_style_text_fields():
+    row = {
+        "job_id": "1",
+        "city": "X",
+        "state": "TX",
+        "support_staff": "3 DAs, 2 Hygienists,",
+        "types_of_cases": "Restorative, surgical,",
+        "point_of_contact": "Jane Doe,",
+        "insight": "*Note here,",
+    }
+    out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    assert out.get("Job_Support_Staff__c") == "3 DAs, 2 Hygienists"
+    assert out.get("Job_Types_of_Cases__c") == "Restorative, surgical"
+    assert out.get("Job_Point_of_Contact__c") == "Jane Doe"
+    assert out.get("Insight__c") == "*Note here"

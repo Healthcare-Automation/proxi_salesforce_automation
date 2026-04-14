@@ -31,6 +31,7 @@ from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE, extract_pay_range_from_
 from utils.address_display_format import format_us_address_line_for_display
 from utils.job_content_parser import _parse_city_state
 from utils.sf_push_defaults import SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID
+from utils.sf_text_normalize import strip_trailing_commas_from_sf_text
 from utils.us_state_expand import state_abbrev_for_job_title, state_name_for_salesforce
 
 # Display string in Job ``Name`` (must match org / formula expectations; same org as primary account).
@@ -79,9 +80,25 @@ SF_PUSH_STATIC_DEFAULTS: dict[str, str] = {
 # Exact Job__c API names automation may send (before Salesforce describe filters FLS).
 # Must stay aligned with ``job_row_to_salesforce_fields`` + ``SF_PUSH_STATIC_DEFAULTS``
 # and ``docs/engineering/salesforce_job_push_rules.md``.
+# Free-text Job__c fields: strip trailing commas so SF matches clean Kimedics lists (e.g. support staff).
+_SF_TEXT_FIELDS_STRIP_TRAILING_COMMAS: frozenset[str] = frozenset(
+    {
+        "Job_Support_Staff__c",
+        "Job_Types_of_Cases__c",
+        "Job_Point_of_Contact__c",
+        "Job_Dates_Needed__c",
+        "Job_Standard_Schedule__c",
+        "Standard_Schedule_Hours__c",
+        "Job_Facility_Display__c",
+        "Job_Client_Job_Id__c",
+        "Insight__c",
+        "Job_Volume__c",
+        "Job_Worksite_1_Address__c",
+    }
+)
+
 CANONICAL_JOB_C_PUSH_FIELD_NAMES: frozenset[str] = frozenset(
     {
-        "Name",
         "External_Job_ID__c",
         "Job_Account__c",
         "Job_Worksite_Location_1__c",
@@ -109,6 +126,17 @@ CANONICAL_JOB_C_PUSH_FIELD_NAMES: frozenset[str] = frozenset(
         *SF_PUSH_STATIC_DEFAULTS.keys(),
     }
 )
+
+
+def _apply_trailing_comma_strip_to_sf_text_fields(out: dict[str, Any]) -> None:
+    for k in _SF_TEXT_FIELDS_STRIP_TRAILING_COMMAS:
+        v = out.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, str):
+            v = str(v)
+        cleaned = strip_trailing_commas_from_sf_text(v)
+        out[k] = cleaned if cleaned else None
 
 
 def _sf_field_nonempty(val: Any) -> bool:
@@ -333,8 +361,8 @@ def build_salesforce_job_name(
     When city is missing everywhere, parentheses are omitted (no ``()``).
 
     ``job_name_location_fallback``: optional ``Job_City__c`` / ``Job_State__c`` from a Salesforce
-    GET when the Supabase row has blank location (common for Elite/sync rows); keeps ``Name`` aligned
-    with populated ``Job_City__c`` / ``Job_State__c``.
+    GET when the Supabase row has blank location — **reference / tooling only**; Job ``Name`` is a
+    formula in this org and is not written by automation.
     """
     r = _row_with_job_name_location_fallback(row, job_name_location_fallback)
     abbr = state_abbrev_for_job_title(r.get("state"))
@@ -369,7 +397,6 @@ def job_row_to_salesforce_fields(
     primary_account_id: Optional[str] = None,
     worksite_account_id: Optional[str] = None,
     description_use_html: Optional[bool] = None,
-    job_name_location_fallback: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """
     Build a Job__c field dict from one job row (``job_current`` shape).
@@ -409,8 +436,8 @@ def job_row_to_salesforce_fields(
     addr = format_us_address_line_for_display(addr_raw) if addr_raw else None
     if addr == "":
         addr = None
+    # Job__c Name is a formula (worksite shipping city/state, specialty, account, status) — do not PATCH.
     out: dict[str, Any] = {
-        "Name": build_salesforce_job_name(r, job_name_location_fallback=job_name_location_fallback),
         "External_Job_ID__c": _truncate_external_job_id(r.get("job_id")),
         "Job_Account__c": pid,
         "Job_Worksite_Location_1__c": wid if wid else None,
@@ -440,6 +467,8 @@ def job_row_to_salesforce_fields(
         out["Job_Volume__c"] = vol
     out["Job_Ranking__c"] = str(r.get("job_ranking") or "B").strip() or "B"
 
+    _apply_trailing_comma_strip_to_sf_text_fields(out)
+
     extra = set(out.keys()) - CANONICAL_JOB_C_PUSH_FIELD_NAMES
     if extra:
         raise RuntimeError(
@@ -459,7 +488,6 @@ def prepare_payload_for_write(
     primary_account_id: Optional[str] = None,
     worksite_account_id: Optional[str] = None,
     description_use_html: Optional[bool] = None,
-    job_name_location_fallback: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """
     Full row → Salesforce fields → picklist coercion → createable/updateable filter.
@@ -472,7 +500,6 @@ def prepare_payload_for_write(
         primary_account_id=primary_account_id,
         worksite_account_id=worksite_account_id,
         description_use_html=description_use_html,
-        job_name_location_fallback=job_name_location_fallback,
     )
     if for_update:
         for k in SF_PUSH_JOB_ROLE_DEFAULTS:
