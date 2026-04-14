@@ -53,7 +53,8 @@ def test_job_status_empty_is_none():
     assert job_status_for_salesforce_push("") is None
 
 
-def test_standard_schedule_hours_matches_job_standard_schedule():
+def test_standard_schedule_hours_matches_job_standard_schedule(monkeypatch):
+    monkeypatch.setenv("PROXI_SF_OMIT_JOB_FIELDS", "")
     row = {
         "job_id": "19999",
         "city": "Testville",

@@ -127,6 +127,39 @@ CANONICAL_JOB_C_PUSH_FIELD_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# API names omitted from Salesforce push when unset env (org FLS / field not on Job__c).
+_DEFAULT_SF_PUSH_OMITS: frozenset[str] = frozenset(
+    {
+        "Job_Facility_Display__c",
+        "Job_Worksite_1_Address__c",
+        "Job_Point_of_Contact__c",
+        "Job_Standard_Schedule__c",
+        "Job_Provider_Start_Date__c",
+        "Job_Provider_End_Date__c",
+        "Position_Type_DJC__c",
+        "Specialty_DJC__c",
+        "Worksite_Parent__c",
+    }
+)
+
+
+def sf_push_omitted_field_names() -> frozenset[str]:
+    """
+    Fields not sent to Salesforce for this deployment.
+
+    - Env unset → use :data:`_DEFAULT_SF_PUSH_OMITS` (Aspen org: not updateable / not on describe).
+    - ``PROXI_SF_OMIT_JOB_FIELDS=`` (empty) → omit nothing (other orgs / full push).
+    - Otherwise comma-separated API names to omit in addition to or instead of default — use only
+      explicit list when set to non-empty.
+    """
+    raw = os.environ.get("PROXI_SF_OMIT_JOB_FIELDS")
+    if raw is None:
+        return _DEFAULT_SF_PUSH_OMITS
+    s = raw.strip()
+    if not s:
+        return frozenset()
+    return frozenset(x.strip() for x in s.split(",") if x.strip())
+
 
 def _apply_trailing_comma_strip_to_sf_text_fields(out: dict[str, Any]) -> None:
     for k in _SF_TEXT_FIELDS_STRIP_TRAILING_COMMAS:
@@ -469,10 +502,15 @@ def job_row_to_salesforce_fields(
 
     _apply_trailing_comma_strip_to_sf_text_fields(out)
 
-    extra = set(out.keys()) - CANONICAL_JOB_C_PUSH_FIELD_NAMES
+    omit = sf_push_omitted_field_names()
+    for k in omit:
+        out.pop(k, None)
+
+    allowed = CANONICAL_JOB_C_PUSH_FIELD_NAMES - omit
+    extra = set(out.keys()) - allowed
     if extra:
         raise RuntimeError(
-            "job_row_to_salesforce_fields produced keys not in CANONICAL_JOB_C_PUSH_FIELD_NAMES: "
+            "job_row_to_salesforce_fields produced keys not in allowed canonical set: "
             f"{sorted(extra)} — update the frozenset and docs together."
         )
 

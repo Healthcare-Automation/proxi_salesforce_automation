@@ -55,7 +55,8 @@ def test_volume_override_still_canonical():
     assert set(out.keys()) <= CANONICAL_JOB_C_PUSH_FIELD_NAMES
 
 
-def test_trailing_commas_stripped_from_list_style_text_fields():
+def test_trailing_commas_stripped_from_list_style_text_fields(monkeypatch):
+    monkeypatch.setenv("PROXI_SF_OMIT_JOB_FIELDS", "")
     row = {
         "job_id": "1",
         "city": "X",

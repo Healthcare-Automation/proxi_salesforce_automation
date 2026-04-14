@@ -19,6 +19,7 @@ from typing import Any, Optional, Union
 
 from utils.sf_job_payload import (
     CANONICAL_JOB_C_PUSH_FIELD_NAMES,
+    sf_push_omitted_field_names,
     _canonical_description_use_html,
     _truncate_external_job_id,
     coerce_picklists_to_valid,
@@ -86,7 +87,7 @@ def _scrape_sync_audit_field_names(*, test_mode: bool) -> tuple[str, ...]:
     Role/source picklists are often omitted from ``desired`` when Salesforce already has a value,
     but we still fetch and display them.
     """
-    names = set(CANONICAL_JOB_C_PUSH_FIELD_NAMES)
+    names = set(CANONICAL_JOB_C_PUSH_FIELD_NAMES) - sf_push_omitted_field_names()
     if test_mode:
         names.add(SF_FIELD_TEST_STATUS)
         names.add(SF_FIELD_TEST_POSTED_DATE)
