@@ -13,9 +13,22 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Optional
+from typing import Iterable, Optional
 
 DEFAULT_REST_VERSION = "v59.0"
+
+# Same org + describe → same skip lists; avoid printing once per job in batch scripts.
+_SKIP_PRINT_KEYS: set[str] = set()
+
+
+def _print_field_skip_once(kind: str, names: list[str], label: str) -> None:
+    if not names:
+        return
+    key = f"{kind}:{','.join(sorted(names))}"
+    if key in _SKIP_PRINT_KEYS:
+        return
+    _SKIP_PRINT_KEYS.add(key)
+    print(f"{label}: {', '.join(names)}")
 
 
 class OAuthTokenHTTPError(RuntimeError):
@@ -207,6 +220,28 @@ def describe_sobject(
     return out or {}
 
 
+def filter_field_names_to_describe(describe: dict, names: Iterable[str]) -> tuple[str, ...]:
+    """
+    REST ``GET ...?fields=a,b,c`` fails with HTTP 400 if any name is not on the object.
+
+    Use the describe ``fields`` list so audit GETs and hub ``fields_compared`` stay aligned with
+    what actually exists in this org (custom fields vary by sandbox/prod).
+    """
+    valid = {
+        f["name"]
+        for f in describe.get("fields", [])
+        if isinstance(f, dict) and f.get("name")
+    }
+    requested = sorted(frozenset(n for n in names if n))
+    missing = [n for n in requested if n not in valid]
+    _print_field_skip_once(
+        "describe_omit",
+        missing,
+        "Skipped (field not on object describe; omitted from GET/compare)",
+    )
+    return tuple(n for n in requested if n in valid)
+
+
 def filter_createable_fields(describe: dict, fields: dict) -> dict:
     creatable = {
         f["name"]
@@ -222,8 +257,7 @@ def filter_createable_fields(describe: dict, fields: dict) -> dict:
             out[k] = v
         else:
             skipped.append(k)
-    if skipped:
-        print("Skipped (not createable on object):", ", ".join(skipped))
+    _print_field_skip_once("not_createable", skipped, "Skipped (not createable on object)")
     return out
 
 
@@ -256,8 +290,7 @@ def filter_updateable_fields(describe: dict, fields: dict) -> dict:
             out[k] = v
         else:
             skipped.append(k)
-    if skipped:
-        print("Skipped (not updateable on object):", ", ".join(skipped))
+    _print_field_skip_once("not_updateable", skipped, "Skipped (not updateable on object)")
     return out
 
 

@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Any, Optional, Union
 
 from utils.sf_job_payload import (
-    SF_PUSH_JOB_ROLE_DEFAULTS,
+    CANONICAL_JOB_C_PUSH_FIELD_NAMES,
     _canonical_description_use_html,
     _truncate_external_job_id,
     coerce_picklists_to_valid,
@@ -29,6 +29,7 @@ from utils.sf_job_payload import (
 from utils.sf_job_rest_minimal import (
     DEFAULT_REST_VERSION,
     describe_sobject,
+    filter_field_names_to_describe,
     is_salesforce_deleted_entity_error,
     rest_json,
     update_account_record,
@@ -76,16 +77,39 @@ def posted_date_to_salesforce_date(raw: Optional[str]) -> Optional[str]:
     return None
 
 
-def _nonempty_desired_field_names(desired: dict[str, Any]) -> list[str]:
-    """API names we intend to sync (non-null, non-blank string values)."""
-    out: list[str] = []
-    for fname, want in desired.items():
-        if want is None:
-            continue
-        if isinstance(want, str) and not want.strip():
-            continue
-        out.append(fname)
-    return sorted(out)
+def _scrape_sync_audit_field_names(*, test_mode: bool) -> tuple[str, ...]:
+    """
+    Every Job__c API name automation may send (canonical push set).
+
+    Used for the Salesforce GET field list and for ``fields_compared`` / ``prev`` / ``next`` in
+    ``job_event_log`` so the hub shows a full audit — not only fields present in the PATCH body.
+    Role/source picklists are often omitted from ``desired`` when Salesforce already has a value,
+    but we still fetch and display them.
+    """
+    names = set(CANONICAL_JOB_C_PUSH_FIELD_NAMES)
+    if test_mode:
+        names.add(SF_FIELD_TEST_STATUS)
+        names.add(SF_FIELD_TEST_POSTED_DATE)
+    return tuple(sorted(names))
+
+
+def _scrape_sync_prev_next_full(
+    compared: tuple[str, ...],
+    desired: dict[str, Any],
+    current: dict[str, Any],
+    body: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build hub audit dicts: after PATCH prefer ``body``; else automation ``desired``; else SF ``current``."""
+    prev_full = {k: current.get(k) for k in compared}
+    next_full: dict[str, Any] = {}
+    for k in compared:
+        if k in body:
+            next_full[k] = body[k]
+        elif k in desired:
+            next_full[k] = desired[k]
+        else:
+            next_full[k] = current.get(k)
+    return prev_full, next_full
 
 
 def desired_scrape_sync_fields_from_job_row(row: Optional[dict]) -> dict[str, Any]:
@@ -317,7 +341,8 @@ def sync_missing_scrape_fields_to_salesforce(
             },
             run_id=run_id,
         )
-    if _env_truthy("PROXI_SF_TEST_MODE"):
+    test_mode = _env_truthy("PROXI_SF_TEST_MODE")
+    if test_mode:
         desired.update(desired_scrape_sync_fields_from_job_row(job_row))
 
     if not desired:
@@ -336,8 +361,12 @@ def sync_missing_scrape_fields_to_salesforce(
         )
         return out
 
-    role_keys = tuple(SF_PUSH_JOB_ROLE_DEFAULTS.keys())
-    field_names = tuple(sorted(set(desired.keys()) | set(role_keys)))
+    audit_field_names = _scrape_sync_audit_field_names(test_mode=test_mode)
+    known_audit = filter_field_names_to_describe(describe, audit_field_names)
+    field_names = filter_field_names_to_describe(
+        describe,
+        tuple(sorted(frozenset(desired.keys()) | frozenset(known_audit))),
+    )
     current = _get_job_fields(instance_url, access_token, sf_job_id, field_names)
     merge_job_role_defaults_for_empty_sf_fields(desired, current)
     coerce_picklists_to_valid(describe, desired)
@@ -380,9 +409,8 @@ def sync_missing_scrape_fields_to_salesforce(
             return out
         out["ok"] = True
         out["reason"] = "already_matches_salesforce"
-        compared = _nonempty_desired_field_names(desired)
-        prev_full = {k: current.get(k) for k in compared}
-        next_full = {k: desired.get(k) for k in compared}
+        compared = known_audit
+        prev_full, next_full = _scrape_sync_prev_next_full(compared, desired, current, {})
         _maybe_log(
             conn,
             jid_log,
@@ -393,7 +421,7 @@ def sync_missing_scrape_fields_to_salesforce(
                 "detail": "Compared desired values from the scrape to Salesforce; all Job fields already matched and worksite shipping is current.",
                 "sf_job_id": sf_job_id or None,
                 "checked": list(field_names),
-                "fields_compared": compared,
+                "fields_compared": list(compared),
                 "fields_changed": [],
                 "prev": prev_full,
                 "next": next_full,
@@ -409,6 +437,7 @@ def sync_missing_scrape_fields_to_salesforce(
             out["patched"] = True
             out["fields"] = []
             out["dry_run_worksite_shipping"] = shipping_sync
+            dr_prev, dr_next = _scrape_sync_prev_next_full(known_audit, desired, current, {})
             _maybe_log(
                 conn,
                 jid_log,
@@ -419,6 +448,11 @@ def sync_missing_scrape_fields_to_salesforce(
                     "detail": "Dry-run: would PATCH worksite Account ShippingCity/ShippingState only (Job fields already matched).",
                     "sf_job_id": sf_job_id or None,
                     "worksite_shipping_sync": shipping_sync,
+                    "checked": list(field_names),
+                    "fields_compared": list(known_audit),
+                    "fields_changed": [],
+                    "prev": dr_prev,
+                    "next": dr_next,
                 },
                 run_id=run_id,
             )
@@ -438,6 +472,7 @@ def sync_missing_scrape_fields_to_salesforce(
         out["ok"] = True
         out["patched"] = True
         out["fields"] = []
+        sh_prev, sh_next = _scrape_sync_prev_next_full(known_audit, desired, current, {})
         _maybe_log(
             conn,
             jid_log,
@@ -449,6 +484,10 @@ def sync_missing_scrape_fields_to_salesforce(
                 "worksite_account_shipping_updated": shipping_sync.get("account_fields"),
                 "detail": "Job fields already matched; updated worksite Account ShippingCity/ShippingState for Job Name formula.",
                 "worksite_shipping_sync": shipping_sync,
+                "checked": list(field_names),
+                "fields_compared": list(known_audit),
+                "prev": sh_prev,
+                "next": sh_next,
             },
             run_id=run_id,
         )
@@ -465,6 +504,7 @@ def sync_missing_scrape_fields_to_salesforce(
         out["patched"] = True
         out["fields"] = sorted(body.keys())
         out["dry_run_body"] = body
+        dr2_prev, dr2_next = _scrape_sync_prev_next_full(known_audit, desired, current, body)
         _maybe_log(
             conn,
             jid_log,
@@ -475,6 +515,11 @@ def sync_missing_scrape_fields_to_salesforce(
                 "detail": "Dry-run mode: computed Salesforce update body but did not send the API request.",
                 "sf_job_id": sf_job_id or None,
                 "would_update": sorted(body.keys()),
+                "checked": list(field_names),
+                "fields_compared": list(known_audit),
+                "fields_changed": sorted(body.keys()),
+                "prev": dr2_prev,
+                "next": dr2_next,
             },
             run_id=run_id,
         )
@@ -512,14 +557,8 @@ def sync_missing_scrape_fields_to_salesforce(
                     run_id=run_id,
                 )
                 return out
-            compared = _nonempty_desired_field_names(desired)
-            prev_full = {k: current.get(k) for k in compared}
-            next_full: dict[str, Any] = {}
-            for k in compared:
-                if k in body:
-                    next_full[k] = body[k]
-                else:
-                    next_full[k] = current.get(k)
+            compared = known_audit
+            prev_full, next_full = _scrape_sync_prev_next_full(compared, desired, current, body)
             _maybe_log(
                 conn,
                 jid_log,
@@ -528,7 +567,7 @@ def sync_missing_scrape_fields_to_salesforce(
                 {
                     "sf_job_id": sf_job_id or None,
                     "fields_changed": sorted(body.keys()),
-                    "fields_compared": compared,
+                    "fields_compared": list(compared),
                     "prev": prev_full,
                     "next": next_full,
                     "retried_without_worksite_lookup": True,
@@ -559,14 +598,8 @@ def sync_missing_scrape_fields_to_salesforce(
     out["ok"] = True
     out["patched"] = True
     out["fields"] = sorted(body.keys())
-    compared = _nonempty_desired_field_names(desired)
-    prev_full = {k: current.get(k) for k in compared}
-    next_full: dict[str, Any] = {}
-    for k in compared:
-        if k in body:
-            next_full[k] = body[k]
-        else:
-            next_full[k] = current.get(k)
+    compared = known_audit
+    prev_full, next_full = _scrape_sync_prev_next_full(compared, desired, current, body)
     _maybe_log(
         conn,
         jid_log,
@@ -575,7 +608,7 @@ def sync_missing_scrape_fields_to_salesforce(
         {
             "sf_job_id": sf_job_id or None,
             "fields_changed": out["fields"],
-            "fields_compared": compared,
+            "fields_compared": list(compared),
             "prev": prev_full,
             "next": next_full,
         },
