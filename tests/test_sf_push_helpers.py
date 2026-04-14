@@ -133,6 +133,63 @@ def test_salesforce_job_name_uses_abbrev_when_state_is_full_name():
     )
 
 
+def test_salesforce_job_name_heartland_posting_org():
+    row = {
+        "job_id": "1",
+        "city": "Summerville",
+        "state": "SC",
+        "posting_org": "Heartland Dental",
+        "status": "Open",
+        "description_full_text": "x",
+    }
+    out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    assert out["Name"] == "SC (Summerville) General Dentistry - Heartland Dental - Open"
+
+
+def test_salesforce_job_name_midwest_posting_org():
+    row = {
+        "job_id": "1",
+        "city": "Shelby",
+        "state": "OH",
+        "posting_org": "Midwest Dental",
+        "status": "Closed",
+        "description_full_text": "x",
+    }
+    out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    assert out["Name"] == "OH (Shelby) General Dentistry - Midwest Dental - Closed"
+
+
+def test_salesforce_job_name_city_from_practice_value_when_city_blank():
+    row = {
+        "job_id": "1",
+        "city": "",
+        "state": "SC",
+        "practice_value": "1234 - Summerville, SC",
+        "posting_org": "Heartland Dental",
+        "status": "Open",
+        "description_full_text": "x",
+    }
+    out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    assert "SC (Summerville)" in out["Name"]
+    assert "Heartland Dental" in out["Name"]
+
+
+def test_salesforce_job_name_no_empty_parens_when_city_unknown():
+    row = {
+        "job_id": "1",
+        "city": "",
+        "state": "TX",
+        "practice_value": "",
+        "location_line": "",
+        "posting_org": "Heartland Dental",
+        "status": "Closed",
+        "description_full_text": "x",
+    }
+    out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    assert "()" not in out["Name"]
+    assert out["Name"] == "TX General Dentistry - Heartland Dental - Closed"
+
+
 def test_extract_pay_range():
     text = "Something something Pay Range: $125 – $145 per hour\nfooter"
     got = extract_pay_range_from_description(text)

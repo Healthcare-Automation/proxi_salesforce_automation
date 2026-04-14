@@ -45,10 +45,13 @@ Below, **“Supabase column”** is the human/process input from Kimedics scrape
 
 ### `Name`
 
-- **Intent:** Record title / header line in Salesforce.
-- **Pattern:** `{StateAbbr} ({City}) {Specialty} - Aspen Dental Management Inc. - {Open|Closed}`  
-  Example shape: `NY (Dunkirk) General Dentistry - Aspen Dental Management Inc. - Open`
-- **Sources:** `state` → abbrev (`state_abbrev_for_job_title`); `city`; specialty from static default **General Dentistry**; status via **`job_status_for_salesforce_push`** (Open/Closed only).
+- **Intent:** Record title / header line in Salesforce (manual parity with recruiter naming).
+- **Pattern:** `{StateAbbr} ({City}) {Specialty} - {Brand} - {Open|Closed}`  
+  Examples: `OH (Shelby) General Dentistry - Midwest Dental - Closed`, `SC (Summerville) General Dentistry - Heartland Dental - Open`.
+- **Brand (`posting_org`):** `job_name_brand_display_for_row` — substring match on trimmed lowercased **posting_org**: **Heartland** → `Heartland Dental`; **Midwest** → `Midwest Dental`; **Aspen** → `Aspen Dental Management Inc.`; other non-empty values pass through as-is; empty → **Aspen Dental Management Inc.**
+- **City:** Primary `city` column; if blank, city from **`practice_value`** via `_parse_city_state` (e.g. `1234 - Summerville, SC`); if still blank, first segment of **`location_line`** before the last comma (parenthetical suffix stripped). **If no city is found, the `(City)` parentheses are omitted** so you never get `() General Dentistry - …`.
+- **Specialty:** static default **General Dentistry** (same as `Job_Specialty__c` / `Specialty_DJC__c` defaults).
+- **Status:** **`job_status_for_salesforce_push`** → **Open** or **Closed** only.
 - **Length:** Hard cap **80** characters; tail replaced with `…` if longer.
 
 ### `External_Job_ID__c`
@@ -255,6 +258,7 @@ Optional merge: **`PROXI_SF_ACCOUNT_CREATE_EXTRA_JSON`**.
 - **Address:** Do you strip trailing **empty commas** and fix ALL CAPS the same way?
 - **Picklists:** Do your manual values match **API values** or **labels**? Automation coerces — mismatched org values surface as “first active” fallback (watch stderr/logs).
 - **Worksite:** Do you only set **Worksite Location 1** when you have a real **Account Id**?
+- **Job Name brand:** Does Kimedics **Posting org** (`posting_org`) match how you choose **Heartland Dental** vs **Midwest Dental** vs **Aspen** in the middle segment of the Job **Name**?
 - **Role/source backfill:** On **updates**, do you avoid overwriting recruiter-filled **Position / Specialty / Occupation / Job Source** when SF already has a value? Automation skips those unless blank.
 
 ---

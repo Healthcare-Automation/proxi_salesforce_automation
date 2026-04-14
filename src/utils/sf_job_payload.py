@@ -29,6 +29,7 @@ from utils.job_description_proxi_template import (
 )
 from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE, extract_pay_range_from_description
 from utils.address_display_format import format_us_address_line_for_display
+from utils.job_content_parser import _parse_city_state
 from utils.sf_push_defaults import SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID
 from utils.us_state_expand import state_abbrev_for_job_title, state_name_for_salesforce
 
@@ -263,23 +264,67 @@ def coerce_picklists_to_valid(describe: dict, fields_map: dict) -> None:
         fields_map[fname] = fallback
 
 
+def job_name_brand_display_for_row(row: dict) -> str:
+    """
+    Middle segment of Job ``Name`` (DSO / posting org) for manual parity.
+
+    Kimedics ``posting_org`` drives Heartland vs Midwest vs Aspen; unknown non-empty values
+    are passed through trimmed; blank falls back to the primary Aspen account display name.
+    """
+    po = (row.get("posting_org") or "").strip().lower()
+    if "heartland" in po:
+        return "Heartland Dental"
+    if "midwest" in po:
+        return "Midwest Dental"
+    if "aspen" in po:
+        return SF_JOB_PRIMARY_ACCOUNT_DISPLAY_NAME
+    raw = (row.get("posting_org") or "").strip()
+    return raw if raw else SF_JOB_PRIMARY_ACCOUNT_DISPLAY_NAME
+
+
+def _city_for_job_name(row: dict) -> str:
+    """Prefer ``city``; else parse ``practice_value`` / ``location_line`` so we do not emit ``()``."""
+    c = (row.get("city") or "").strip()
+    if c:
+        return c
+    city2, _st2 = _parse_city_state(row.get("practice_value") or "")
+    if city2:
+        return city2.strip()
+    loc = (row.get("location_line") or "").strip()
+    if loc and "," in loc:
+        left = loc.rsplit(",", 1)[0].strip()
+        left = re.sub(r"\s*\([^)]*\)\s*$", "", left).strip()
+        if left:
+            return left
+    return ""
+
+
 def build_salesforce_job_name(row: dict) -> Optional[str]:
     """
-    Job record header pattern::
+    Job record header pattern (examples)::
 
-        NY (Dunkirk) General Dentistry - Aspen Dental Management Inc. - Open
+        OH (Shelby) General Dentistry - Midwest Dental - Closed
+        SC (Summerville) General Dentistry - Heartland Dental - Open
 
-    Uses the same specialty default as ``Specialty_DJC__c`` and mapped status labels.
+    Brand segment comes from :func:`job_name_brand_display_for_row` (``posting_org``).
+    When city is missing everywhere, parentheses are omitted (no ``()``).
     """
     abbr = state_abbrev_for_job_title(row.get("state"))
-    city = (row.get("city") or "").strip()
+    city = _city_for_job_name(row)
     specialty = str(
         SF_PUSH_STATIC_DEFAULTS.get("Job_Specialty__c")
         or SF_PUSH_STATIC_DEFAULTS.get("Specialty_DJC__c")
         or "General Dentistry"
     ).strip()
     st = job_status_for_salesforce_push(row.get("status")) or "Open"
-    name = f"{abbr} ({city}) {specialty} - {SF_JOB_PRIMARY_ACCOUNT_DISPLAY_NAME} - {st}"
+    brand = job_name_brand_display_for_row(row)
+    if city:
+        loc = f"{abbr} ({city})".strip() if abbr else f"({city})"
+        name = f"{loc} {specialty} - {brand} - {st}".strip()
+    else:
+        loc = abbr.strip() if abbr else ""
+        name = f"{loc} {specialty} - {brand} - {st}".strip() if loc else f"{specialty} - {brand} - {st}"
+    name = re.sub(r"\s+", " ", name).strip()
     if len(name) > SF_JOB_NAME_MAX_LEN:
         name = name[: SF_JOB_NAME_MAX_LEN - 1].rstrip() + "…"
     return name
