@@ -2,6 +2,8 @@
 
 This document is the source of truth for how **Supabase `job_current`** (and the same keys from the Kimedics parser) map to **Salesforce `Job__c`** on **create** and **update**.
 
+**Field-by-field logic** (for manual Kimedics ↔ Salesforce parity review): [`salesforce_field_logic_manual_parity.md`](./salesforce_field_logic_manual_parity.md).
+
 Implementation lives in:
 
 - `src/utils/sf_job_payload.py` — field dict, picklist coercion, push-time defaults
