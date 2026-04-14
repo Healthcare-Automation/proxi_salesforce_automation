@@ -270,6 +270,21 @@ def test_address_line_city_state_only_when_no_address_label():
     assert (out.get("address_line") or "").strip() == "Austin, TX"
 
 
+def test_practice_value_city_only_numeric_prefix_sets_city():
+    """``CODE - City`` without comma (common on Client Job Id line) must populate city."""
+    body = (
+        "Title #19613\n"
+        "Loc, ST\n"
+        "Practice\n"
+        "4190 - Gloucester\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "State: VA\n"
+    )
+    out = parse_job_content_txt(body)
+    assert "gloucester" in (out.get("city") or "").lower()
+
+
 def test_parse_city_state_from_location_line():
     body = (
         "Title #1\n"

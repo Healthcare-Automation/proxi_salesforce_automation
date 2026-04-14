@@ -103,17 +103,26 @@ LABEL_TO_COLUMN = {
 def _parse_city_state(text: str) -> tuple[str, str]:
     """
     Best-effort city/state from a Kimedics line like '6313 - Cheektowaga, NY' or 'Baxter, MN'.
+
+    For lines with a **numeric office prefix** (``4190 - Gloucester``), the part after the dash may
+    be city-only (no comma); state then comes from elsewhere (e.g. Description ``State:``). Plain
+    single tokens without that prefix (practice names like ``Acme``) are not treated as cities so
+    ``Location: …`` can still supply city/state.
     """
     s = (text or "").strip()
     if not s:
         return "", ""
+    had_numeric_prefix = False
     m = re.match(r"^\d+\s*-\s*(.+)$", s)
     if m:
+        had_numeric_prefix = True
         s = m.group(1).strip()
     s = re.sub(r"^location\s*:\s*", "", s, flags=re.IGNORECASE).strip()
     if "," in s:
         left, right = s.rsplit(",", 1)
         return left.strip(), right.strip()
+    if had_numeric_prefix and s:
+        return s, ""
     return "", ""
 
 

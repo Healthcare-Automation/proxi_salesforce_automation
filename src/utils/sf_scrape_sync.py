@@ -21,6 +21,7 @@ from utils.sf_job_payload import (
     SF_PUSH_JOB_ROLE_DEFAULTS,
     _canonical_description_use_html,
     _truncate_external_job_id,
+    build_salesforce_job_name,
     coerce_picklists_to_valid,
     external_job_link_from_job_row,
     merge_job_role_defaults_for_empty_sf_fields,
@@ -272,6 +273,14 @@ def sync_missing_scrape_fields_to_salesforce(
     current = _get_job_fields(instance_url, access_token, sf_job_id, field_names)
     merge_job_role_defaults_for_empty_sf_fields(desired, current)
     coerce_picklists_to_valid(describe, desired)
+    # Name must use the same city/state as Job__c when the scrape row is sparse (e.g. ``4190 - Gloucester``).
+    desired["Name"] = build_salesforce_job_name(
+        job_row,
+        job_name_location_fallback={
+            "Job_City__c": current.get("Job_City__c"),
+            "Job_State__c": current.get("Job_State__c"),
+        },
+    )
 
     patch: dict[str, Any] = {}
     for fname, want in desired.items():

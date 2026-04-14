@@ -5,6 +5,7 @@ from utils.sf_job_payload import (
     KIMEDICS_PORTAL_JOB_POST_URL_PREFIX,
     _canonical_description_use_html,
     _truncate_external_job_link,
+    build_salesforce_job_name,
     external_job_id_match_key,
     external_job_link_from_job_row,
     job_row_to_salesforce_fields,
@@ -231,3 +232,49 @@ def test_external_job_link_non_numeric_falls_back_to_view_job_link():
     got = external_job_link_from_job_row(row)
     assert got is not None
     assert len(got) == EXTERNAL_JOB_LINK_MAX_LEN
+
+
+def test_build_salesforce_job_name_uses_sf_location_fallback():
+    """When Supabase row has no city/state, merge Job_City__c / Job_State__c from Salesforce GET."""
+    row = {
+        "city": "",
+        "state": "",
+        "status": "open",
+        "posting_org": "Shiftwise - Aspen Dental - AMN",
+    }
+    fb = {"Job_City__c": "Gloucester", "Job_State__c": "Virginia"}
+    got = build_salesforce_job_name(row, job_name_location_fallback=fb)
+    assert got == (
+        "VA (Gloucester) General Dentistry - Aspen Dental Management Inc. - Open"
+    )
+
+
+def test_build_salesforce_job_name_practice_line_city_only_numeric_prefix():
+    """Kimedics ``4190 - Gloucester`` (no comma) still yields a city for the Job Name."""
+    row = {
+        "practice_value": "4190 - Gloucester",
+        "city": "",
+        "state": "VA",
+        "status": "open",
+        "posting_org": "Shiftwise - Aspen Dental - AMN",
+    }
+    got = build_salesforce_job_name(row)
+    assert got == (
+        "VA (Gloucester) General Dentistry - Aspen Dental Management Inc. - Open"
+    )
+
+
+def test_build_salesforce_job_name_strips_bare_empty_parens_prefix():
+    row = {
+        "city": "",
+        "state": "",
+        "status": "open",
+        "posting_org": "Aspen",
+    }
+    # Malformed fallback: empty strings should not yield "() ..." after merge.
+    got = build_salesforce_job_name(
+        row,
+        job_name_location_fallback={"Job_City__c": "", "Job_State__c": " "},
+    )
+    assert got == "General Dentistry - Aspen Dental Management Inc. - Open"
+    assert not got.startswith("()")

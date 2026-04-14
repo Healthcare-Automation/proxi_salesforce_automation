@@ -48,6 +48,7 @@ load_dotenv(_env_path)
 from utils.salesforce import SalesforceLoginError, get_token_auto
 from utils.sf_job_payload import (
     SF_PUSH_JOB_ROLE_DEFAULTS,
+    build_salesforce_job_name,
     coerce_picklists_to_valid,
     merge_job_role_defaults_for_empty_sf_fields,
     prepare_payload_for_write,
@@ -156,15 +157,23 @@ def main() -> None:
 
     sf_id = args.sf_id.strip()
     role_field_list = ",".join(SF_PUSH_JOB_ROLE_DEFAULTS.keys())
+    name_ctx_fields = "Job_City__c,Job_State__c"
     cur = rest_json(
         instance_url,
         access_token,
         "GET",
-        f"sobjects/{job_object}/{sf_id}?fields={role_field_list}",
+        f"sobjects/{job_object}/{sf_id}?fields={role_field_list},{name_ctx_fields}",
         api_version=DEFAULT_REST_VERSION,
     )
     if isinstance(cur, dict):
         merge_job_role_defaults_for_empty_sf_fields(body, cur)
+        body["Name"] = build_salesforce_job_name(
+            row,
+            job_name_location_fallback={
+                "Job_City__c": cur.get("Job_City__c"),
+                "Job_State__c": cur.get("Job_State__c"),
+            },
+        )
         coerce_picklists_to_valid(describe, body)
 
     print(json.dumps(body, indent=2, default=str))

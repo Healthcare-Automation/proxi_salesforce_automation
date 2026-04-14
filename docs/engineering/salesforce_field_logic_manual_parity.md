@@ -2,7 +2,7 @@
 
 Audience: anyone comparing **manual** Kimedics-to-Salesforce work with **automation** so day-to-day decisions stay aligned.
 
-Companion: high-level pipeline and env rules live in [`salesforce_job_push_rules.md`](./salesforce_job_push_rules.md). This document is **field-centric**: what goes to each API field, from what source, and what transforms/guards apply.
+Companion: high-level pipeline and env rules live in `[salesforce_job_push_rules.md](./salesforce_job_push_rules.md)`. This document is **field-centric**: what goes to each API field, from what source, and what transforms/guards apply.
 
 ---
 
@@ -12,7 +12,7 @@ Companion: high-level pipeline and env rules live in [`salesforce_job_push_rules
 - **Core mapper:** `utils/sf_job_payload.job_row_to_salesforce_fields` → dict of API names → values.
 - **Static defaults:** merged from `SF_PUSH_STATIC_DEFAULTS` (Locums, General Dentistry, Dentist, job source, legacy DJC mirrors, worksite parent, patient ages, volume default).
 - **Before API write:** `prepare_payload_for_write`:
-  - Runs **`coerce_picklists_to_valid`** (describe: match API value, else label, else **first active** value — **verify org picklists** if a value looks wrong).
+  - Runs `**coerce_picklists_to_valid`** (describe: match API value, else label, else **first active** value — **verify org picklists** if a value looks wrong).
   - Drops keys the org does not allow (**createable** vs **updateable** from describe). If a field never appears in Salesforce, check FLS/metadata — not “automation skipped it” silently if describe filters it out.
 - **PATCH (scrape sync / lever scripts):**
   - Payload is built **for update**; fields in `SF_PUSH_JOB_ROLE_DEFAULTS` (**role picklists + `Job_Job_Source__c`**) are **removed** from the row-based dict, then **re-filled only where Salesforce GET shows blank** (`merge_job_role_defaults_for_empty_sf_fields`). That avoids overwriting recruiter-edited SF values.
@@ -22,19 +22,19 @@ Companion: high-level pipeline and env rules live in [`salesforce_job_push_rules
 
 ## Environment gates (when writes happen)
 
-- **`PROXI_SF_UPDATE_JOBS`:** when false/`0`/`no`/`off`, automation skips Salesforce **POST/PATCH** from the scrape pipeline (including field-sync reads used for compare, in that path). Default when unset: **on**.
-- **`PROXI_SF_CREATE_JOBS`:** allows **auto-create Job__c** when resolver finds **no** safe 1:1 match (see resolver doc). Still respects write kill switch above where coded.
-- **`PROXI_SF_CREATE_WORKSITES`:** allows **POST worksite Account** + map upsert when policy says to create a new location Account.
-- **`PROXI_SF_TEST_MODE`:** adds **`test_status__c`** (raw Kimedics `status` string) and **`test_posted_date__c`** (normalized date) to scrape-sync **desired** payload only — org must have those fields.
+- `**PROXI_SF_UPDATE_JOBS`:** when false/`0`/`no`/`off`, automation skips Salesforce **POST/PATCH** from the scrape pipeline (including field-sync reads used for compare, in that path). Default when unset: **on**.
+- `**PROXI_SF_CREATE_JOBS`:** allows **auto-create Job__c** when resolver finds **no** safe 1:1 match (see resolver doc). Still respects write kill switch above where coded.
+- `**PROXI_SF_CREATE_WORKSITES`:** allows **POST worksite Account** + map upsert when policy says to create a new location Account.
+- `**PROXI_SF_TEST_MODE`:** adds `**test_status__c`** (raw Kimedics `status` string) and `**test_posted_date__c**` (normalized date) to scrape-sync **desired** payload only — org must have those fields.
 
 ---
 
 ## Cross-cutting rules (all fields)
 
-- **Picklists:** Automation never sends arbitrary strings into restricted picklists without passing **`coerce_picklists_to_valid`**. Wrong-looking values usually mean **no exact API value / label match** — check Setup picklist entries.
-- **Empty vs omit:** Many fields become **`null`/omitted** when source is blank after trim; PATCH only includes **non-empty** desired values that **differ** from SF.
+- **Picklists:** Automation never sends arbitrary strings into restricted picklists without passing `**coerce_picklists_to_valid`**. Wrong-looking values usually mean **no exact API value / label match** — check Setup picklist entries.
+- **Empty vs omit:** Many fields become `**null`/omitted** when source is blank after trim; PATCH only includes **non-empty** desired values that **differ** from SF.
 - **Truncation:** `External_Job_ID__c` truncated to **20** chars; `External_Job_Link__c` truncated to **255** when using fallback `view_job_link`.
-- **Primary Account:** `Job_Account__c` defaults to **`0015f00000HH63kAAD`** (Aspen Dental Management Inc.) unless row has `sf_primary_account_id` / override.
+- **Primary Account:** `Job_Account__c` defaults to `**0015f00000HH63kAAD`** (Aspen Dental Management Inc.) unless row has `sf_primary_account_id` / override.
 - **Worksite lookup:** `Job_Worksite_Location_1__c` is set **only** when `sf_worksite_account_id` (or caller override) is known — **no placeholder Id**.
 
 ---
@@ -47,23 +47,23 @@ Below, **“Supabase column”** is the human/process input from Kimedics scrape
 
 - **Intent:** Record title / header line in Salesforce (manual parity with recruiter naming).
 - **Pattern:** `{StateAbbr} ({City}) {Specialty} - {Brand} - {Open|Closed}`  
-  Examples: `OH (Shelby) General Dentistry - Midwest Dental - Closed`, `SC (Summerville) General Dentistry - Heartland Dental - Open`.
+Examples: `OH (Shelby) General Dentistry - Midwest Dental - Closed`, `SC (Summerville) General Dentistry - Heartland Dental - Open`.
 - **Brand (`posting_org`):** `job_name_brand_display_for_row` — substring match on trimmed lowercased **posting_org**: **Heartland** → `Heartland Dental`; **Midwest** → `Midwest Dental`; **Aspen** → `Aspen Dental Management Inc.`; other non-empty values pass through as-is; empty → **Aspen Dental Management Inc.**
-- **City:** Primary `city` column; if blank, city from **`practice_value`** via `_parse_city_state` (e.g. `1234 - Summerville, SC`); if still blank, first segment of **`location_line`** before the last comma (parenthetical suffix stripped). **If no city is found, the `(City)` parentheses are omitted** so you never get `() General Dentistry - …`.
+- **City:** Primary `city` column; if blank, city from `**practice_value`** via `_parse_city_state` (e.g. `1234 - Summerville, SC`); if still blank, first segment of `**location_line**` before the last comma (parenthetical suffix stripped). **If no city is found, the `(City)` parentheses are omitted** so you never get `() General Dentistry - …`.
 - **Specialty:** static default **General Dentistry** (same as `Job_Specialty__c` / `Specialty_DJC__c` defaults).
-- **Status:** **`job_status_for_salesforce_push`** → **Open** or **Closed** only.
+- **Status:** `**job_status_for_salesforce_push`** → **Open** or **Closed** only.
 - **Length:** Hard cap **80** characters; tail replaced with `…` if longer.
 
 ### `External_Job_ID__c`
 
 - **Source:** Kimedics `job_id` (string).
-- **Logic:** Strip; truncate to **`EXTERNAL_JOB_ID_MAX_LEN` (20)**.
+- **Logic:** Strip; truncate to `**EXTERNAL_JOB_ID_MAX_LEN` (20)**.
 - **Use:** Matching / dedupe key against Kimedics in resolver logic (truncated key comparison).
 
 ### `External_Job_Link__c`
 
 - **Primary:** If `job_id` is **all digits**, canonical URL  
-  `https://portal.kimedics.com/app/workspace/job-posts/{job_id}` (avoids long email tracker links).
+`https://portal.kimedics.com/app/workspace/job-posts/{job_id}` (avoids long email tracker links).
 - **Fallback:** `view_job_link` when `job_id` missing or non-numeric (e.g. tests); **truncate 255**.
 
 ### `Job_Client_Job_Id__c`
@@ -78,7 +78,7 @@ Below, **“Supabase column”** is the human/process input from Kimedics scrape
 
 ### `Job_Account__c`
 
-- **Value:** Primary Account Id — default **`0015f00000HH63kAAD`**, or row `sf_primary_account_id` / function arg override.
+- **Value:** Primary Account Id — default `**0015f00000HH63kAAD`**, or row `sf_primary_account_id` / function arg override.
 
 ### `Job_Worksite_Location_1__c`
 
@@ -91,7 +91,7 @@ Below, **“Supabase column”** is the human/process input from Kimedics scrape
 
 - **Source:** Supabase `address_line` (parser composes from `Address:` + `City:` + `State:` lines when needed).
 - **Push-time:** `format_us_address_line_for_display`: whitespace collapse; **Unicode comma → ASCII**; drop **empty comma segments**; strip trailing comma junk; optional **ALL CAPS → title-style** (street types, directionals, `PO Box`, 2-letter states).
-- **Same string** feeds new worksite Account **`ShippingStreet`** when creating Account (`sf_worksite_create`).
+- **Same string** feeds new worksite Account `**ShippingStreet`** when creating Account (`sf_worksite_create`).
 - **Org caveat:** If field is **not updateable** in Salesforce, PATCH may never fix bad legacy values — FLS/layout must allow automation to write.
 
 ### `Job_Status__c`
@@ -119,14 +119,14 @@ Below, **“Supabase column”** is the human/process input from Kimedics scrape
 ### `Job_Dates_Needed__c`
 
 - **Primary:** `effective_dates_needed(row)`:
-  - If **`description_full_text`** contains **`Active needs are `** (case-insensitive) on **any line**, use text **after that phrase on the same line** (first match). Overrides structured `dates_needed`.
+  - If `**description_full_text`** contains `**Active needs are**`  (case-insensitive) on **any line**, use text **after that phrase on the same line** (first match). Overrides structured `dates_needed`.
   - Else use `dates_needed`.
 - **Parser:** `_fill_from_description_blocks` also writes `dates_needed` from that clause when present (so DB stays consistent on scrape).
 - **Canonical job posting** uses the same effective string for the **Dates:** line in the template.
 
 ### `Job_Standard_Schedule__c` / `Standard_Schedule_Hours__c`
 
-- **Source:** Same Supabase column **`standard_schedule`** (trimmed) copied to **both** API fields (org uses one for “schedule” and one for “hours”-style field).
+- **Source:** Same Supabase column `**standard_schedule`** (trimmed) copied to **both** API fields (org uses one for “schedule” and one for “hours”-style field).
 
 ### `Job_Provider_Start_Date__c` / `Job_Provider_End_Date__c`
 
@@ -151,8 +151,8 @@ Below, **“Supabase column”** is the human/process input from Kimedics scrape
 
 ### `Salary_Pay_Range__c`
 
-- **Source:** First pay-range match from **`description_full_text`** via `extract_pay_range_from_description` (dollar patterns / “starting at” patterns).
-- **Default:** **`Starting at $125/hour`** if no match (`DEFAULT_SALARY_PAY_RANGE`).
+- **Source:** First pay-range match from `**description_full_text`** via `extract_pay_range_from_description` (dollar patterns / “starting at” patterns).
+- **Default:** `**Starting at $125/hour`** if no match (`DEFAULT_SALARY_PAY_RANGE`).
 - **Note:** Dashes normalized to en-dash in extracted fragment.
 
 ### `Job_Client_Job_Description__c`
@@ -167,17 +167,17 @@ Below, **“Supabase column”** is the human/process input from Kimedics scrape
 
 ### `Job_Ranking__c`
 
-- **Source:** `job_ranking`; default **`B`** if missing/blank.
+- **Source:** `job_ranking`; default `**B`** if missing/blank.
 
 ### `Job_Volume__c`
 
 - **Default (static):** **Not Provided** from `SF_PUSH_STATIC_DEFAULTS`.
-- **Override:** If `avg_patients_per_day` non-empty after trim, **`Job_Volume__c`** set to that value (Kimedics “avg patients per day”).
+- **Override:** If `avg_patients_per_day` non-empty after trim, `**Job_Volume__c`** set to that value (Kimedics “avg patients per day”).
 
 ### `roster_only__c`
 
-- **Source:** Supabase `roster_only` string **`"true"`** / **`"false"`** (parser sets from full post text “roster only” phrase).
-- **Push:** JSON boolean **`true`/`false`** (`roster_only_string_from_row` returns strings `"true"`/`"false"` for checkbox-style fields — confirm org field type matches).
+- **Source:** Supabase `roster_only` string `**"true"`** / `**"false"**` (parser sets from full post text “roster only” phrase).
+- **Push:** JSON boolean `**true`/`false`** (`roster_only_string_from_row` returns strings `"true"`/`"false"` for checkbox-style fields — confirm org field type matches).
 
 ### `Job_Position_Type__c` / `Job_Specialty__c` / `Occupation_DJC__c`
 
@@ -210,7 +210,7 @@ Below, **“Supabase column”** is the human/process input from Kimedics scrape
 
 ### `test_status__c`
 
-- **Value:** Raw trimmed Kimedics **`status`** string (not mapped to Open/Closed) — for debugging / QA fields only.
+- **Value:** Raw trimmed Kimedics `**status`** string (not mapped to Open/Closed) — for debugging / QA fields only.
 
 ### `test_posted_date__c`
 
@@ -222,30 +222,32 @@ Below, **“Supabase column”** is the human/process input from Kimedics scrape
 
 When automation **creates** a worksite **Account** (`PROXI_SF_CREATE_WORKSITES=true`, write gate on):
 
-| API field        | Logic |
-| ---------------- | ----- |
-| `Name`           | `Aspen Dental - {City}, {ST}` (2-letter state) |
-| `ShippingStreet` | Same formatting as `Job_Worksite_1_Address__c` from `address_line` |
-| `ParentId`       | Aspen Dental Management Inc. Id |
+
+| API field        | Logic                                                                                       |
+| ---------------- | ------------------------------------------------------------------------------------------- |
+| `Name`           | `Aspen Dental - {City}, {ST}` (2-letter state)                                              |
+| `ShippingStreet` | Same formatting as `Job_Worksite_1_Address__c` from `address_line`                          |
+| `ParentId`       | Aspen Dental Management Inc. Id                                                             |
 | `RecordTypeId`   | `PROXI_SF_ACCOUNT_WORKSITE_RECORD_TYPE_ID` **or** Account describe **Worksite** record type |
 
-Optional merge: **`PROXI_SF_ACCOUNT_CREATE_EXTRA_JSON`**.
+
+Optional merge: `**PROXI_SF_ACCOUNT_CREATE_EXTRA_JSON`**.
 
 ---
 
 ## Supabase / parser — where structured columns come from (for manual parity)
 
 - **Labeled lines** in `description_full_text` (`Address:`, `City:`, `State:`, `Dates:`, `Hours:`, etc.) populate columns; **sections** fill gaps when labels missing.
-- **`address_line`:** Composed from street + city + state when partial; then **`format_us_address_line_for_display`** on parse exit.
-- **`dates_needed`:** Overridden in `_fill_from_description_blocks` when **`Active needs are `** clause exists (wins over `Dates:` line).
-- **`types_of_cases`:** Often combined from required procedures + additional requirements (`job_content_ai.combined_types_of_cases` may run in pipeline).
+- `**address_line`:** Composed from street + city + state when partial; then `**format_us_address_line_for_display`** on parse exit.
+- `**dates_needed`:** Overridden in `_fill_from_description_blocks` when `**Active needs are`**  clause exists (wins over `Dates:` line).
+- `**types_of_cases`:** Often combined from required procedures + additional requirements (`job_content_ai.combined_types_of_cases` may run in pipeline).
 - **AI validate/fix:** Optional stages in `job_content_ai` may adjust fields — automation still applies **push-time** rules above on whatever lands in `job_current`.
 
 ---
 
 ## Fields automation does **not** map (today)
 
-- **`priority`** → stored in Supabase; **`Job_Recruitment_Level__c`** is **not** in `CANONICAL_JOB_C_PUSH_FIELD_NAMES` (not sent).
+- `**priority`** → stored in Supabase; `**Job_Recruitment_Level__c**` is **not** in `CANONICAL_JOB_C_PUSH_FIELD_NAMES` (not sent).
 - Any Job__c API name **not** in the canonical set will never be emitted by `job_row_to_salesforce_fields` until code + doc are updated together.
 
 ---
@@ -265,16 +267,19 @@ Optional merge: **`PROXI_SF_ACCOUNT_CREATE_EXTRA_JSON`**.
 
 ## Implementation index
 
-| Concern | Module |
-| -------- | ------ |
-| Field dict, Name, status, links, defaults, `prepare_payload_for_write` | `src/utils/sf_job_payload.py` |
-| Canonical description + dates override + presentation strip | `src/utils/job_description_proxi_template.py` |
-| Address normalization | `src/utils/address_display_format.py` |
-| Pay extraction | `src/utils/sf_pay_range.py` |
-| State expand | `src/utils/us_state_expand.py` |
-| Insight dedupe | `src/utils/insight_sanitize.py` |
-| Scrape PATCH, GET-merge for roles, test fields | `src/utils/sf_scrape_sync.py` |
-| Describe filter / PATCH body | `src/utils/sf_partial_update.py`, `src/utils/sf_job_rest_minimal.py` |
-| Parser / `address_line` / active needs in DB | `src/utils/job_content_parser.py` |
-| Worksite Account POST | `src/utils/sf_worksite_create.py` |
-| Resolver / auto-create | `src/utils/sf_job_supabase_resolve.py` |
+
+| Concern                                                                | Module                                                               |
+| ---------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Field dict, Name, status, links, defaults, `prepare_payload_for_write` | `src/utils/sf_job_payload.py`                                        |
+| Canonical description + dates override + presentation strip            | `src/utils/job_description_proxi_template.py`                        |
+| Address normalization                                                  | `src/utils/address_display_format.py`                                |
+| Pay extraction                                                         | `src/utils/sf_pay_range.py`                                          |
+| State expand                                                           | `src/utils/us_state_expand.py`                                       |
+| Insight dedupe                                                         | `src/utils/insight_sanitize.py`                                      |
+| Scrape PATCH, GET-merge for roles, test fields                         | `src/utils/sf_scrape_sync.py`                                        |
+| Describe filter / PATCH body                                           | `src/utils/sf_partial_update.py`, `src/utils/sf_job_rest_minimal.py` |
+| Parser / `address_line` / active needs in DB                           | `src/utils/job_content_parser.py`                                    |
+| Worksite Account POST                                                  | `src/utils/sf_worksite_create.py`                                    |
+| Resolver / auto-create                                                 | `src/utils/sf_job_supabase_resolve.py`                               |
+
+

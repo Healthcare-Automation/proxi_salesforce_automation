@@ -282,6 +282,25 @@ def job_name_brand_display_for_row(row: dict) -> str:
     return raw if raw else SF_JOB_PRIMARY_ACCOUNT_DISPLAY_NAME
 
 
+def _row_with_job_name_location_fallback(
+    row: dict,
+    job_name_location_fallback: Optional[dict[str, Any]],
+) -> dict:
+    """Fill missing ``city`` / ``state`` on a copy from Salesforce GET (PATCH path)."""
+    if not job_name_location_fallback:
+        return row
+    out = dict(row)
+    if not (out.get("city") or "").strip():
+        v = job_name_location_fallback.get("Job_City__c")
+        if v is not None and str(v).strip():
+            out["city"] = str(v).strip()
+    if not (out.get("state") or "").strip():
+        v = job_name_location_fallback.get("Job_State__c")
+        if v is not None and str(v).strip():
+            out["state"] = str(v).strip()
+    return out
+
+
 def _city_for_job_name(row: dict) -> str:
     """Prefer ``city``; else parse ``practice_value`` / ``location_line`` so we do not emit ``()``."""
     c = (row.get("city") or "").strip()
@@ -299,7 +318,11 @@ def _city_for_job_name(row: dict) -> str:
     return ""
 
 
-def build_salesforce_job_name(row: dict) -> Optional[str]:
+def build_salesforce_job_name(
+    row: dict,
+    *,
+    job_name_location_fallback: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
     """
     Job record header pattern (examples)::
 
@@ -308,22 +331,31 @@ def build_salesforce_job_name(row: dict) -> Optional[str]:
 
     Brand segment comes from :func:`job_name_brand_display_for_row` (``posting_org``).
     When city is missing everywhere, parentheses are omitted (no ``()``).
+
+    ``job_name_location_fallback``: optional ``Job_City__c`` / ``Job_State__c`` from a Salesforce
+    GET when the Supabase row has blank location (common for Elite/sync rows); keeps ``Name`` aligned
+    with populated ``Job_City__c`` / ``Job_State__c``.
     """
-    abbr = state_abbrev_for_job_title(row.get("state"))
-    city = _city_for_job_name(row)
+    r = _row_with_job_name_location_fallback(row, job_name_location_fallback)
+    abbr = state_abbrev_for_job_title(r.get("state"))
+    city = _city_for_job_name(r)
     specialty = str(
         SF_PUSH_STATIC_DEFAULTS.get("Job_Specialty__c")
         or SF_PUSH_STATIC_DEFAULTS.get("Specialty_DJC__c")
         or "General Dentistry"
     ).strip()
-    st = job_status_for_salesforce_push(row.get("status")) or "Open"
-    brand = job_name_brand_display_for_row(row)
+    st = job_status_for_salesforce_push(r.get("status")) or "Open"
+    brand = job_name_brand_display_for_row(r)
     if city:
         loc = f"{abbr} ({city})".strip() if abbr else f"({city})"
         name = f"{loc} {specialty} - {brand} - {st}".strip()
     else:
         loc = abbr.strip() if abbr else ""
         name = f"{loc} {specialty} - {brand} - {st}".strip() if loc else f"{specialty} - {brand} - {st}"
+    name = re.sub(r"\s+", " ", name).strip()
+    # Defensive: never leave a bare "() " from bad inputs / legacy rows.
+    if name.startswith("()"):
+        name = name[2:].strip()
     name = re.sub(r"\s+", " ", name).strip()
     if len(name) > SF_JOB_NAME_MAX_LEN:
         name = name[: SF_JOB_NAME_MAX_LEN - 1].rstrip() + "…"
@@ -337,6 +369,7 @@ def job_row_to_salesforce_fields(
     primary_account_id: Optional[str] = None,
     worksite_account_id: Optional[str] = None,
     description_use_html: Optional[bool] = None,
+    job_name_location_fallback: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """
     Build a Job__c field dict from one job row (``job_current`` shape).
@@ -377,7 +410,7 @@ def job_row_to_salesforce_fields(
     if addr == "":
         addr = None
     out: dict[str, Any] = {
-        "Name": build_salesforce_job_name(r),
+        "Name": build_salesforce_job_name(r, job_name_location_fallback=job_name_location_fallback),
         "External_Job_ID__c": _truncate_external_job_id(r.get("job_id")),
         "Job_Account__c": pid,
         "Job_Worksite_Location_1__c": wid if wid else None,
@@ -426,6 +459,7 @@ def prepare_payload_for_write(
     primary_account_id: Optional[str] = None,
     worksite_account_id: Optional[str] = None,
     description_use_html: Optional[bool] = None,
+    job_name_location_fallback: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """
     Full row → Salesforce fields → picklist coercion → createable/updateable filter.
@@ -438,6 +472,7 @@ def prepare_payload_for_write(
         primary_account_id=primary_account_id,
         worksite_account_id=worksite_account_id,
         description_use_html=description_use_html,
+        job_name_location_fallback=job_name_location_fallback,
     )
     if for_update:
         for k in SF_PUSH_JOB_ROLE_DEFAULTS:
