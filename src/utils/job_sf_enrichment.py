@@ -25,12 +25,15 @@ def enrich_cleaned_row_salesforce_fields(
     *,
     schema: str = "public",
     cache: Optional[dict[str, Any]] = None,
+    run_id: Optional[int] = None,
 ) -> None:
     """
     Mutates ``cleaned`` in place: sets sf_primary_account_id, sf_worksite_account_id,
     sf_worksite_display_label when missing and lookups succeed.
 
     ``cache`` is optional; reused across rows in one batch (keys: primary_id, worksite_default).
+    ``run_id``: when set, ``worksite_created`` / ``worksite_create_failed`` events use this
+    ``scrape_runs.id`` (pipeline link_batch). Omit for ad-hoc reads (e.g. manual SF push helpers).
     """
     if conn is None or not cleaned:
         return
@@ -82,7 +85,7 @@ def enrich_cleaned_row_salesforce_fields(
                     access_token=at,
                     address_line=(cleaned.get("address_line") or "").strip() or None,
                     schema=schema,
-                    run_id=None,
+                    run_id=run_id,
                     job_id_for_log=jid_log,
                     skip_location_lookup=True,
                 )

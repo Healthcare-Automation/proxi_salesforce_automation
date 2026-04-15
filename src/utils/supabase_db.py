@@ -1708,7 +1708,9 @@ def log_job_content(
     try:
         from utils.job_sf_enrichment import enrich_cleaned_row_salesforce_fields
 
-        enrich_cleaned_row_salesforce_fields(conn, cleaned, schema=schema, cache=sf_lookup_cache)
+        enrich_cleaned_row_salesforce_fields(
+            conn, cleaned, schema=schema, cache=sf_lookup_cache, run_id=run_id
+        )
     except Exception:
         pass
     if email_scrape_id is None and job_post_id:

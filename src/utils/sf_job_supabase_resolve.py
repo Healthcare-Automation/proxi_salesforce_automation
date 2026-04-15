@@ -4,8 +4,10 @@ Fill missing ``sf_job_id`` / ``sf_worksite_account_id`` on Supabase after a Kime
 Order:
 1. Skip if ``job_current`` already has both ``sf_job_id`` and ``sf_worksite_account_id``.
 2. Merge from newest ``job_content`` with both ids (history carry-forward).
-3. **Practice** match: normalized ``practice_value`` ↔ ``Job_Client_Job_Id__c`` (1:1 only; N>1 → ambiguous, no update).
-4. **External Job ID** match: Kimedics ``job_id`` ↔ ``External_Job_ID__c`` (1:1 only; same truncation as push).
+3. **External Job ID** match: Kimedics ``job_id`` ↔ ``External_Job_ID__c`` (1:1 only; same truncation as push).
+   Primary when many jobs already carry ``External_Job_ID__c`` in Salesforce (avoids wrong practice / Client Job Id typos).
+4. **Practice** match: normalized ``practice_value`` ↔ ``Job_Client_Job_Id__c`` (1:1 only; N>1 → ambiguous, no update).
+   Used when external id is absent or unmatched in the pulled SF snapshot.
 5. **AI** fallback on practice string when practice key had 0 hits.
 6. **No match**: log ``mapping_no_match``; if ``PROXI_SF_CREATE_JOBS=true`` and ``PROXI_SF_UPDATE_JOBS``
    is not false, **POST** a new ``Job__c`` (needs a worksite Account Id from ``sf_worksite_location_map``
@@ -201,7 +203,7 @@ def _try_create_sf_job_after_no_match(
     try:
         from utils.job_sf_enrichment import enrich_cleaned_row_salesforce_fields
 
-        enrich_cleaned_row_salesforce_fields(conn, latest, schema=schema)
+        enrich_cleaned_row_salesforce_fields(conn, latest, schema=schema, run_id=run_id)
     except Exception:
         pass
 
@@ -458,49 +460,8 @@ def resolve_sf_ids_for_job_ids(
                     break
 
         p = practice_key(practice_raw)
-        hits: list[str] = []
-        match_source = ""
-        if p:
-            hits = sorted(sf_by_practice.get(p, set()))
-            match_source = "sf_practice_match"
 
-        if len(hits) == 1:
-            sfid = hits[0]
-            wid = (sf_by_id.get(sfid, {}).get("Job_Worksite_Location_1__c") or "").strip() or None
-            j_final = j or sfid
-            w_final = w or wid
-            update_sf_ids_for_job(
-                conn,
-                job_id=jid,
-                sf_job_id=j_final or None,
-                sf_worksite_account_id=w_final or None,
-                source=match_source,
-                mapping_status="resolved",
-                mapping_detail="1:1 practice match",
-                run_id=run_id,
-                schema=schema,
-            )
-            updated += 1
-            continue
-
-        if len(hits) > 1:
-            log_job_event(
-                conn,
-                job_id=jid,
-                event_type="mapping_ambiguous",
-                schema=schema,
-                run_id=run_id,
-                payload={
-                    "source": "sf_practice_match",
-                    "practice_key": p or None,
-                    "practice_raw": practice_raw[:500] if practice_raw else None,
-                    "hits": len(hits),
-                    "candidate_sf_job_ids": hits,
-                },
-            )
-            continue
-
-        # ── External Job ID (Kimedics job_id ↔ External_Job_ID__c), 1:1 only ──
+        # ── External Job ID first (Kimedics job_id ↔ External_Job_ID__c), 1:1 only ──
         ext_key = external_job_id_match_key(jid)
         ext_hits: list[str] = []
         if ext_key:
@@ -535,6 +496,47 @@ def resolve_sf_ids_for_job_ids(
                     "external_key": ext_key,
                     "hits": len(ext_hits),
                     "candidate_sf_job_ids": ext_hits,
+                },
+            )
+            continue
+
+        # ── Practice match (fallback when external id absent / no 1:1 in SF snapshot) ──
+        hits: list[str] = []
+        if p:
+            hits = sorted(sf_by_practice.get(p, set()))
+
+        if len(hits) == 1:
+            sfid = hits[0]
+            wid = (sf_by_id.get(sfid, {}).get("Job_Worksite_Location_1__c") or "").strip() or None
+            j_final = j or sfid
+            w_final = w or wid
+            update_sf_ids_for_job(
+                conn,
+                job_id=jid,
+                sf_job_id=j_final or None,
+                sf_worksite_account_id=w_final or None,
+                source="sf_practice_match",
+                mapping_status="resolved",
+                mapping_detail="1:1 practice match",
+                run_id=run_id,
+                schema=schema,
+            )
+            updated += 1
+            continue
+
+        if len(hits) > 1:
+            log_job_event(
+                conn,
+                job_id=jid,
+                event_type="mapping_ambiguous",
+                schema=schema,
+                run_id=run_id,
+                payload={
+                    "source": "sf_practice_match",
+                    "practice_key": p or None,
+                    "practice_raw": practice_raw[:500] if practice_raw else None,
+                    "hits": len(hits),
+                    "candidate_sf_job_ids": hits,
                 },
             )
             continue
@@ -596,6 +598,8 @@ def resolve_sf_ids_for_job_ids(
             schema=schema,
             run_id=run_id,
             payload={
+                "external_key": ext_key or None,
+                "external_hits": len(ext_hits) if ext_key else 0,
                 "practice_key": p or None,
                 "practice_raw": practice_raw[:500] if practice_raw else None,
                 "practice_hits": len(hits) if p else 0,
