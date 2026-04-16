@@ -212,6 +212,18 @@ def test_extract_pay_range_missing_uses_default_constant():
     assert "125" in DEFAULT_SALARY_PAY_RANGE
 
 
+def test_salary_pay_range_field_always_default_despite_kimedics_range_in_description():
+    row = {
+        "job_id": "1",
+        "city": "X",
+        "state": "TX",
+        "description_full_text": "Pay Range: $200 – $300 per hour\n",
+    }
+    out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    assert out.get("Salary_Pay_Range__c") == DEFAULT_SALARY_PAY_RANGE
+    assert "$200" not in (out.get("Salary_Pay_Range__c") or "")
+
+
 def test_external_job_id_match_key_case_insensitive():
     assert external_job_id_match_key("19448") == "19448"
     assert external_job_id_match_key("AbC") == "abc"

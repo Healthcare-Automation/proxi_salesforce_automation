@@ -159,7 +159,7 @@ Examples: `OH (Shelby) General Dentistry - Midwest Dental - Closed`, `SC (Summer
 
 - **Default (canonical):** `build_proxi_job_posting_description(row)` when `use_canonical_description=True`.
   - **HTML vs plain:** `PROXI_JOB_DESCRIPTION_HTML` default true → HTML for Rich Text fields; false → plain sections.
-  - **AI intro:** `PROXI_JOB_DESCRIPTION_USE_AI` default true → optional OpenAI intro; on failure falls back to static paragraphs (`OPENAI_API_KEY` required for AI).
+  - **AI intro:** `PROXI_JOB_DESCRIPTION_USE_AI` default true → optional OpenAI intro (single opening paragraph in HTML); on failure falls back to the static template (`OPENAI_API_KEY` required for AI).
   - **Aligned with structured fields:** city/state (full state in prose), **dates** = `effective_dates_needed`, **schedule** = `standard_schedule`, **pay** = same extraction as `Salary_Pay_Range__c`, **clinical scope** / **support** / **requirements** blocks from structured columns.
   - **Not included:** Kimedics top-line `M/D update: …` admin preamble is **not** pasted into candidate body (tooling can still parse it via `extract_kimedics_dates_update_preamble`).
   - **Stripping:** Whole assembled HTML/plain output passed through `strip_internal_presentation_phrases` where applicable in template path for cases text; description source for raw mode uses strip on `description_full_text`.
@@ -171,8 +171,8 @@ Examples: `OH (Shelby) General Dentistry - Midwest Dental - Closed`, `SC (Summer
 
 ### `Job_Volume__c`
 
-- **Default (static):** **Not Provided** from `SF_PUSH_STATIC_DEFAULTS`.
-- **Override:** If `avg_patients_per_day` non-empty after trim, `**Job_Volume__c`** set to that value (Kimedics “avg patients per day”).
+- **No static default** when volume is unknown (field omitted from the push payload).
+- **Set when:** `avg_patients_per_day` is non-empty after trim and is not the literal placeholder “Not Provided” (case-insensitive); any other string field in the payload equal to that placeholder is also dropped before write.
 
 ### `roster_only__c`
 

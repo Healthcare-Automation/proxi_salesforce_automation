@@ -59,6 +59,23 @@ def _guess_key_procedures(row: dict[str, Any]) -> str:
     return first
 
 
+def merge_ai_intro_html_to_single_paragraph(intro_html: str) -> str:
+    """
+    Collapse multiple top-level ``<p>...</p>`` blocks into one paragraph (space-joined).
+
+    Used so the opening job description reads as a single paragraph even when the model
+    returns several ``<p>`` tags.
+    """
+    s = (intro_html or "").strip()
+    if not s:
+        return s
+    parts = re.findall(r"<p[^>]*>(.*?)</p>", s, flags=re.I | re.DOTALL)
+    if len(parts) <= 1:
+        return s
+    inner = " ".join(_collapse_ws(p) for p in parts if p and p.strip())
+    return f"<p>{inner}</p>"
+
+
 def _basic_readability_issues(text: str) -> list[str]:
     t = (text or "").strip()
     issues: list[str] = []
@@ -82,7 +99,7 @@ def generate_ai_intro_html(
     timeout_s: float = 20.0,
 ) -> AIDescriptionResult:
     """
-    Generate the top intro copy as HTML paragraphs, and return any QA issues flagged by the model
+    Generate the top intro copy as a single HTML paragraph, and return any QA issues flagged by the model
     plus some deterministic checks.
 
     Requires `OPENAI_API_KEY` and the `openai` python package.
@@ -114,24 +131,21 @@ def generate_ai_intro_html(
     prompt = f"""
 You are generating client-facing job posting copy for a dental staffing agency.
 
-Write EXACTLY three short paragraphs in clean HTML, using only <p> and text (no lists, no headings).
+Write EXACTLY ONE short paragraph in clean HTML: a single <p>...</p> block containing only text (no lists, no headings, no nested <p>).
 Tone: professional, clear, confident. Avoid hype and avoid phrases like "best-in-class".
 
-Fill this template, improving grammar and readability while keeping the meaning:
+Combine these ideas into that single paragraph (smooth sentences, normal punctuation; do not use line breaks inside the paragraph):
 
-Paragraph 1:
-Proxi Dental Staffing is seeking a {{specialty}} for a {{job_type}} opportunity in {{city}}, {{state}}.
+1) We are seeking a {{specialty}} for a {{job_type}} opportunity in {{city}}, {{state}}.
 
-Paragraph 2:
-This opportunity allows a dentist to practice comprehensive general dentistry with a supportive clinical team and steady patient workflow.
+2) This opportunity allows a dentist to practice comprehensive general dentistry with a supportive clinical team and a steady patient workflow.
 
-Paragraph 3:
-{key_proc_clause}
+3) {key_proc_clause}
 
 Hard rules:
 - Do not include "Source notes", "Kimedics", or any internal sourcing language.
 - Do not add pay, dates, schedule, requirements, or anything not in the template.
-- If city or state is missing, rewrite the first paragraph to avoid dangling commas and missing info.
+- If city or state is missing, rewrite the opening to avoid dangling commas and missing info.
 
 Inputs:
 - specialty: {specialty}
@@ -156,6 +170,8 @@ Inputs:
     # Basic validation: must be HTML with <p>.
     if "<p" not in text.lower():
         raise RuntimeError("AI intro did not return HTML <p> paragraphs")
+
+    text = merge_ai_intro_html_to_single_paragraph(text)
 
     issues = _basic_readability_issues(text)
 

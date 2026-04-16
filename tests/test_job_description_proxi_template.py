@@ -2,6 +2,7 @@
 
 import pytest
 
+from utils.job_description_ai import merge_ai_intro_html_to_single_paragraph
 from utils.job_description_proxi_template import (
     build_proxi_job_posting_description,
     extract_active_needs_dates,
@@ -34,12 +35,36 @@ def test_build_html_contains_structure():
     assert "California" in out
     assert "Dates:" in out and "Schedule:" in out
     assert "Highlights" not in out
+    # Pay line matches fixed default (not Kimedics Pay Range: $125 – $145 in description_full_text).
+    assert "Pay Range:" in out
+    assert "Starting at $125/hour" in out
+    assert "$145" not in out
 
 
 def test_opening_paragraphs_not_over_bolded():
     out = build_proxi_job_posting_description(_minimal_row(), use_html=True)
     assert "<strong>Proxi" not in out
     assert "<strong>General Dentist</strong>" not in out
+
+
+def test_opening_intro_single_paragraph_including_ideal_role_sentence():
+    row = _minimal_row()
+    row["types_of_cases"] = "Surgical extractions for dentures\nrestorative"
+    out = build_proxi_job_posting_description(row, use_html=True)
+    idx_opening = out.find("We are seeking")
+    idx_ideal = out.find("This role is ideal")
+    assert idx_opening != -1 and idx_ideal != -1
+    intro_close = out.find("</p>", idx_opening)
+    assert intro_close != -1
+    assert idx_ideal < intro_close
+
+
+def test_merge_ai_intro_html_to_single_paragraph():
+    merged = merge_ai_intro_html_to_single_paragraph(
+        "<p>First sentence.</p>\n<p>Second sentence.</p>"
+    )
+    assert merged == "<p>First sentence. Second sentence.</p>"
+    assert merge_ai_intro_html_to_single_paragraph("<p>Only one.</p>") == "<p>Only one.</p>"
 
 
 def test_build_html_escapes_angle_brackets():
@@ -70,6 +95,35 @@ def test_clinical_scope_capitalizes_first_letter():
     out = build_proxi_job_posting_description(row, use_html=True)
     assert "Extractions could include" in out
     assert "Restorative procedures" in out
+
+
+def test_strip_procedure_limitations_phrase_from_types_style_text():
+    raw = (
+        "Surgical extractions\n"
+        "please notate any procedure limitations in presentation."
+    )
+    out = strip_internal_presentation_phrases(raw)
+    assert "notate" not in out.lower()
+    assert "presentation" not in out.lower()
+    assert "surgical extractions" in out.lower()
+
+
+def test_strip_presentation_note_variants():
+    assert "notate" not in strip_internal_presentation_phrases(
+        "Extractions — kindly note any limitations on presentation."
+    ).lower()
+    assert "notate" not in strip_internal_presentation_phrases(
+        "Scope: pls notate limitations during presentation"
+    ).lower()
+    assert "presentation" not in strip_internal_presentation_phrases(
+        "Scope: pls notate limitations during presentation"
+    ).lower()
+
+
+def test_clinical_note_word_not_stripped():
+    """Bare word 'note' in clinical prose must not remove unrelated lines."""
+    raw = "Clinical note: patient prefers morning visits."
+    assert "Clinical note" in strip_internal_presentation_phrases(raw)
 
 
 def test_strip_internal_phrases_in_html_clinical_scope():

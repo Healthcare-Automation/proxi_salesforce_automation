@@ -21,7 +21,7 @@ SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID = "0015f00000HH63kAAD"
 SF_FIELD_WORKSITE_LOCATION = "Job_Worksite_Location_1__c"
 
 # Push-time defaults for Job__c live in ``utils.sf_job_payload.SF_PUSH_STATIC_DEFAULTS``
-# (DJC fields, Job_Patient_Ages__c, Job_Volume__c, etc.). See ``docs/salesforce_job_push_rules.md``.
+# (DJC fields, Job_Patient_Ages__c, etc.). See ``docs/engineering/salesforce_job_push_rules.md``.
 
 
 def format_worksite_account_name(city: str, state: str) -> str:

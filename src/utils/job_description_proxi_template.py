@@ -3,6 +3,7 @@ Canonical Proxi job posting body for Salesforce (Job_Client_Job_Description__c).
 
 Built from the same structured row we map to other SF fields so the narrative stays in sync
 with Status, City, State, Dates, Schedule, Types of Cases, Support Staff, etc.
+The **Pay Range** line uses the same fixed default as ``Salary_Pay_Range__c`` (not Kimedics extraction).
 
 **Formatting:** By default we emit **HTML** (``<p>``, ``<strong>``, ``<ul>``/``<li>``, ``<br>``) so
 Lightning **Rich Text** fields show bold section titles and spacing. Use ``use_html=False`` if
@@ -18,7 +19,7 @@ import os
 import re
 from typing import Iterable, Optional
 
-from utils.sf_pay_range import extract_pay_range_from_description
+from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE
 from utils.us_state_expand import state_name_for_salesforce
 
 # Kimedics sometimes prepends ``M/D update: …`` without refreshing structured date/schedule fields.
@@ -41,15 +42,84 @@ _ACTIVE_NEED_LINE_PREFIXES: tuple[re.Pattern[str], ...] = (
 )
 
 # Kimedics internal phrasing for account managers — must not appear in candidate-facing copy.
-_PRESENTATION_NOTATE = re.compile(
-    r"(?i)(?:\s*[,;]+\s*)?(?:(?:\s+[-–—]\s+)|(?<=[\w\d])[-–—]\s*)?please\s+notate\s+any\s+limitations\s+in\s+presentation\.?",
+# ``note`` only when clearly an instruction (please/kindly/pls + note), not the noun in "clinical note".
+_INSTR_PRESENT = (
+    r"(?:please\s+notate|please\s+note|kindly\s+notate|kindly\s+note|"
+    r"pls\.?\s*notate|pls\.?\s*note|\bnotate\b)"
 )
+
+# Several regex passes catch wording drift (pls/kindly, on/in/during, procedure, extra words, etc.).
+_PRESENTATION_CLAUSE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Tight boilerplate + common prepositions.
+    re.compile(
+        r"(?i)(?:\s*[,;]+\s*)?(?:(?:\s+[-–—]\s+)|(?<=[\w\d])[-–—]\s*)?"
+        + _INSTR_PRESENT
+        + r"\s+"
+        r"(?:any|the|all\s+|us\s+|us\s+to\s+)?(?:relevant\s+|clinical\s+)?"
+        r"(?:(?:procedure\s+)?limitations?|limitations?\s+of\s+procedure|procedure\s+limitations?)\s+"
+        r"(?:in|on|during|for|with|within|at)\s+"
+        r"(?:a\s+|the\s+|your\s+|our\s+)?(?:candidate\s+|internal\s+)?presentation\.?"
+    ),
+    # Medium: instruction then bounded gap to limitations then to presentation.
+    re.compile(
+        r"(?i)(?:\s*[,;]+\s*)?(?:(?:\s+[-–—]\s+)|(?<=[\w\d])[-–—]\s*)?"
+        + _INSTR_PRESENT
+        + r"\b"
+        r".{0,55}?"
+        r"(?:any|the|all\s+)?"
+        r".{0,55}?"
+        r"\blimitations?\b"
+        r".{0,55}?"
+        r"\bpresentation\b\.?"
+    ),
+    # Looser same-line clause: instruction … (limitation|procedure) … presentation (all bounded).
+    re.compile(
+        r"(?i)(?:\s*[,;]+\s*)?(?:(?:\s+[-–—]\s+)|(?<=[\w\d])[-–—]\s*)?"
+        + _INSTR_PRESENT
+        + r"\b"
+        r".{0,130}?"
+        r"(?:\blimitations?\b|\bprocedure\b)"
+        r".{0,85}?"
+        r"\bpresentation\b\.?"
+    ),
+)
+
+
+def _drop_internal_presentation_only_lines(text: str) -> str:
+    """
+    Remove whole lines that are clearly only the Kimedics internal presentation note
+    (short line containing notate/note + limitation/procedure + presentation).
+    """
+    kept: list[str] = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if not s:
+            kept.append(line)
+            continue
+        low = s.lower()
+        has_present = "presentation" in low
+        has_limit = "limitation" in low or "limitations" in low or re.search(r"\bprocedure\b", low)
+        has_instr = bool(
+            re.search(r"\bnotate\b", low)
+            or re.search(r"\bplease\s+note\b", low)
+            or re.search(r"\bplease\s+notate\b", low)
+            or re.search(r"\bkindly\s+note\b", low)
+            or re.search(r"\bkindly\s+notate\b", low)
+            or re.search(r"\bpls\.?\s*note\b", low)
+            or re.search(r"\bpls\.?\s*notate\b", low)
+        )
+        if has_present and has_limit and has_instr and len(s) <= 220:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def strip_internal_presentation_phrases(text: str) -> str:
     """
-    Remove ``please notate any limitations in presentation`` (and the leading comma / dash / `` - ``),
-    including forms like ``full mouth- please notate…``.
+    Remove internal *notate/note … presentation* instructions (and leading comma / dash / `` - ``).
+
+    Uses several clause patterns plus dropping short standalone lines so Kimedics wording drift
+    (``pls``, ``kindly note``, ``on presentation``, ``procedure limitations``, etc.) is still stripped.
     """
     t = (text or "").strip()
     if not t:
@@ -57,7 +127,9 @@ def strip_internal_presentation_phrases(text: str) -> str:
     prev = None
     while prev != t:
         prev = t
-        t = _PRESENTATION_NOTATE.sub("", t)
+        for pat in _PRESENTATION_CLAUSE_PATTERNS:
+            t = pat.sub("", t)
+    t = _drop_internal_presentation_only_lines(t)
     t = re.sub(r",\s*,+", ", ", t)
     # Collapse horizontal spaces only (preserve newlines in plain-text descriptions).
     t = re.sub(r"[ \t]{2,}", " ", t).strip()
@@ -229,8 +301,8 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
     dates = effective_dates_needed(row)
     schedule = (row.get("standard_schedule") or "").strip()
 
-    raw_desc_for_pay = (row.get("description_full_text") or "").strip()
-    pay_line = (extract_pay_range_from_description(raw_desc_for_pay) or "").strip()
+    # Align narrative pay line with ``Salary_Pay_Range__c`` (fixed default, not Kimedics extraction).
+    pay_line = DEFAULT_SALARY_PAY_RANGE
 
     types_of_cases = strip_internal_presentation_phrases((row.get("types_of_cases") or "").strip())
     support_staff = (row.get("support_staff") or "").strip()
@@ -305,23 +377,18 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
                 use_ai_intro = False
 
         if not use_ai_intro:
-            chunks.append(
-                "<p>"
-                f"Proxi Dental Staffing is seeking a General Dentist for a locum tenens opportunity in {_e(prose_loc)}."
+            intro_body = (
+                f"We are seeking a General Dentist for a locum tenens opportunity in {_e(prose_loc)}."
                 " This position offers the opportunity to practice comprehensive general dentistry with a supportive "
                 "clinical team and steady patient flow."
-                "</p>"
             )
-            chunks.append(_spacer())
-
             if include_ideal_para:
-                chunks.append(
-                    "<p>"
-                    "This role is ideal for a dentist comfortable with surgical extractions and dentures who enjoys "
+                intro_body += (
+                    " This role is ideal for a dentist comfortable with surgical extractions and dentures who enjoys "
                     "working in a collaborative environment."
-                    "</p>"
                 )
-                chunks.append(_spacer())
+            chunks.append(f"<p>{intro_body}</p>")
+            chunks.append(_spacer())
 
             chunks.append("<p>Travel and lodging may be available for qualified candidates.</p>")
 
@@ -373,17 +440,17 @@ def build_proxi_job_posting_description(row: dict, *, use_html: bool = True) -> 
     else:
         lines.append("General Dentist Locum Tenens Opportunity")
     lines.append("")
-    lines.append(
-        f"Proxi Dental Staffing is seeking a General Dentist for a locum tenens opportunity in {prose_loc}. "
+    intro_plain = (
+        f"We are seeking a General Dentist for a locum tenens opportunity in {prose_loc}. "
         "This position offers the opportunity to practice comprehensive general dentistry with a supportive "
         "clinical team and steady patient flow."
     )
     if include_ideal_para:
-        lines.append("")
-        lines.append(
-            "This role is ideal for a dentist comfortable with surgical extractions and dentures who enjoys working "
+        intro_plain += (
+            " This role is ideal for a dentist comfortable with surgical extractions and dentures who enjoys working "
             "in a collaborative environment."
         )
+    lines.append(intro_plain)
     lines.append("")
     lines.append("Travel and lodging may be available for qualified candidates.")
     lines.append("")

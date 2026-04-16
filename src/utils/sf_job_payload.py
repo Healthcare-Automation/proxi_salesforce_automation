@@ -4,7 +4,7 @@ Map Supabase ``job_current`` / parser-shaped rows → Salesforce Job__c field di
 Push-time only:
   - Account / worksite Ids and fixed DJC defaults (not stored in Supabase).
   - Canonical Proxi job description (optional) so narrative matches structured fields.
-  - Salary range default unless extracted from Kimedics description text.
+  - ``Salary_Pay_Range__c`` always uses the fixed default (``Starting at $125/hour``); Kimedics pay lines are ignored for that field.
   - Full US state names on Job_State__c.
 
 See ``docs/engineering/salesforce_job_push_rules.md`` for the full rule set.
@@ -27,7 +27,7 @@ from utils.job_description_proxi_template import (
     effective_dates_needed,
     strip_internal_presentation_phrases,
 )
-from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE, extract_pay_range_from_description
+from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE
 from utils.address_display_format import format_us_address_line_for_display
 from utils.job_content_parser import _parse_city_state, infer_roster_only_from_full_text
 from utils.sf_push_defaults import SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID
@@ -74,7 +74,6 @@ SF_PUSH_STATIC_DEFAULTS: dict[str, str] = {
     "Specialty_DJC__c": "General Dentistry",
     "Worksite_Parent__c": "Aspen Dental Management Inc.",
     "Job_Patient_Ages__c": "Mostly Adults",
-    "Job_Volume__c": "Not Provided",
 }
 
 # Exact Job__c API names automation may send (before Salesforce describe filters FLS).
@@ -159,6 +158,14 @@ def sf_push_omitted_field_names() -> frozenset[str]:
     if not s:
         return frozenset()
     return frozenset(x.strip() for x in s.split(",") if x.strip())
+
+
+def _omit_not_provided_sentinel_strings(out: dict[str, Any]) -> None:
+    """Remove any string field equal to ``Not Provided`` (case-insensitive); do not send that placeholder to SF."""
+    for k in list(out.keys()):
+        v = out.get(k)
+        if isinstance(v, str) and v.strip().casefold() == "not provided":
+            del out[k]
 
 
 def _apply_trailing_comma_strip_to_sf_text_fields(out: dict[str, Any]) -> None:
@@ -465,8 +472,8 @@ def job_row_to_salesforce_fields(
     wid = (w_override or w_from_row) or None
 
     desc_raw = (r.get("description_full_text") or "").strip()
-    inferred_pay = extract_pay_range_from_description(desc_raw)
-    salary_pay = inferred_pay if inferred_pay else DEFAULT_SALARY_PAY_RANGE
+    # Always push the standard rate line on Job__c (Kimedics ranges in description are not used here).
+    salary_pay = DEFAULT_SALARY_PAY_RANGE
 
     state_sf = state_name_for_salesforce(r.get("state"))
     city = (r.get("city") or "").strip()
@@ -511,11 +518,12 @@ def job_row_to_salesforce_fields(
     }
     out.update(SF_PUSH_STATIC_DEFAULTS)
     vol = (r.get("avg_patients_per_day") or "").strip()
-    if vol:
+    if vol and vol.casefold() != "not provided":
         out["Job_Volume__c"] = vol
     out["Job_Ranking__c"] = str(r.get("job_ranking") or "B").strip() or "B"
 
     _apply_trailing_comma_strip_to_sf_text_fields(out)
+    _omit_not_provided_sentinel_strings(out)
 
     omit = sf_push_omitted_field_names()
     for k in omit:

@@ -56,6 +56,17 @@ def test_volume_override_still_canonical():
     assert set(out.keys()) <= CANONICAL_JOB_C_PUSH_FIELD_NAMES
 
 
+def test_minimal_row_omits_job_volume_no_not_provided_default():
+    out = job_row_to_salesforce_fields({"job_id": "1", "city": "X", "state": "TX"})
+    assert "Job_Volume__c" not in out
+
+
+def test_volume_not_provided_placeholder_omitted():
+    row = {"job_id": "1", "city": "X", "state": "TX", "avg_patients_per_day": "  NOT PROVIDED "}
+    out = job_row_to_salesforce_fields(row)
+    assert "Job_Volume__c" not in out
+
+
 def test_roster_only_true_from_open_to_roster_in_description_when_column_false():
     row = {
         "job_id": "1",
