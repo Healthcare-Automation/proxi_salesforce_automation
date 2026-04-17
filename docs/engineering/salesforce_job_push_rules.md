@@ -103,7 +103,7 @@ These values are **always applied when building the Salesforce payload**, even i
 
 **Role and job source on update:** `Job_Position_Type__c`, `Job_Specialty__c`, `Occupation_DJC__c`, and `Job_Job_Source__c` are included on **create** with the defaults above. On **PATCH** (scrape sync and `update_salesforce_job.py`), they are sent **only when the existing Salesforce value is blank**, so non-null org data is not overwritten (`merge_job_role_defaults_for_empty_sf_fields`). Picklist labels are matched to valid API values before the write.
 
-**Candidate-facing description:** Kimedics internal wording *“please notate any limitations in presentation”* (and the leading comma / dash) is stripped from `Job_Client_Job_Description__c`, raw-description pushes, and `Job_Types_of_Cases__c` via `strip_internal_presentation_phrases` in `utils.job_description_proxi_template`.
+**Candidate-facing description:** Kimedics internal wording *“please notate any limitations in presentation”* (and close variants, including *note any limitations … presentation*) is stripped from `Job_Client_Job_Description__c` and raw-description pushes via `strip_internal_presentation_phrases` in `utils.job_description_proxi_template`. For **`Job_Types_of_Cases__c`**, `utils.sf_job_payload.sanitize_types_of_cases_for_salesforce` applies that strip per line/semicolon segment, normalizes uncommon Unicode hyphens, runs again after trailing-comma cleanup, so the value sent to Salesforce stays client-safe.
 
 ### Salary / pay range
 

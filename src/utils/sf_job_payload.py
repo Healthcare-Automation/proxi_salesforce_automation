@@ -34,6 +34,37 @@ from utils.sf_push_defaults import SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID
 from utils.sf_text_normalize import strip_trailing_commas_from_sf_text
 from utils.us_state_expand import state_abbrev_for_job_title, state_name_for_salesforce
 
+# Unicode dashes Kimedics sometimes uses before trailing *notate … presentation* on the same line as procedures.
+_TYPES_OF_CASES_DASH_NORMALIZE = re.compile(
+    r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uFE58\uFE63\uFF0D]"
+)
+
+
+def sanitize_types_of_cases_for_salesforce(raw: str) -> str:
+    """
+    Client-safe value for ``Job_Types_of_Cases__c`` before Salesforce.
+
+    Strips Kimedics-internal *notate / note … presentation* phrasing (via
+    :func:`strip_internal_presentation_phrases`), normalizes uncommon hyphens so
+    inline clauses still match, splits on newlines/semicolons so a trailing instruction
+    on its own segment is dropped, then runs a final strip on the merged text.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    s = _TYPES_OF_CASES_DASH_NORMALIZE.sub("-", s)
+    parts: list[str] = []
+    for chunk in re.split(r"[\n;\r]+", s):
+        seg = chunk.strip()
+        if not seg:
+            continue
+        seg = strip_internal_presentation_phrases(seg).strip()
+        if seg:
+            parts.append(seg)
+    merged = "\n".join(parts)
+    return strip_internal_presentation_phrases(merged).strip()
+
+
 # Display string in Job ``Name`` (must match org / formula expectations; same org as primary account).
 SF_JOB_PRIMARY_ACCOUNT_DISPLAY_NAME = "Aspen Dental Management Inc."
 
@@ -74,6 +105,9 @@ SF_PUSH_STATIC_DEFAULTS: dict[str, str] = {
     "Specialty_DJC__c": "General Dentistry",
     "Worksite_Parent__c": "Aspen Dental Management Inc.",
     "Job_Patient_Ages__c": "Mostly Adults",
+    # Org defaults (reference ids)
+    "Job_Primary_Contact__c": "0035f00001hbICYAA2",
+    "Job_Contract__c": "8005f0000007Ot0AAE",
 }
 
 # Exact Job__c API names automation may send (before Salesforce describe filters FLS).
@@ -486,7 +520,7 @@ def job_row_to_salesforce_fields(
 
     support = r.get("support_staff")
     toc_raw = (r.get("types_of_cases") or "").strip()
-    types_clean = strip_internal_presentation_phrases(toc_raw) if toc_raw else ""
+    types_clean = sanitize_types_of_cases_for_salesforce(toc_raw)
     addr_raw = (r.get("address_line") or "").strip()
     addr = format_us_address_line_for_display(addr_raw) if addr_raw else None
     if addr == "":
@@ -523,6 +557,10 @@ def job_row_to_salesforce_fields(
     out["Job_Ranking__c"] = str(r.get("job_ranking") or "B").strip() or "B"
 
     _apply_trailing_comma_strip_to_sf_text_fields(out)
+    toc_sf = out.get("Job_Types_of_Cases__c")
+    if isinstance(toc_sf, str) and toc_sf.strip():
+        toc_final = sanitize_types_of_cases_for_salesforce(toc_sf)
+        out["Job_Types_of_Cases__c"] = toc_final if toc_final else None
     _omit_not_provided_sentinel_strings(out)
 
     omit = sf_push_omitted_field_names()

@@ -111,6 +111,10 @@ def fetch_or_create_worksite_account_id(
     }
     if ship_street:
         body["ShippingStreet"] = ship_street
+    # Ensure the address renders correctly on Job formula fields that reference the worksite Account.
+    # We intentionally keep these as simple text fields (no geocoding assumptions).
+    body["ShippingCity"] = c
+    body["ShippingState"] = st
 
     body.update(_account_extra_fields())
 

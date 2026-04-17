@@ -89,6 +89,22 @@ def test_strip_internal_presentation_phrases_dash_before():
     assert "full mouth" in strip_internal_presentation_phrases(raw).lower()
 
 
+def test_strip_note_any_limitations_after_comma_or_semicolon():
+    for raw in (
+        "Surgical extractions; note any limitations in presentation",
+        "Surgical extractions, note any limitations in presentation",
+    ):
+        out = strip_internal_presentation_phrases(raw)
+        assert "presentation" not in out.lower()
+        assert "note any" not in out.lower()
+        assert "surgical extractions" in out.lower()
+
+
+def test_clinical_note_colon_line_not_stripped_by_note_any_clause():
+    raw = "Clinical note: patient prefers morning visits."
+    assert "Clinical note" in strip_internal_presentation_phrases(raw)
+
+
 def test_clinical_scope_capitalizes_first_letter():
     row = _minimal_row()
     row["types_of_cases"] = "extractions could include simple and surgical\nrestorative procedures"

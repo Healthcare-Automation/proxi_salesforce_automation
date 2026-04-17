@@ -82,6 +82,14 @@ _PRESENTATION_CLAUSE_PATTERNS: tuple[re.Pattern[str], ...] = (
         r".{0,85}?"
         r"\bpresentation\b\.?"
     ),
+    # ``note any limitations … presentation`` without ``please`` — only after ``,``, ``;``, newline,
+    # line start, or hyphen after a word char (avoids ``Clinical note: …`` false positives).
+    re.compile(
+        r"(?im)(?:^|[,;\n]|(?<=[\w\d])[-–—])\s*"
+        r"\bnote\s+any\s+limitations?\b"
+        r"\s+(?:in|on|during|for|with|within|at)\s+"
+        r"(?:a\s+|the\s+|your\s+|our\s+|internal\s+)?(?:candidate\s+)?presentation\.?"
+    ),
 )
 
 

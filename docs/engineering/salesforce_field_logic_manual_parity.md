@@ -25,7 +25,7 @@ Companion: high-level pipeline and env rules live in `[salesforce_job_push_rules
 - `**PROXI_SF_UPDATE_JOBS`:** when false/`0`/`no`/`off`, automation skips Salesforce **POST/PATCH** from the scrape pipeline (including field-sync reads used for compare, in that path). Default when unset: **on**.
 - `**PROXI_SF_CREATE_JOBS`:** allows **auto-create Job__c** when resolver finds **no** safe 1:1 match (see resolver doc). Still respects write kill switch above where coded.
 - `**PROXI_SF_CREATE_WORKSITES`:** allows **POST worksite Account** + map upsert when policy says to create a new location Account.
-- `**PROXI_SF_TEST_MODE`:** adds `**test_status__c`** (raw Kimedics `status` string) and `**test_posted_date__c**` (normalized date) to scrape-sync **desired** payload only — org must have those fields.
+- `**PROXI_SF_TEST_MODE`:** adds `**test_status__c`** (raw Kimedics `status` string) and `**test_posted_date__c`** (normalized date) to scrape-sync **desired** payload only — org must have those fields.
 
 ---
 
@@ -49,7 +49,7 @@ Below, **“Supabase column”** is the human/process input from Kimedics scrape
 - **Pattern:** `{StateAbbr} ({City}) {Specialty} - {Brand} - {Open|Closed}`  
 Examples: `OH (Shelby) General Dentistry - Midwest Dental - Closed`, `SC (Summerville) General Dentistry - Heartland Dental - Open`.
 - **Brand (`posting_org`):** `job_name_brand_display_for_row` — substring match on trimmed lowercased **posting_org**: **Heartland** → `Heartland Dental`; **Midwest** → `Midwest Dental`; **Aspen** → `Aspen Dental Management Inc.`; other non-empty values pass through as-is; empty → **Aspen Dental Management Inc.**
-- **City:** Primary `city` column; if blank, city from `**practice_value`** via `_parse_city_state` (e.g. `1234 - Summerville, SC`); if still blank, first segment of `**location_line**` before the last comma (parenthetical suffix stripped). **If no city is found, the `(City)` parentheses are omitted** so you never get `() General Dentistry - …`.
+- **City:** Primary `city` column; if blank, city from `**practice_value`** via `_parse_city_state` (e.g. `1234 - Summerville, SC`); if still blank, first segment of `**location_line`** before the last comma (parenthetical suffix stripped). **If no city is found, the `(City)` parentheses are omitted** so you never get `() General Dentistry - …`.
 - **Specialty:** static default **General Dentistry** (same as `Job_Specialty__c` / `Specialty_DJC__c` defaults).
 - **Status:** `**job_status_for_salesforce_push`** → **Open** or **Closed** only.
 - **Length:** Hard cap **80** characters; tail replaced with `…` if longer.
@@ -119,7 +119,7 @@ Examples: `OH (Shelby) General Dentistry - Midwest Dental - Closed`, `SC (Summer
 ### `Job_Dates_Needed__c`
 
 - **Primary:** `effective_dates_needed(row)`:
-  - If `**description_full_text`** contains `**Active needs are**`  (case-insensitive) on **any line**, use text **after that phrase on the same line** (first match). Overrides structured `dates_needed`.
+  - If `**description_full_text`** contains `**Active needs are`**  (case-insensitive) on **any line**, use text **after that phrase on the same line** (first match). Overrides structured `dates_needed`.
   - Else use `dates_needed`.
 - **Parser:** `_fill_from_description_blocks` also writes `dates_needed` from that clause when present (so DB stays consistent on scrape).
 - **Canonical job posting** uses the same effective string for the **Dates:** line in the template.
@@ -142,7 +142,7 @@ Examples: `OH (Shelby) General Dentistry - Midwest Dental - Closed`, `SC (Summer
 ### `Job_Types_of_Cases__c`
 
 - **Source:** `types_of_cases` (parser often joins required procedures + additional requirements; AI pipeline may refine in Supabase).
-- **Push:** `strip_internal_presentation_phrases` removes internal *“please notate any limitations in presentation”* (and leading punctuation variants).
+- **Push:** `sanitize_types_of_cases_for_salesforce` in `sf_job_payload` (uses `strip_internal_presentation_phrases` per segment, hyphen normalization, and a second pass after trailing-comma strip) removes internal *notate / note … presentation* phrasing so Salesforce never receives that boilerplate on this field.
 - **Template clinical bullets:** first letter of each bullet line capitalized for display.
 
 ### `Job_Support_Staff__c`
@@ -176,7 +176,7 @@ Examples: `OH (Shelby) General Dentistry - Midwest Dental - Closed`, `SC (Summer
 
 ### `roster_only__c`
 
-- **Source:** Supabase `roster_only` string `**"true"`** / `**"false"**` (parser sets from full post text “roster only” phrase).
+- **Source:** Supabase `roster_only` string `**"true"`** / `**"false"`** (parser sets from full post text “roster only” phrase).
 - **Push:** JSON boolean `**true`/`false`** (`roster_only_string_from_row` returns strings `"true"`/`"false"` for checkbox-style fields — confirm org field type matches).
 
 ### `Job_Position_Type__c` / `Job_Specialty__c` / `Occupation_DJC__c`
@@ -247,7 +247,7 @@ Optional merge: `**PROXI_SF_ACCOUNT_CREATE_EXTRA_JSON`**.
 
 ## Fields automation does **not** map (today)
 
-- `**priority`** → stored in Supabase; `**Job_Recruitment_Level__c**` is **not** in `CANONICAL_JOB_C_PUSH_FIELD_NAMES` (not sent).
+- `**priority`** → stored in Supabase; `**Job_Recruitment_Level__c`** is **not** in `CANONICAL_JOB_C_PUSH_FIELD_NAMES` (not sent).
 - Any Job__c API name **not** in the canonical set will never be emitted by `job_row_to_salesforce_fields` until code + doc are updated together.
 
 ---

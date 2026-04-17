@@ -4,6 +4,7 @@ from utils.sf_job_payload import (
     CANONICAL_JOB_C_PUSH_FIELD_NAMES,
     ROSTER_ONLY_FIELD,
     job_row_to_salesforce_fields,
+    sanitize_types_of_cases_for_salesforce,
 )
 
 
@@ -95,3 +96,36 @@ def test_trailing_commas_stripped_from_list_style_text_fields(monkeypatch):
     assert out.get("Job_Types_of_Cases__c") == "Restorative, surgical"
     assert out.get("Job_Point_of_Contact__c") == "Jane Doe"
     assert out.get("Insight__c") == "*Note here"
+
+
+def test_sanitize_types_of_cases_splits_semicolon_and_strips_instruction():
+    s = "Surgical extractions; please notate any limitations in presentation"
+    assert sanitize_types_of_cases_for_salesforce(s) == "Surgical extractions"
+
+
+def test_job_row_types_of_cases_strips_non_ascii_hyphen_before_instruction():
+    row = {
+        "job_id": "1",
+        "city": "X",
+        "state": "TX",
+        "types_of_cases": "Surgical extractions\u2011 please notate any limitations in presentation",
+    }
+    out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    val = (out.get("Job_Types_of_Cases__c") or "").lower()
+    assert "notate" not in val
+    assert "presentation" not in val
+    assert "surgical extractions" in val
+
+
+def test_job_row_types_of_cases_re_sanitized_after_trailing_comma_strip():
+    row = {
+        "job_id": "1",
+        "city": "X",
+        "state": "TX",
+        "types_of_cases": "Restorative, please notate any limitations in presentation,",
+    }
+    out = job_row_to_salesforce_fields(row, use_canonical_description=False)
+    val = (out.get("Job_Types_of_Cases__c") or "").lower()
+    assert "notate" not in val
+    assert "presentation" not in val
+    assert "restorative" in val
