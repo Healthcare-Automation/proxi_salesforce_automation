@@ -549,13 +549,77 @@ def _extract_practice_value_from_description(desc: str) -> str:
     return ""
 
 
+# Common UI elements that should never be extracted as practice values
+_UI_ELEMENT_BLOCKLIST = frozenset({
+    "sign out",
+    "signout",
+    "log out",
+    "logout",
+    "sign in",
+    "signin",
+    "log in",
+    "login",
+    "home",
+    "back",
+    "menu",
+    "settings",
+    "profile",
+    "dashboard",
+    "help",
+    "support",
+    "close",
+    "cancel",
+    "submit",
+    "save",
+    "edit",
+    "delete",
+    "search",
+    "filter",
+    "sort",
+    "export",
+    "import",
+    "download",
+    "upload",
+})
+
+
+def _is_valid_practice_value(value: str) -> bool:
+    """Check if a string is a valid practice value (not a UI element)."""
+    v = (value or "").strip()
+    if not v:
+        return False
+
+    # Check against UI element blocklist
+    v_lower = v.lower()
+    if v_lower in _UI_ELEMENT_BLOCKLIST:
+        return False
+
+    # Practice values should typically have letters/numbers and be more than 2 chars
+    if len(v) < 3:
+        return False
+
+    # Check if it's just navigation text (all lowercase single/two words)
+    if v_lower == v and len(v.split()) <= 2 and not any(c.isdigit() for c in v):
+        # Likely a navigation element unless it contains location-like patterns
+        if not any(marker in v_lower for marker in [",", " - ", "dental", "clinic", "practice", "office", "center"]):
+            return False
+
+    return True
+
+
 def _backfill_practice_value(out: dict, main_block: str) -> None:
     if (out.get("practice_value") or "").strip():
-        return
+        # Validate existing practice value
+        if not _is_valid_practice_value(out["practice_value"]):
+            out["practice_value"] = ""
+        else:
+            return
+
     v = _extract_practice_value_from_description(out.get("description_full_text") or "")
-    if v:
+    if v and _is_valid_practice_value(v):
         out["practice_value"] = v
         return
+
     lines = [ln.strip() for ln in (main_block or "").splitlines()]
     for i, ln in enumerate(lines):
         if ln.lower() != "practice":
@@ -563,7 +627,7 @@ def _backfill_practice_value(out: dict, main_block: str) -> None:
         if i + 1 >= len(lines):
             break
         nxt = lines[i + 1].strip()
-        if nxt and not _normalize_key(nxt):
+        if nxt and not _normalize_key(nxt) and _is_valid_practice_value(nxt):
             out["practice_value"] = nxt
             return
 
@@ -642,7 +706,13 @@ def parse_job_content_txt(text: str) -> dict:
             out["practice_value"] = ""
             start_i = 3
         else:
-            out["practice_value"] = lines[3]
+            # Validate that lines[3] is a legitimate practice value
+            if _is_valid_practice_value(lines[3]):
+                out["practice_value"] = lines[3]
+            else:
+                # Invalid practice value (likely UI element), treat as empty
+                out["practice_value"] = ""
+                start_i = 3
 
     # From start_i: alternating key, value. If the "value" is itself a known label, treat current key's value as "" and use that line as next key.
     i = start_i

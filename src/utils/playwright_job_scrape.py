@@ -30,7 +30,8 @@ BETWEEN_URLS_S = 0.5
 WAIT_FOR_CONTENT_OR_LOGIN_MS = 20_000
 
 # Maximum number of times we retry a single URL when we detect a login page.
-MAX_LOGIN_RETRIES = 2
+# Increased to be more aggressive about getting logged in
+MAX_LOGIN_RETRIES = 5
 
 # Tokens that indicate the extracted text is a login/auth page, not job content.
 _LOGIN_PAGE_MARKERS = frozenset({
@@ -42,6 +43,14 @@ _LOGIN_PAGE_MARKERS = frozenset({
     "use auth0",
     "enter your password",
     "don't have an account",
+})
+
+# Tokens that indicate we're on a logged-out state (seeing navigation/UI elements)
+_LOGGED_OUT_MARKERS = frozenset({
+    "sign out",
+    "signout",
+    "log out",
+    "logout",
 })
 
 
@@ -166,13 +175,51 @@ def _looks_like_login_page(text: str) -> bool:
     return False
 
 
+def _is_logged_out_page(text: str) -> bool:
+    """Return True when we detect 'Sign Out' or similar UI elements indicating we're not on job content."""
+    if not text or not text.strip():
+        return False
+
+    low = text.strip().lower()
+
+    # Check if page is suspiciously short and contains logout markers
+    if len(low) < 1000:
+        for marker in _LOGGED_OUT_MARKERS:
+            if marker in low:
+                # Found sign out but no job content markers = we're on a nav/UI page
+                if not _looks_like_job_content(text):
+                    return True
+
+    # Check if "Sign Out" appears in first few lines (UI element position)
+    lines = text.strip().split('\n')
+    for line in lines[:10]:  # Check first 10 lines
+        line_low = line.lower().strip()
+        for marker in _LOGGED_OUT_MARKERS:
+            if marker in line_low:
+                return True
+
+    return False
+
+
 def _looks_like_job_content(text: str) -> bool:
     """Positive signal that the text is real Kimedics job content."""
     if not text or len(text.strip()) < 60:
         return False
     low = text.lower()
-    markers = ("practice", "job title", "posted date", "posting org", "status", "priority")
-    return sum(1 for m in markers if m in low) >= 3
+
+    # If we detect logged out markers, it's definitely not job content
+    if _is_logged_out_page(text):
+        return False
+
+    # Need strong evidence this is actual job content
+    required_markers = ("job title", "posted date", "posting org")
+    optional_markers = ("practice", "status", "priority", "provider start date", "description")
+
+    required_found = sum(1 for m in required_markers if m in low)
+    optional_found = sum(1 for m in optional_markers if m in low)
+
+    # Must have at least 2 required markers and 2 optional markers
+    return required_found >= 2 and optional_found >= 2
 
 
 # ---------------------------------------------------------------------------
@@ -331,15 +378,26 @@ def visit_and_extract(
         _navigate_and_login_if_needed(page, primary_url, email, password)
         bt, dv = _extract_body_and_desc(page)
 
+        # Check if we have valid job content
         if _looks_like_job_content(bt):
             return bt, dv
 
-        if _looks_like_login_page(bt) or (not bt.strip() and not dv):
+        # Detect various failure modes
+        is_login_page = _looks_like_login_page(bt)
+        is_logged_out = _is_logged_out_page(bt)
+        is_empty = not bt.strip() and not dv
+
+        if is_login_page or is_logged_out or is_empty:
             if attempt <= MAX_LOGIN_RETRIES:
+                reason = "login page" if is_login_page else "logged out" if is_logged_out else "empty"
                 print(
-                    f"  [attempt {attempt}] page looks like login/empty — re-authenticating...",
+                    f"  [attempt {attempt}/{MAX_LOGIN_RETRIES}] page looks like {reason} — forcing re-authentication...",
                     file=sys.stderr,
                 )
+
+                # Clear cookies and force fresh login
+                page.context.clear_cookies()
+
                 # Force a login: go to the portal root which always shows the form.
                 page.goto(
                     KIMEDICS_PORTAL_JOB_POST_URL_PREFIX.rstrip("/"),
@@ -347,20 +405,55 @@ def visit_and_extract(
                     timeout=NAV_TIMEOUT_MS,
                 )
                 page.wait_for_timeout(WAIT_AFTER_GOTO_MS)
-                ensure_kimedics_logged_in(page, email, password)
+
+                # Try logging in
+                login_success = ensure_kimedics_logged_in(page, email, password)
+                if not login_success:
+                    print(
+                        f"  [attempt {attempt}] Login submission failed, waiting and retrying...",
+                        file=sys.stderr,
+                    )
+                    page.wait_for_timeout(3000)  # Wait 3 seconds before retry
+
                 continue
-            # Last resort: try the other URL if we haven't yet.
+
+            # Last resort: try the alternate URL
             alt = url if primary_url == canon else canon
             if alt and alt != primary_url:
                 print(
-                    f"  [attempt {attempt}] trying alternate URL: {alt[:70]}...",
+                    f"  [final attempt] trying alternate URL: {alt[:70]}...",
                     file=sys.stderr,
                 )
+                page.context.clear_cookies()  # Clear cookies for fresh attempt
                 _navigate_and_login_if_needed(page, alt, email, password)
                 bt, dv = _extract_body_and_desc(page)
 
-        return bt, dv
+                # Final check - if still not valid content, don't return it
+                if _looks_like_job_content(bt):
+                    return bt, dv
 
+        # If we got some text but it's not recognized as valid, try once more
+        elif bt.strip() and attempt == 1:
+            print(
+                f"  [attempt {attempt}] Got text but not valid job content, retrying...",
+                file=sys.stderr,
+            )
+            continue
+        else:
+            # We have content but it's not matching our patterns - could be a new format
+            # Log a warning but return it anyway (better than nothing)
+            if bt.strip():
+                print(
+                    f"  WARNING: Returning content that doesn't match expected format for job {job_post_id}",
+                    file=sys.stderr,
+                )
+            return bt, dv
+
+    # All retries exhausted - this should trigger an alert
+    print(
+        f"  ERROR: Failed to get valid content for job {job_post_id} after {MAX_LOGIN_RETRIES} attempts!",
+        file=sys.stderr,
+    )
     return "", ""
 
 
@@ -421,12 +514,49 @@ def scrape_job_pages(
                 )
                 if desc_value:
                     body_text = body_text + "\n\n--- Description (full text) ---\n" + desc_value
-                cleaned = parse_job_content_txt(body_text)
-                results.append({
-                    "job_post_id": job_id,
-                    "email_received_date": email_date,
-                    "view_job_link": url,
-                    "cleaned": cleaned,
+                # Check if we got valid content or authentication failed
+                if _is_logged_out_page(body_text):
+                    error_msg = "AUTHENTICATION_FAILED: Detected 'Sign Out' - not logged in"
+                    print(f"  ERROR for job {job_id}: {error_msg}", file=sys.stderr)
+                    results.append({
+                        "job_post_id": job_id,
+                        "email_received_date": email_date,
+                        "view_job_link": url,
+                        "cleaned": {},
+                        "error": error_msg,
+                        "authentication_failed": True,
+                    })
+                elif not body_text.strip():
+                    error_msg = "NO_CONTENT: Failed to extract any content after retries"
+                    print(f"  ERROR for job {job_id}: {error_msg}", file=sys.stderr)
+                    results.append({
+                        "job_post_id": job_id,
+                        "email_received_date": email_date,
+                        "view_job_link": url,
+                        "cleaned": {},
+                        "error": error_msg,
+                        "authentication_failed": True,
+                    })
+                elif not _looks_like_job_content(body_text):
+                    # Parse it anyway but flag as suspicious
+                    cleaned = parse_job_content_txt(body_text)
+                    print(f"  WARNING for job {job_id}: Content doesn't match expected format", file=sys.stderr)
+                    results.append({
+                        "job_post_id": job_id,
+                        "email_received_date": email_date,
+                        "view_job_link": url,
+                        "cleaned": cleaned,
+                        "error": "SUSPICIOUS_CONTENT: Parsed but doesn't match expected format",
+                        "authentication_failed": False,
+                    })
+                else:
+                    # Success - valid content
+                    cleaned = parse_job_content_txt(body_text)
+                    results.append({
+                        "job_post_id": job_id,
+                        "email_received_date": email_date,
+                        "view_job_link": url,
+                        "cleaned": cleaned,
                     "error": "",
                     "email_scrape_id": email_scrape_id,
                 })

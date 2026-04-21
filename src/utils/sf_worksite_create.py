@@ -105,9 +105,14 @@ def fetch_or_create_worksite_account_id(
     if ship_street == "":
         ship_street = None
 
+    # Default Account Owner for all new worksites
+    # User: 0055f000007qcxEAAQ (as specified)
+    DEFAULT_ACCOUNT_OWNER_ID = "0055f000007qcxEAAQ"
+
     body: dict[str, Any] = {
         "Name": display,
         "ParentId": SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID,
+        "OwnerId": DEFAULT_ACCOUNT_OWNER_ID,  # Set specific owner for all new accounts
     }
     if ship_street:
         body["ShippingStreet"] = ship_street

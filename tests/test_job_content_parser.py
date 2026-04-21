@@ -486,3 +486,53 @@ def test_parse_with_pipeline_heuristic_only():
     assert r["stages"]["ai_validate"] is False
     assert r["validation"] is None
     assert r["row"]["job_id"] == "17967"
+
+
+def test_ui_elements_not_extracted_as_practice():
+    """Test that UI elements like 'Sign Out' are not extracted as practice values."""
+    # Test case 1: Sign Out on line 3 (the actual issue from job 19656)
+    text1 = """New job post from Aspen Dental #19656
+Location
+Practice
+Sign Out
+Job Title
+Dental Position
+Posted Date
+2024-04-20
+--- Description (full text) ---
+Actual job content here."""
+    result1 = parse_job_content_txt(text1)
+    assert result1["practice_value"] == ""  # Should be empty, not "Sign Out"
+    assert result1["job_id"] == "19656"
+
+    # Test case 2: Other UI elements that should be filtered
+    ui_elements = ["Log Out", "Settings", "Profile", "Dashboard", "Home", "Menu", "sign out", "SIGN OUT"]
+    for ui_element in ui_elements:
+        text = f"""Job #12345
+Location
+Practice
+{ui_element}
+Job Title
+Test Position"""
+        result = parse_job_content_txt(text)
+        assert result["practice_value"] == "", f"UI element '{ui_element}' should not be extracted as practice"
+
+    # Test case 3: Valid practice should still work
+    text3 = """Job #12345
+Location
+Practice
+6313 - Cheektowaga, NY
+Job Title
+Test Position"""
+    result3 = parse_job_content_txt(text3)
+    assert result3["practice_value"] == "6313 - Cheektowaga, NY"  # Valid practice value should be extracted
+
+    # Test case 4: Practice name with dental/clinic keywords should work
+    text4 = """Job #12345
+Location
+Practice
+Smile Dental Center
+Job Title
+Test Position"""
+    result4 = parse_job_content_txt(text4)
+    assert result4["practice_value"] == "Smile Dental Center"  # Valid practice name

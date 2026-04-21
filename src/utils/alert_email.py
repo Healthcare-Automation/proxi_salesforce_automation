@@ -560,3 +560,113 @@ def send_daily_summary(stats: dict) -> bool:
         ),
         text,
     )
+
+
+# ── Authentication failure alert ────────────────────────────────────────────────────
+
+def send_authentication_failure_alert(
+    failed_jobs: list[dict],
+    total_jobs: int,
+) -> bool:
+    """
+    Send an immediate alert when Kimedics authentication failures are detected.
+
+    Args:
+        failed_jobs: List of job dicts with authentication_failed=True
+        total_jobs: Total number of jobs attempted in this batch
+
+    Returns:
+        True if email sent successfully, False otherwise
+    """
+    if not failed_jobs:
+        return False
+
+    failure_rate = len(failed_jobs) / total_jobs * 100 if total_jobs > 0 else 0
+
+    # Build list of failed jobs
+    failed_rows = []
+    for job in failed_jobs[:20]:  # Limit to 20 for email size
+        job_id = job.get("job_post_id", "Unknown")
+        error = job.get("error", "Unknown error")
+        link = job.get("view_job_link", "")
+
+        link_html = f'<a href="{link}">View Job</a>' if link else "No link"
+        failed_rows.append(
+            f'<tr><td>#{job_id}</td><td>{error}</td><td>{link_html}</td></tr>'
+        )
+
+    # Critical alert badge
+    health_badge = '<span class="badge critical">🔴 AUTHENTICATION FAILURE</span>'
+
+    body = f"""
+    <div class="section" style="background:#fef2f2;border:1px solid #dc2626;border-radius:4px;padding:16px;">
+      <h2 style="color:#dc2626;margin:0 0 12px;">⚠️ CRITICAL: Kimedics Authentication Failed</h2>
+      <p style="margin:0 0 8px;"><strong>{len(failed_jobs)} of {total_jobs} jobs ({failure_rate:.0f}%)</strong>
+      failed to scrape due to authentication issues.</p>
+      <p style="margin:0;color:#666;">The scraper detected "Sign Out" or similar UI elements, indicating we're not logged in.</p>
+    </div>
+
+    <div class="section">
+      <h2>Failed Jobs</h2>
+      <table style="width:100%;border-collapse:collapse;">
+        <tr style="background:#f0f0f0;">
+          <th style="text-align:left;padding:6px;">Job ID</th>
+          <th style="text-align:left;padding:6px;">Error</th>
+          <th style="text-align:left;padding:6px;">Link</th>
+        </tr>
+        {''.join(failed_rows)}
+      </table>
+      {f'<p style="font-size:12px;color:#888;">... and {len(failed_jobs) - 20} more</p>' if len(failed_jobs) > 20 else ''}
+    </div>
+
+    <div class="section">
+      <h2>Required Actions</h2>
+      <ol>
+        <li><strong>Check Kimedics credentials</strong> in Modal secrets (KIMEDICS_EMAIL, KIMEDICS_PASSWORD)</li>
+        <li><strong>Verify login flow</strong> hasn't changed on Kimedics portal</li>
+        <li><strong>Test manual login</strong> to ensure account isn't locked</li>
+        <li><strong>Review playwright selectors</strong> if login page structure changed</li>
+      </ol>
+    </div>
+
+    <div class="section">
+      <p style="font-size:12px;color:#888;margin:0;">
+        This is a critical alert. The automation cannot function without valid authentication.
+        Immediate action is required to restore service.
+      </p>
+    </div>
+    """
+
+    # Plain text version
+    text = textwrap.dedent(f"""
+    CRITICAL: Kimedics Authentication Failed
+    {'='*50}
+
+    {len(failed_jobs)} of {total_jobs} jobs ({failure_rate:.0f}%) failed due to authentication issues.
+
+    The scraper detected "Sign Out" or similar UI elements, indicating we're not logged in.
+
+    Failed Jobs:
+    {chr(10).join(f'  - Job #{job.get("job_post_id", "?")} : {job.get("error", "Unknown")}' for job in failed_jobs[:10])}
+    {f'  ... and {len(failed_jobs) - 10} more' if len(failed_jobs) > 10 else ''}
+
+    Required Actions:
+    1. Check Kimedics credentials in Modal secrets
+    2. Verify login flow hasn't changed
+    3. Test manual login to ensure account isn't locked
+    4. Review playwright selectors if needed
+
+    This is a critical alert requiring immediate attention.
+    """).strip()
+
+    subject = f"🚨 CRITICAL: Kimedics Authentication Failed - {len(failed_jobs)} jobs affected"
+
+    return _send(
+        subject,
+        _html_wrap(
+            "🚨 Authentication Failure Alert",
+            f"{len(failed_jobs)} jobs failed · Proxi Automation",
+            body,
+        ),
+        text,
+    )

@@ -162,8 +162,39 @@ def scrape_gmail_job():
             if link_run_id:
                 log_run_finish(conn, link_run_id)
 
+    # Check for authentication failures and send immediate alert
+    auth_failures = [r for r in scrape_results if r.get("authentication_failed")]
+    if auth_failures:
+        print(f"\n⚠️ AUTHENTICATION FAILURES DETECTED: {len(auth_failures)} job(s) failed due to login issues!")
+        print("Failed jobs:")
+        for failure in auth_failures:
+            print(f"  - Job #{failure['job_post_id']}: {failure.get('error', 'Unknown error')}")
+
+        # Send immediate alert email
+        try:
+            from utils.alert_email import send_authentication_failure_alert
+            alert_sent = send_authentication_failure_alert(
+                failed_jobs=auth_failures,
+                total_jobs=len(scrape_results),
+            )
+            if alert_sent:
+                print("Authentication failure alert email sent!")
+            else:
+                print("Failed to send authentication failure alert email")
+        except ImportError:
+            # If the alert function doesn't exist yet, at least log it prominently
+            print("\n" + "=" * 80)
+            print("CRITICAL: Authentication failures detected but alert function not available!")
+            print("Manual intervention required - Kimedics login may be broken!")
+            print("=" * 80 + "\n")
+
     ok = sum(1 for r in scrape_results if not r.get("error"))
-    print(f"Link scrape done: {ok}/{len(scrape_results)} logged to job_content")
+    failed = len(scrape_results) - ok
+    print(f"\nLink scrape done: {ok}/{len(scrape_results)} successful, {failed} failed")
+
+    if failed > 0:
+        print(f"⚠️ {failed} job(s) had errors - check logs for details")
+
     return len(new_rows)
 
 

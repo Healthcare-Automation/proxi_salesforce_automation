@@ -332,6 +332,73 @@ def _mdy_to_iso(d: Optional[str]) -> Optional[str]:
         return None
 
 
+def get_most_recent_open_date(conn, job_id: str, schema: str = "public") -> Optional[str]:
+    """
+    Find the most recent date when this job transitioned to Open/Active status.
+
+    Looks through job_content history to find the most recent email_received_date
+    where the status was "Open" or "Active, accepting new providers".
+
+    This handles cases where a job went: closed -> open -> closed -> open
+    by returning the date from the most recent transition to open.
+
+    Returns ISO date string (YYYY-MM-DD) or None if no open status found.
+    """
+    if not conn or not job_id:
+        return None
+
+    try:
+        cur = conn.cursor()
+        # Query job_content history for this job, ordered by most recent first
+        # Join with email_scrapes to get the email_received_date
+        query = """
+        SELECT
+            es.date as email_received_date,
+            jc.status
+        FROM job_content jc
+        LEFT JOIN email_scrapes es ON es.id = jc.email_scrape_id
+        WHERE jc.job_id = %s
+        AND jc.status IS NOT NULL
+        AND jc.status != ''
+        AND es.date IS NOT NULL
+        ORDER BY es.date DESC
+        """
+
+        cur.execute(query, (job_id,))
+        rows = cur.fetchall()
+        cur.close()
+
+        if not rows:
+            return None
+
+        # Find the most recent transition to Open/Active status
+        for row in rows:
+            email_date, status = row
+            status_lower = str(status).lower().strip()
+
+            # Check if this is an open/active status
+            if ("open" in status_lower and "not" not in status_lower) or \
+               "accepting new provider" in status_lower:
+                # Convert datetime to ISO date string
+                if hasattr(email_date, 'date'):
+                    return email_date.date().isoformat()
+                elif hasattr(email_date, 'isoformat'):
+                    return email_date.isoformat().split('T')[0]
+                else:
+                    # Try to parse if it's a string
+                    try:
+                        dt = datetime.fromisoformat(str(email_date))
+                        return dt.date().isoformat()
+                    except:
+                        pass
+
+        return None
+
+    except Exception as e:
+        print(f"Error getting most recent open date for job {job_id}: {e}", file=sys.stderr)
+        return None
+
+
 def coerce_picklists_to_valid(describe: dict, fields_map: dict) -> None:
     """
     Restricted picklists reject labels. Align each sent picklist field to a valid API value
@@ -486,6 +553,8 @@ def job_row_to_salesforce_fields(
     primary_account_id: Optional[str] = None,
     worksite_account_id: Optional[str] = None,
     description_use_html: Optional[bool] = None,
+    conn = None,
+    schema: str = "public",
 ) -> dict[str, Any]:
     """
     Build a Job__c field dict from one job row (``job_current`` shape).
@@ -547,6 +616,7 @@ def job_row_to_salesforce_fields(
         "Job_Support_Staff__c": support if (support and str(support).strip()) else None,
         "Job_Provider_Start_Date__c": _mdy_to_iso(r.get("provider_start_date")),
         "Job_Provider_End_Date__c": _mdy_to_iso(r.get("provider_end_date")),
+        "Job_Open_Date__c": get_most_recent_open_date(conn, r.get("job_id"), schema) if conn else None,
         "Salary_Pay_Range__c": salary_pay,
         ROSTER_ONLY_FIELD: roster_only_string_from_row(r),
     }
@@ -587,6 +657,8 @@ def prepare_payload_for_write(
     primary_account_id: Optional[str] = None,
     worksite_account_id: Optional[str] = None,
     description_use_html: Optional[bool] = None,
+    conn = None,
+    schema: str = "public",
 ) -> dict[str, Any]:
     """
     Full row → Salesforce fields → picklist coercion → createable/updateable filter.
@@ -599,6 +671,8 @@ def prepare_payload_for_write(
         primary_account_id=primary_account_id,
         worksite_account_id=worksite_account_id,
         description_use_html=description_use_html,
+        conn=conn,
+        schema=schema,
     )
     if for_update:
         for k in SF_PUSH_JOB_ROLE_DEFAULTS:

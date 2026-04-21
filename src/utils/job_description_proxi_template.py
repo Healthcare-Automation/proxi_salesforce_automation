@@ -39,6 +39,12 @@ _ACTIVE_NEED_LINE_PREFIXES: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\bactive\s+need\s*:\s*"),
     re.compile(r"(?i)\bactive\s+needs\s*:\s*"),
     re.compile(r"(?i)\bactive\s+needs?\s*[-–—]\s*"),
+    # Handle "current active need" and similar variations
+    re.compile(r"(?i)\b(?:current\s+)?active\s+needs?\s+(?:are|is)\s+"),
+    re.compile(r"(?i)\b(?:current\s+)?active\s+needs?\s*[:–—]\s*"),
+    # More flexible pattern to catch variations like "current active need April 24"
+    # Must be followed by a date-like pattern (month, number, or day of week)
+    re.compile(r"(?i)\b(?:current\s+)?active\s+needs?\s+(?=(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d+|mon|tue|wed|thu|fri|sat|sun))"),
 )
 
 # Kimedics internal phrasing for account managers — must not appear in candidate-facing copy.

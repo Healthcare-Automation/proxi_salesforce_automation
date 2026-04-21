@@ -178,6 +178,23 @@ def test_extract_active_need_colon_and_dash_variants():
     assert extract_active_needs_dates("Active need – May 20 (tentative)") == "May 20 (tentative)"
 
 
+def test_extract_current_active_need_variations():
+    """Test variations with 'current active need' phrasing."""
+    # Your specific case
+    assert extract_active_needs_dates("4/17 update: Partial fill, current active need April 24th") == "April 24th"
+    assert extract_active_needs_dates("4/17 update: Partial fill, current active need April 24") == "April 24"
+
+    # Other variations
+    assert extract_active_needs_dates("Update: current active need is May 15") == "May 15"
+    assert extract_active_needs_dates("Current active needs are June 1-3") == "June 1-3"
+    assert extract_active_needs_dates("Note: Current active need: July 10") == "July 10"
+    assert extract_active_needs_dates("Current active need – August 20") == "August 20"
+
+    # Without 'current'
+    assert extract_active_needs_dates("Status update, active need September 5") == "September 5"
+    assert extract_active_needs_dates("Active need March 10-12") == "March 10-12"
+
+
 def test_active_needs_dates_in_template_overrides_dates_needed_column():
     row = _minimal_row()
     row["dates_needed"] = "Monday only"

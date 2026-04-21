@@ -342,6 +342,8 @@ def sync_missing_scrape_fields_to_salesforce(
         use_canonical_description=True,
         for_update=True,
         description_use_html=_canonical_description_use_html(),
+        conn=conn,
+        schema=schema,
     )
     if conn and jid_log and not (job_row.get("sf_worksite_account_id") or "").strip():
         _maybe_log(

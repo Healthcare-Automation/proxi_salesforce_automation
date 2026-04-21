@@ -220,6 +220,8 @@ def _try_create_sf_job_after_no_match(
                 for_update=False,
                 use_canonical_description=True,
                 description_use_html=use_html,
+                conn=conn,
+                schema=schema,
             )
             fields = filter_createable_fields(describe, fields)
             if not fields:
