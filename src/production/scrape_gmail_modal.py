@@ -44,6 +44,13 @@ _light_image = (
     .add_local_dir(_src_root / "utils", remote_path="/root/utils")
 )
 
+# Endpoint image: adds FastAPI so Modal's fastapi_endpoint decorator works.
+_endpoint_image = (
+    modal.Image.debian_slim()
+    .pip_install("psycopg2-binary", "python-dotenv", "fastapi")
+    .add_local_dir(_src_root / "utils", remote_path="/root/utils")
+)
+
 app = modal.App("salesforce-automation")
 
 # TEMPORARY: 2 h Gmail window (was 1 h). Keep lookback ≥ email window for dedupe.
@@ -195,6 +202,40 @@ def scrape_gmail_job():
     if failed > 0:
         print(f"⚠️ {failed} job(s) had errors - check logs for details")
 
+    # Tail: auto-recover unresolved SF push errors from the last 3 h. Best-effort;
+    # swallow exceptions so a recovery bug never breaks the primary scrape loop.
+    try:
+        from utils.sf_push_recovery import recover_recent_failures, resolve_sf_credentials
+        creds = resolve_sf_credentials()
+        if creds is None:
+            print("Recovery: SF credentials unavailable; skipping auto-recovery")
+        else:
+            instance_url, access_token = creds
+            with get_conn() as rec_conn:
+                if rec_conn:
+                    results = recover_recent_failures(
+                        rec_conn,
+                        access_token=access_token,
+                        instance_url=instance_url,
+                        hours=3.0,
+                        recovery_run_id=link_run_id,
+                        invocation="modal_auto",
+                        invoker=f"modal:scrape_gmail_job:{link_run_id or 'unknown'}",
+                    )
+                    rec_conn.commit()
+                    recovered = sum(1 for r in results if r.action == "re_parsed")
+                    dropped   = sum(1 for r in results if r.action == "field_dropped")
+                    transient = sum(1 for r in results if r.action == "transient_retried")
+                    quarantined = sum(1 for r in results if r.action == "quarantined")
+                    unhandled = sum(1 for r in results if r.action == "unhandled")
+                    print(
+                        f"Recovery: {len(results)} candidates · re_parsed={recovered} "
+                        f"field_dropped={dropped} transient_retried={transient} "
+                        f"quarantined={quarantined} unhandled={unhandled}"
+                    )
+    except Exception as e:
+        print(f"Recovery failed: {e}")
+
     return len(new_rows)
 
 
@@ -227,6 +268,71 @@ def daily_summary_job():
     ok = send_daily_summary(stats)
     print(f"daily_summary_job: email sent={ok}, stats={stats.get('scrape_attempts')} attempts")
     return ok
+
+
+# ── Admin-triggered recovery web endpoint (called by automation-hub) ──────────
+#
+# Exposes the recovery engine as a token-auth'd HTTP POST. Payload:
+#   { "jobIds": ["19664", ...], "sinceHours": 48, "dryRun": false }
+# Response: { "results": [...], "counts": { "re_parsed": N, ... } }
+
+@app.function(
+    image=_endpoint_image,
+    secrets=[modal.Secret.from_name("salesforce-automation")],
+    timeout=300,
+)
+@modal.fastapi_endpoint(method="POST")
+def recovery_endpoint(payload: dict):
+    sys.path.insert(0, "/root")
+    from fastapi import HTTPException, Header, Request
+    from utils.sf_push_recovery import recover_recent_failures, resolve_sf_credentials
+    from utils.supabase_db import get_conn
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    expected = (os.environ.get("RECOVERY_ENDPOINT_TOKEN") or "").strip()
+    supplied = (payload.get("token") or "").strip() if isinstance(payload, dict) else ""
+    if not expected or supplied != expected:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    job_ids    = [str(x).strip() for x in (payload.get("jobIds") or []) if str(x).strip()]
+    since_hrs  = float(payload.get("sinceHours") or 48.0)
+    dry_run    = bool(payload.get("dryRun"))
+    invoker    = str(payload.get("invoker") or "admin_ui")
+
+    since = _dt.now(_tz.utc) - _td(hours=since_hrs)
+
+    creds = None if dry_run else resolve_sf_credentials()
+    instance_url = creds[0] if creds else None
+    access_token = creds[1] if creds else None
+    if not dry_run and not creds:
+        raise HTTPException(status_code=503, detail="SF credentials not configured")
+
+    with get_conn() as conn:
+        if conn is None:
+            raise HTTPException(status_code=503, detail="DB connection unavailable")
+        results = recover_recent_failures(
+            conn,
+            access_token=access_token,
+            instance_url=instance_url,
+            since=since,
+            schema="public",
+            dry_run=dry_run,
+            job_ids=job_ids or None,
+            invocation="manual_admin_ui",
+            invoker=invoker,
+        )
+        if not dry_run:
+            conn.commit()
+
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r.action] = counts.get(r.action, 0) + 1
+    return {
+        "ok": True,
+        "dryRun": dry_run,
+        "counts": counts,
+        "results": [r.to_dict() for r in results],
+    }
 
 
 def _pair_runs(runs: list[dict]) -> list[dict]:
