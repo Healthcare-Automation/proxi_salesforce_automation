@@ -147,6 +147,12 @@ def _norm_heading(s: str) -> str:
     return (s or "").strip().lower().rstrip(":")
 
 
+def _is_insight_bullet_line(line: str) -> bool:
+    """Kimedics insight/footnote lines start with one or more ``*``. Break continuation on them."""
+    t = (line or "").lstrip()
+    return t.startswith("*")
+
+
 def _is_following_section_start(line: str) -> bool:
     """Heuristic: next titled block in Kimedics free-text descriptions."""
     t = line.strip()
@@ -214,6 +220,8 @@ def _section_after_heading(desc_lines: list[str], headings: tuple[str, ...]) -> 
                 if buf:
                     break
                 continue
+            if _is_insight_bullet_line(stripped):
+                break
             if _kimedics_inline_label_value(stripped) is not None:
                 break
             if _is_following_section_start(stripped) and buf:
@@ -242,6 +250,64 @@ _DESC_LABELED_LINE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^State\s*:\s*(.*)$", re.I), "state"),
 ]
 
+def _desc_label_token_matcher() -> re.Pattern[str]:
+    """
+    Regex matcher for *known* Kimedics description label tokens (strict allowlist).
+
+    Derived from ``_DESC_LABELED_LINE_PATTERNS`` by stripping the anchored ``^...:\s*(.*)$`` shape
+    into a non-anchored "label token" matcher that can be found within a longer physical line.
+    """
+    label_token_parts: list[str] = []
+    for pat, _field in _DESC_LABELED_LINE_PATTERNS:
+        p = pat.pattern
+        if not p.startswith("^"):
+            continue
+        if r"\s*:\s*(.*)$" not in p:
+            continue
+        token = p[1:].split(r"\s*:\s*(.*)$", 1)[0]
+        token = token.strip()
+        if token:
+            label_token_parts.append(token)
+    # Safety: if patterns change unexpectedly, return something that never matches.
+    if not label_token_parts:
+        return re.compile(r"a\A")
+    alt = "|".join(f"(?:{part})" for part in label_token_parts)
+    return re.compile(rf"(?P<label>(?:{alt}))\s*:\s*", re.I)
+
+
+_DESC_LABEL_TOKEN_MATCHER = _desc_label_token_matcher()
+
+
+def _split_chained_desc_labels_into_lines(description: str) -> str:
+    """
+    Normalize Kimedics description text so chained labels on one physical line become separate lines.
+
+    Only splits on a strict allowlist of labels the parser already understands (see
+    ``_DESC_LABELED_LINE_PATTERNS``). This avoids splitting arbitrary prose that happens to contain a ':'.
+    """
+    if not (description or "").strip():
+        return description or ""
+    out_lines: list[str] = []
+    for raw in (description or "").splitlines():
+        line = raw.rstrip("\r")
+        matches = list(_DESC_LABEL_TOKEN_MATCHER.finditer(line))
+        if len(matches) < 2:
+            out_lines.append(line)
+            continue
+
+        # Preserve any non-label prefix as its own line (rare, but avoids dropping text).
+        prefix = line[: matches[0].start()]
+        if prefix.strip():
+            out_lines.append(prefix.strip())
+
+        for idx, m in enumerate(matches):
+            start = m.start()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(line)
+            chunk = line[start:end].strip()
+            if chunk:
+                out_lines.append(chunk)
+    return "\n".join(out_lines)
+
 
 def _line_matches_any_desc_label(line: str) -> bool:
     s = (line or "").strip()
@@ -255,7 +321,7 @@ def _extract_labeled_description_fields(description: str) -> dict[str, str]:
     Kimedics-style 'Key: value' lines in the free-text description (often after Facility/Address).
     Values may continue on following lines until a blank line or another label line.
     """
-    desc = (description or "").strip()
+    desc = _split_chained_desc_labels_into_lines(description or "").strip()
     if not desc:
         return {}
     lines = desc.splitlines()
@@ -286,6 +352,8 @@ def _extract_labeled_description_fields(description: str) -> dict[str, str]:
             t = nxt.strip()
             if not t:
                 break
+            if _is_insight_bullet_line(t):
+                break
             if _line_matches_any_desc_label(nxt):
                 break
             if _kimedics_inline_label_value(nxt) is not None:
@@ -304,6 +372,10 @@ def _fill_from_description_blocks(out: dict) -> None:
     desc = (out.get("description_full_text") or "").strip()
     if not desc:
         return
+    # Kimedics / scraping can concatenate multiple `Label:` segments on one physical line.
+    # Normalize here as well so section-heading extraction doesn't treat a subsequent label as the
+    # "value" for the heading (e.g. `Avg patients per day: Additional requirements: ...`).
+    desc = _split_chained_desc_labels_into_lines(desc)
     lines = desc.splitlines()
 
     active_dates = extract_active_needs_dates(desc)

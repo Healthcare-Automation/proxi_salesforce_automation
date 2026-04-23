@@ -120,6 +120,62 @@ def test_avg_patients_per_day_from_labeled_line_in_description():
     assert (out.get("avg_patients_per_day") or "").strip() == "10-12"
 
 
+def test_avg_patients_blank_does_not_absorb_additional_requirements_when_same_line():
+    """
+    Regression: when Kimedics concatenates multiple labels on one physical line, the first label
+    must not absorb subsequent labels (e.g. Avg patients per day swallowing Additional requirements).
+    """
+    body = (
+        "Title #1\n"
+        "Location: City, ST\n"
+        "Practice\n"
+        "Some practice\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "Clinical Staff: 2 DA\n"
+        "Avg patients per day: Additional requirements: PPE required\n"
+    )
+    out = parse_job_content_txt(body)
+    assert (out.get("avg_patients_per_day") or "").strip() == ""
+    assert "ppe" in (out.get("additional_requirements") or "").lower()
+
+
+def test_multiple_labels_chained_on_one_line_are_split_and_extracted():
+    """
+    Regression: multiple label/value pairs may be chained on one physical line; each should be
+    extracted into its own field.
+    """
+    body = (
+        "Title #1\n"
+        "Location: City, ST\n"
+        "Practice\n"
+        "Some practice\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "Required procedures: Fillings and crowns. Avg patients per day: 10-12. Additional requirements: Wear PPE.\n"
+    )
+    out = parse_job_content_txt(body)
+    assert "fillings" in (out.get("required_procedures") or "").lower()
+    assert (out.get("avg_patients_per_day") or "").strip() == "10-12."
+    assert "ppe" in (out.get("additional_requirements") or "").lower()
+
+
+def test_three_labels_in_one_line_extract_all_without_cross_contamination():
+    body = (
+        "Title #1\n"
+        "Location: City, ST\n"
+        "Practice\n"
+        "Some practice\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "Clinical staff: 3 DA, 1 RDH Avg patients per day: 10-12 Additional requirements: none\n"
+    )
+    out = parse_job_content_txt(body)
+    assert "3 da" in (out.get("support_staff") or "").lower()
+    assert (out.get("avg_patients_per_day") or "").strip() == "10-12"
+    assert "none" in (out.get("additional_requirements") or "").lower()
+
+
 def test_roster_only_true_when_phrase_in_description():
     body = (
         "Title #1\n"
@@ -180,6 +236,226 @@ def test_avg_patients_per_day_from_section_heading():
     )
     out = parse_job_content_txt(body)
     assert "8 to 10" in (out.get("avg_patients_per_day") or "")
+
+
+def test_avg_patients_blank_does_not_absorb_asterisk_bullet_on_next_line():
+    """
+    Regression (job 19664): 'Avg patients per day:' with empty value followed by a bullet line
+    beginning with '*' (insight/footnote) must not be absorbed as the value. The bullet belongs
+    to ``insight``, not to the labeled field. Applies to any number of leading ``*``.
+    """
+    body = (
+        "Title #19664\n"
+        "KATY, TX\n"
+        "Practice\n"
+        "4217 - Katy, TX\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "Address: 20230 KATY FWY, KATY TX\n"
+        "\n"
+        "*Must have active TX DEA with all schedules at time of submission to be considered\n"
+        "**Previous Aspen experience required\n"
+        "***Local provider (no flights/rental car)\n"
+        "\n"
+        "Dates: May 18\n"
+        "Hours: 7:30a-5:30p\n"
+        "\n"
+        "Clinical Staff: 3 DA, 1 RDH\n"
+        "Required procedures: Surgical extractions, Denture steps, Comprehensive treatment planning\n"
+        "Avg patients per day:\n"
+        "***Additional requirements/ info: extractions could include simple/ surgical/ full mouth- please notate any limitations in presentation\n"
+    )
+    out = parse_job_content_txt(body)
+    assert (out.get("avg_patients_per_day") or "").strip() == ""
+    # Insight still captures all ``*``-prefixed lines including the trailing one.
+    insight = out.get("insight") or ""
+    assert "Must have active TX DEA" in insight
+    assert "Additional requirements/ info" in insight
+    # Other labeled fields remain correct.
+    assert "surgical extractions" in (out.get("required_procedures") or "").lower()
+    assert "3 DA" in (out.get("support_staff") or "")
+    assert (out.get("standard_schedule") or "").strip() == "7:30a-5:30p"
+
+
+def _make_body(*description_lines: str) -> str:
+    header = (
+        "Title #1\n"
+        "Loc, ST\n"
+        "Practice\n"
+        "x\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+    )
+    return header + "".join(line if line.endswith("\n") else line + "\n" for line in description_lines)
+
+
+def test_single_asterisk_bullet_after_empty_label_is_not_absorbed():
+    out = parse_job_content_txt(_make_body(
+        "Avg patients per day:",
+        "*CSR required",
+    ))
+    assert (out.get("avg_patients_per_day") or "").strip() == ""
+    assert "CSR required" in (out.get("insight") or "")
+
+
+def test_double_asterisk_bullet_after_empty_label_is_not_absorbed():
+    out = parse_job_content_txt(_make_body(
+        "Avg patients per day:",
+        "**Must have X license",
+    ))
+    assert (out.get("avg_patients_per_day") or "").strip() == ""
+    assert "Must have X license" in (out.get("insight") or "")
+
+
+def test_empty_required_procedures_not_absorbing_following_asterisk_bullet():
+    """The fix must apply to every labeled description field, not just avg_patients_per_day."""
+    out = parse_job_content_txt(_make_body(
+        "Required procedures:",
+        "*Must have active license",
+    ))
+    assert (out.get("required_procedures") or "").strip() == ""
+
+
+def test_empty_clinical_staff_not_absorbing_following_asterisk_bullet():
+    out = parse_job_content_txt(_make_body(
+        "Clinical Staff:",
+        "**Previous experience required",
+    ))
+    assert (out.get("support_staff") or "").strip() == ""
+
+
+def test_empty_dates_not_absorbing_following_asterisk_bullet():
+    out = parse_job_content_txt(_make_body(
+        "Dates:",
+        "***Local provider only",
+    ))
+    assert (out.get("dates_needed") or "").strip() == ""
+
+
+def test_empty_hours_not_absorbing_following_asterisk_bullet():
+    out = parse_job_content_txt(_make_body(
+        "Hours:",
+        "*All schedules required",
+    ))
+    assert (out.get("standard_schedule") or "").strip() == ""
+
+
+def test_avg_patients_inline_value_retained_when_next_line_is_bullet():
+    """Inline value on the label line must survive; bullet on next line stays in insight only."""
+    out = parse_job_content_txt(_make_body(
+        "Avg patients per day: 10-12",
+        "*See footnote on billing",
+    ))
+    assert (out.get("avg_patients_per_day") or "").strip() == "10-12"
+    assert "See footnote on billing" in (out.get("insight") or "")
+
+
+def test_avg_patients_section_heading_form_does_not_absorb_asterisk_bullet():
+    """Section-heading form ('Avg patients per day' with no colon) also must not absorb bullets."""
+    out = parse_job_content_txt(_make_body(
+        "Avg patients per day",
+        "***Additional requirements/ info: extractions could include limitations",
+    ))
+    assert (out.get("avg_patients_per_day") or "").strip() == ""
+    assert "Additional requirements/ info" in (out.get("insight") or "")
+
+
+def test_asterisk_bullet_between_labels_does_not_leak_into_prior_value():
+    """Bullet sandwiched between two labels must not extend the prior label's value."""
+    out = parse_job_content_txt(_make_body(
+        "Clinical Staff: 3 DA, 1 RDH",
+        "*Must have active DEA",
+        "Required procedures: Fillings",
+    ))
+    assert (out.get("support_staff") or "").strip() == "3 DA, 1 RDH"
+    assert "fillings" in (out.get("required_procedures") or "").lower()
+    assert "Must have active DEA" in (out.get("insight") or "")
+
+
+def test_asterisk_in_middle_of_line_is_not_treated_as_bullet():
+    """Only leading ``*`` marks an insight bullet; mid-line asterisks are regular content."""
+    out = parse_job_content_txt(_make_body(
+        "Avg patients per day:",
+        "10-12 (projected 5*2 per provider)",
+    ))
+    assert (out.get("avg_patients_per_day") or "").strip() == "10-12 (projected 5*2 per provider)"
+
+
+def test_blank_line_then_asterisk_bullet_does_not_cross_into_prior_empty_label():
+    """Blank line breaks continuation first; bullet afterwards must not backfill the empty value."""
+    out = parse_job_content_txt(_make_body(
+        "Avg patients per day:",
+        "",
+        "*CSR required",
+    ))
+    assert (out.get("avg_patients_per_day") or "").strip() == ""
+    assert "CSR required" in (out.get("insight") or "")
+
+
+def test_multiple_empty_labels_followed_by_single_trailing_bullet_all_empty():
+    """Stress: sequence of empty labels then one trailing bullet — every field should stay empty."""
+    out = parse_job_content_txt(_make_body(
+        "Required procedures:",
+        "Clinical Staff:",
+        "Avg patients per day:",
+        "***Additional requirements/ info: notate any limitations",
+    ))
+    assert (out.get("required_procedures") or "").strip() == ""
+    assert (out.get("support_staff") or "").strip() == ""
+    assert (out.get("avg_patients_per_day") or "").strip() == ""
+    assert "Additional requirements/ info" in (out.get("insight") or "")
+
+
+def test_leading_whitespace_before_asterisk_still_treated_as_bullet():
+    out = parse_job_content_txt(_make_body(
+        "Avg patients per day:",
+        "   *CSR required (indented)",
+    ))
+    assert (out.get("avg_patients_per_day") or "").strip() == ""
+    # Insight captures it because ``_extract_insight_lines`` strips before checking ``*``.
+    assert "CSR required" in (out.get("insight") or "")
+
+
+def test_valid_multiline_continuation_still_works_when_no_bullet_follows():
+    """Must not over-correct: continuation on subsequent non-bullet, non-label line still works."""
+    out = parse_job_content_txt(_make_body(
+        "Required procedures:",
+        "Fillings, crowns, and",
+        "surgical extractions",
+        "Avg patients per day: 12",
+    ))
+    rp = (out.get("required_procedures") or "").lower()
+    assert "fillings" in rp
+    assert "surgical extractions" in rp
+    assert (out.get("avg_patients_per_day") or "").strip() == "12"
+
+
+def test_sf_job_volume_omitted_when_avg_patients_empty_for_19664():
+    """
+    End-to-end guard: for the 19664 scenario, the SF payload must not set Job_Volume__c (which
+    would trip the 50-char max). This ties the parser fix to the downstream Salesforce result.
+    """
+    from utils.sf_job_payload import job_row_to_salesforce_fields
+
+    body = (
+        "Title #19664\n"
+        "KATY, TX\n"
+        "Practice\n"
+        "4217 - Katy, TX\n"
+        "...\n\n"
+        "--- Description (full text) ---\n"
+        "Address: 20230 KATY FWY, KATY TX\n"
+        "Dates: May 18\n"
+        "Hours: 7:30a-5:30p\n"
+        "Clinical Staff: 3 DA, 1 RDH\n"
+        "Required procedures: Surgical extractions\n"
+        "Avg patients per day:\n"
+        "***Additional requirements/ info: extractions could include simple/ surgical/ full mouth- please notate any limitations in presentation\n"
+    )
+    row = parse_job_content_txt(body)
+    row["job_id"] = "19664"
+    payload = job_row_to_salesforce_fields(row)
+    assert "Job_Volume__c" not in payload or payload.get("Job_Volume__c") is None
 
 
 def test_practice_value_backfilled_from_facility_when_header_has_job_title_on_line_3():

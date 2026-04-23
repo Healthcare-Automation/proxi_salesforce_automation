@@ -152,6 +152,7 @@ CANONICAL_JOB_C_PUSH_FIELD_NAMES: frozenset[str] = frozenset(
         "Job_Support_Staff__c",
         "Job_Provider_Start_Date__c",
         "Job_Provider_End_Date__c",
+        "Job_Open_Date__c",
         "Salary_Pay_Range__c",
         ROSTER_ONLY_FIELD,
         "Job_Ranking__c",
