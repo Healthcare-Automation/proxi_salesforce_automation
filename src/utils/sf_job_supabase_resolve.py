@@ -66,8 +66,17 @@ def _try_create_sf_job_after_no_match(
     row: dict,
     schema: str,
     run_id: Optional[int],
+    sf_jobs: Optional[list[dict]] = None,
 ) -> bool:
-    """POST new Job__c when unmapped; requires worksite Account Id (map or create). Returns True if created."""
+    """POST new Job__c when unmapped; requires worksite Account Id (map or create). Returns True if created.
+
+    When ``sf_jobs`` is provided, run a final safety check just before POST: if the
+    resolved worksite already has an existing Job__c whose ``Job_Client_Job_Id__c``
+    references the same city + state as ours, we are likely about to create a duplicate
+    (this happens when our practice_value is malformed, e.g. JD body has ``"419 -
+    Georgetown, KY"`` while the real worksite practice is ``"2419 - Georgetown, KY"``).
+    In that case we emit ``mapping_review_required`` and skip the create.
+    """
     from utils.supabase_db import (
         get_job_current,
         log_job_event,
@@ -154,6 +163,53 @@ def _try_create_sf_job_after_no_match(
         return False
 
     latest["sf_worksite_account_id"] = w
+
+    # ── Pre-create safety: do NOT create a duplicate Job__c at the same worksite. ──
+    # If the resolved worksite already hosts a Job__c whose Job_Client_Job_Id__c
+    # references our city/state, the most likely explanation is that our
+    # practice_value is malformed (e.g. "419 - Georgetown, KY" should be "2419 -
+    # Georgetown, KY"). Skip the create and flag for manual review.
+    if sf_jobs and w and city and state:
+        practice_raw = (latest.get("practice_value") or "").strip()
+        cl = city.lower()
+        su = state.upper()
+        suspicious: list[dict] = []
+        for j in sf_jobs:
+            j_w = (j.get("Job_Worksite_Location_1__c") or "").strip()
+            if j_w != w:
+                continue
+            j_practice = (j.get("Job_Client_Job_Id__c") or "")
+            if not j_practice:
+                continue
+            j_low = j_practice.lower()
+            if cl in j_low and su in j_practice.upper():
+                suspicious.append(j)
+        if suspicious:
+            log_job_event(
+                conn,
+                job_id=jid,
+                event_type="mapping_review_required",
+                schema=schema,
+                run_id=run_id,
+                payload={
+                    "reason": "existing_job_at_resolved_worksite_with_matching_location",
+                    "detail": (
+                        "Skipped Job__c create — the resolved worksite already has "
+                        "a Job__c with a Job_Client_Job_Id__c that matches our "
+                        "city/state. Our practice_value may be malformed. Manual "
+                        "review required."
+                    ),
+                    "candidate_practice_value": practice_raw[:200] or None,
+                    "city": city,
+                    "state": state,
+                    "worksite_account_id": w,
+                    "existing_sf_job_ids": [s.get("Id") for s in suspicious],
+                    "existing_practice_values": [
+                        (s.get("Job_Client_Job_Id__c") or "")[:200] for s in suspicious
+                    ],
+                },
+            )
+            return False
 
     eid_trim = _truncate_external_job_id(jid)
     if eid_trim:
@@ -611,7 +667,12 @@ def resolve_sf_ids_for_job_ids(
         )
         if _env_truthy("PROXI_SF_CREATE_JOBS"):
             if _try_create_sf_job_after_no_match(
-                conn, job_id=jid, row=row, schema=schema, run_id=run_id
+                conn,
+                job_id=jid,
+                row=row,
+                schema=schema,
+                run_id=run_id,
+                sf_jobs=sf_jobs,
             ):
                 updated += 1
 
