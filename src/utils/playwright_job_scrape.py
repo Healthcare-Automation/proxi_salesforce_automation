@@ -203,14 +203,18 @@ def _is_logged_out_page(text: str) -> bool:
 
 
 def _looks_like_job_content(text: str) -> bool:
-    """Positive signal that the text is real Kimedics job content."""
+    """Positive signal that the text is real Kimedics job content.
+
+    Pure positive-marker check. Do NOT call ``_is_logged_out_page`` from here:
+    that helper already calls back into this function to confirm it's *not*
+    real content, which created a mutual-recursion loop on body_texts that
+    happened to satisfy both branches' length and marker conditions
+    (RecursionError on job 19724). A real logged-out login page won't carry
+    the required markers below, so positive evidence is sufficient on its own.
+    """
     if not text or len(text.strip()) < 60:
         return False
     low = text.lower()
-
-    # If we detect logged out markers, it's definitely not job content
-    if _is_logged_out_page(text):
-        return False
 
     # Need strong evidence this is actual job content
     required_markers = ("job title", "posted date", "posting org")
