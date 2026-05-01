@@ -446,6 +446,49 @@ def manual_rescrape_endpoint(payload: dict):
     except Exception as e:
         print(f"manual_rescrape: SF retry tail failed (non-fatal): {e}")
 
+    # Audit: emit one ``manual_rescrape_completed`` event per scraped job so
+    # this rescrape shows up in the admin "Manual push log" alongside the
+    # existing recovery actions. Best-effort — must not fail the response.
+    try:
+        from utils.supabase_db import log_job_event
+
+        with get_conn() as ev_conn:
+            if ev_conn:
+                for r in scrape_results:
+                    cl = r.get("cleaned") or {}
+                    jid = (cl.get("job_id") or r.get("job_post_id") or "").strip()
+                    if not jid:
+                        continue
+                    parse_ok = bool((cl.get("title_line") or "").strip())
+                    err = r.get("error") or ""
+                    if parse_ok and not err:
+                        action = "re_scraped"
+                    elif parse_ok and err:
+                        action = "re_scraped_with_warning"
+                    else:
+                        action = "rescrape_parse_failed"
+                    log_job_event(
+                        ev_conn,
+                        job_id=jid,
+                        event_type="manual_rescrape_completed",
+                        run_id=link_run_id,
+                        schema="public",
+                        payload={
+                            "invocation": "manual_admin_ui",
+                            "invoker": invoker,
+                            "action": action,
+                            "link_run_id": link_run_id,
+                            "parse_ok": parse_ok,
+                            "title_line": cl.get("title_line") or "",
+                            "description_present": bool((cl.get("description_full_text") or "").strip()),
+                            "sf_job_id": cl.get("sf_job_id") or None,
+                            "error": err[:500] if err else None,
+                        },
+                    )
+                ev_conn.commit()
+    except Exception as e:
+        print(f"manual_rescrape: event audit log failed (non-fatal): {e}")
+
     return {
         "ok": True,
         "linkRunId": link_run_id,
