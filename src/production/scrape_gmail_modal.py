@@ -26,6 +26,13 @@ from pathlib import Path
 
 import modal
 
+# Band-aid for parser regex paths that recurse on unusual Kimedics body_text
+# (e.g. login-wall HTML interleaved with the real page). Pairs with the
+# try/except around _reconcile_practice_value_against_sf and the traceback
+# capture in playwright_job_scrape.py so we get a full stack on the next
+# occurrence rather than just losing the row.
+sys.setrecursionlimit(5000)
+
 _modal_dir = Path(__file__).resolve().parent
 _src_root  = _modal_dir.parent
 

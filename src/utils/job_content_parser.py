@@ -922,7 +922,19 @@ def parse_job_content_txt(text: str, sf_practice_map: Optional[dict] = None) -> 
 
     # Reconcile the chosen practice_value against Salesforce when we have a map.
     # No-op when sf_practice_map is None or no candidate has a 1:1 hit.
-    _reconcile_practice_value_against_sf(out, main_block, sf_practice_map)
+    # Defensive: a bug in this step (e.g. a regex blowing the recursion limit on
+    # an unusual sidebar) must not take out the whole parse. The heuristic
+    # value already in `out["practice_value"]` is a fine fallback.
+    try:
+        _reconcile_practice_value_against_sf(out, main_block, sf_practice_map)
+    except Exception as _exc:
+        import sys as _sys, traceback as _tb
+        print(
+            f"[parser] _reconcile_practice_value_against_sf failed; keeping heuristic value "
+            f"({out.get('practice_value')!r}). err={type(_exc).__name__}: {str(_exc)[:200]}",
+            file=_sys.stderr,
+        )
+        _tb.print_exc(file=_sys.stderr)
 
     city, st = _parse_city_state(out.get("practice_value") or "")
     if not city and not st:
