@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -618,12 +619,29 @@ def scrape_job_pages(
                     "email_scrape_id": email_scrape_id,
                 })
             except Exception as e:
+                # Preserve the traceback + a body sample so the next occurrence
+                # has enough context to pinpoint the failing frame instead of
+                # only the bare exception string. Recursion / regex catastrophic
+                # backtracking surfaces here when the parser hits unusual input.
+                tb_text = traceback.format_exc()
+                body_sample = ""
+                try:
+                    body_sample = (body_text or "")[:2000]
+                except Exception:
+                    body_sample = ""
+                print(
+                    f"[scrape-parse-error] job={job_id}\n{tb_text}\n"
+                    f"body[:2000]={body_sample!r}",
+                    file=sys.stderr,
+                )
                 results.append({
                     "job_post_id": job_id,
                     "email_received_date": email_date,
                     "view_job_link": url,
                     "cleaned": {},
-                    "error": str(e)[:200],
+                    "error": f"{type(e).__name__}: {str(e)[:200]}",
+                    "traceback": tb_text[-2000:],
+                    "body_sample": body_sample,
                     "email_scrape_id": email_scrape_id,
                 })
             if idx < total:
