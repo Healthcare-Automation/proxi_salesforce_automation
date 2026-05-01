@@ -13,6 +13,7 @@ Extraction stages (see job_content_ai for validate/fix):
 from __future__ import annotations
 
 import re
+from typing import Optional
 from pathlib import Path
 from typing import Union, Optional
 
@@ -704,6 +705,113 @@ def _backfill_practice_value(out: dict, main_block: str) -> None:
             return
 
 
+def _extract_practice_value_from_sidebar(main_block: str) -> str:
+    """
+    Pull the structured "Practice" value from the Kimedics web sidebar (which is
+    flattened into ``main_block`` via ``inner_text()`` during the Playwright scrape).
+
+    Pattern: a line equal to ``Practice`` (case-insensitive) followed by a non-label
+    line that looks like ``\\d{3,5}\\s*-\\s*City, ST``. This is a *standalone* lookup
+    that doesn't share state with the line-3 heuristic, so we can use it as a
+    high-trust candidate when reconciling.
+    """
+    if not main_block:
+        return ""
+    lines = [ln.strip() for ln in main_block.splitlines()]
+    for i, ln in enumerate(lines):
+        if ln.lower() != "practice":
+            continue
+        # Scan the next few non-empty lines (Kimedics sometimes inserts blanks).
+        for j in range(i + 1, min(i + 5, len(lines))):
+            nxt = lines[j]
+            if not nxt:
+                continue
+            if _normalize_key(nxt):
+                # Hit another label — abort this candidate.
+                break
+            if re.match(r"^\d{3,5}\s*-\s*.+", nxt) and re.search(r"[A-Za-z]", nxt) and _is_valid_practice_value(nxt):
+                return nxt
+            break
+    return ""
+
+
+def _practice_candidates(out: dict, main_block: str) -> list[tuple[str, str]]:
+    """
+    Build an ordered candidate list (most → least trustworthy) for the practice value.
+    Each entry is ``(source_label, raw_value)``. Used by ``parse_job_content_txt`` when
+    an SF practice map is provided so we can pick the candidate that already maps 1:1.
+    Deduplicated downstream by normalized practice key.
+    """
+    candidates: list[tuple[str, str]] = []
+    sidebar = _extract_practice_value_from_sidebar(main_block)
+    if sidebar and _is_valid_practice_value(sidebar):
+        candidates.append(("kimedics_sidebar", sidebar))
+    # The "primary" current heuristic value, whatever it ended up being.
+    primary = (out.get("practice_value") or "").strip()
+    if primary and _is_valid_practice_value(primary):
+        candidates.append(("header_or_existing", primary))
+    # The "first \\d{3,5} - City, ST" line in the description body — least trusted.
+    desc_line = _extract_practice_value_from_description(out.get("description_full_text") or "")
+    if desc_line and _is_valid_practice_value(desc_line):
+        candidates.append(("description_line", desc_line))
+    return candidates
+
+
+def _reconcile_practice_value_against_sf(
+    out: dict,
+    main_block: str,
+    sf_practice_map: Optional[dict],
+) -> None:
+    """
+    When ``sf_practice_map`` (``{practice_key → set[sf_job_id]}``) is provided, walk our
+    candidate list and pick the first one with a 1:1 hit in Salesforce. This catches
+    cases like a JD body that says "419 - Georgetown, KY" while the Kimedics sidebar
+    shows "2419 - Georgetown, KY" (the real value). No-op if the map is missing or
+    no candidate matches — we keep whatever the heuristics produced.
+    """
+    if not sf_practice_map:
+        return
+    try:
+        # Lazy import: keep parser usable in test contexts that don't have SF utils.
+        from utils.sf_practice_key import practice_key as _practice_key
+    except Exception:
+        return
+
+    candidates = _practice_candidates(out, main_block)
+    if len(candidates) < 2:
+        return  # Nothing to reconcile — only one candidate.
+
+    seen_keys: set[str] = set()
+    chosen: Optional[tuple[str, str, str]] = None  # (source, raw, key)
+    for source, raw in candidates:
+        key = _practice_key(raw)
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        hits = sf_practice_map.get(key)
+        if hits and len(hits) == 1:
+            chosen = (source, raw, key)
+            break
+
+    if not chosen:
+        return
+
+    source, raw, _key = chosen
+    current = (out.get("practice_value") or "").strip()
+    if raw == current:
+        return  # Already on the right value.
+    out["practice_value"] = raw
+    # Visible signal in batch logs that reconciliation flipped the value. We
+    # deliberately don't add a column for this — the right value is stored,
+    # and the run output captures what happened.
+    import sys as _sys
+    print(
+        f"[parser] practice_value reconciled via {source}: "
+        f"{current!r} -> {raw!r} (1:1 SF hit)",
+        file=_sys.stderr,
+    )
+
+
 # Kimedics job text (header + description): "roster only" / "roster-only" / "open to roster" → ``roster_only`` = true/false.
 _ROSTER_ONLY_PHRASE = re.compile(r"roster\s*[-]?\s*only", re.IGNORECASE)
 _OPEN_TO_ROSTER_PHRASE = re.compile(r"\bopen\s+to\s+roster\b", re.IGNORECASE)
@@ -741,10 +849,17 @@ def repair_flat_jobpost_text_missing_posted_date(flat_text: str, posted_date: Op
     return flat_text
 
 
-def parse_job_content_txt(text: str) -> dict:
+def parse_job_content_txt(text: str, sf_practice_map: Optional[dict] = None) -> dict:
     """
     Parse raw job post text into a single row dict with keys in JOB_CONTENT_COLUMNS.
     Never raises: missing/malformed data yields empty strings.
+
+    When ``sf_practice_map`` is provided (``{practice_key → set[sf_job_id]}``), reconcile
+    the chosen ``practice_value`` against Salesforce: collect all plausible candidates
+    (Kimedics sidebar > current heuristic > description-line) and pick the first one
+    that has a 1:1 hit in Salesforce. Catches typos like ``"419 - Georgetown, KY"``
+    in the JD body when the real value is ``"2419 - Georgetown, KY"`` in the sidebar.
+    Falls back to today's heuristic when the map isn't provided or no candidate matches.
     """
     out = {c: "" for c in JOB_CONTENT_COLUMNS}
     if not (text or "").strip():
@@ -804,6 +919,10 @@ def parse_job_content_txt(text: str) -> dict:
             i += 2
 
     _backfill_practice_value(out, main_block)
+
+    # Reconcile the chosen practice_value against Salesforce when we have a map.
+    # No-op when sf_practice_map is None or no candidate has a 1:1 hit.
+    _reconcile_practice_value_against_sf(out, main_block, sf_practice_map)
 
     city, st = _parse_city_state(out.get("practice_value") or "")
     if not city and not st:

@@ -812,3 +812,121 @@ Job Title
 Test Position"""
     result4 = parse_job_content_txt(text4)
     assert result4["practice_value"] == "Smile Dental Center"  # Valid practice name
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reconciliation against Salesforce practice map (job #19703-style scenarios).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# Build a minimal map shaped like the one assembled in
+# sf_job_supabase_resolve / playwright_job_scrape: { practice_key: {sf_job_id} }.
+def _make_sf_map(*pairs):
+    from utils.sf_practice_key import practice_key as _pk
+    m: dict = {}
+    for raw, sfid in pairs:
+        m.setdefault(_pk(raw), set()).add(sfid)
+    return m
+
+
+# Simulates the Kimedics web body_text: sidebar shows the *correct* practice
+# value, JD body shows the *typo* version. Without the SF map, today's heuristic
+# may pick either one (depending on which line lands first); with the map, we
+# pick the one that has a 1:1 SF hit.
+JOB_19703_BODY = """Dentistry (Dentist (DMD/DDS)) (#19703)
+GEORGETOWN, KY
+Practice
+2419 - Georgetown, KY
+Job Title
+#19703: Dentistry (Dentist (DMD/DDS))
+Posted Date
+04/28/26
+Posting Org
+Aspen Dental
+Priority
+Normal
+Status
+Active, accepting new providers
+Full Job Post
+Description
+*Must have DEA with all schedules
+
+419 - Georgetown, KY
+Address: 450 CONNECTOR RD, GEORGETOWN KY
+
+Dates: May 1-2
+Hours: 8a-1p
+
+--- Description (full text) ---
+*Must have DEA with all schedules
+
+419 - Georgetown, KY
+Address: 450 CONNECTOR RD, GEORGETOWN KY
+"""
+
+
+def test_reconcile_19703_picks_sidebar_when_sf_has_2419():
+    sf_map = _make_sf_map(("2419 - Georgetown, KY", "a01UP00000realJOB"))
+    out = parse_job_content_txt(JOB_19703_BODY, sf_practice_map=sf_map)
+    # Sidebar value (correct, matches SF) should win over JD body typo.
+    assert out["practice_value"] == "2419 - Georgetown, KY"
+
+
+def test_reconcile_falls_through_when_neither_candidate_matches_sf():
+    # SF doesn't have any matching practice — leave whatever heuristic chose.
+    sf_map = _make_sf_map(("9999 - Other Place, TX", "a01UP00000other"))
+    out = parse_job_content_txt(JOB_19703_BODY, sf_practice_map=sf_map)
+    # Unchanged from heuristic (header line picks 2419 since that's line 3).
+    assert out["practice_value"] == "2419 - Georgetown, KY"
+
+
+def test_reconcile_no_op_when_map_is_none():
+    out = parse_job_content_txt(JOB_19703_BODY, sf_practice_map=None)
+    # No reconciliation at all — same path as today's calls without the kwarg.
+    assert out["practice_value"] == "2419 - Georgetown, KY"
+
+
+def test_reconcile_picks_typo_candidate_when_sf_only_has_typo():
+    # Pathological: SF actually has the 3-digit version (rare; client typo on
+    # both sides). We pick the 1:1 SF match regardless of "trustworthiness".
+    sf_map = _make_sf_map(("419 - Georgetown, KY", "a01UP00000typo"))
+    # Use a body where the heuristic would pick "2419" (header line 3).
+    out = parse_job_content_txt(JOB_19703_BODY, sf_practice_map=sf_map)
+    assert out["practice_value"] == "419 - Georgetown, KY"
+
+
+def test_reconcile_skips_ambiguous_sf_matches():
+    # If the candidate hits >1 SF jobs, we don't pick it; fall through to next.
+    sf_map = _make_sf_map(
+        ("2419 - Georgetown, KY", "a01UP00000a"),
+        ("2419 - Georgetown, KY", "a01UP00000b"),  # 2 hits → ambiguous
+        ("419 - Georgetown, KY",  "a01UP00000c"),  # 1:1
+    )
+    out = parse_job_content_txt(JOB_19703_BODY, sf_practice_map=sf_map)
+    assert out["practice_value"] == "419 - Georgetown, KY"
+
+
+def test_reconcile_backward_compat_existing_call_signature():
+    # Existing callers use parse_job_content_txt(text). New optional arg must
+    # default to None and not change behavior.
+    out = parse_job_content_txt(JOB_19703_BODY)
+    assert "practice_value" in out  # still returns the dict, no crash
+
+
+def test_extract_practice_value_from_sidebar_only_takes_well_formed_lines():
+    from utils.job_content_parser import _extract_practice_value_from_sidebar
+
+    # Standard case.
+    body = "Practice\n2419 - Georgetown, KY\nJob Title\n#19703"
+    assert _extract_practice_value_from_sidebar(body) == "2419 - Georgetown, KY"
+
+    # No "Practice" label.
+    assert _extract_practice_value_from_sidebar("foo\nbar") == ""
+
+    # "Practice" followed by another label (no value present).
+    body2 = "Practice\nJob Title\n#19703"
+    assert _extract_practice_value_from_sidebar(body2) == ""
+
+    # "Practice" followed by something that doesn't look like a clinic id.
+    body3 = "Practice\nSign Out"
+    assert _extract_practice_value_from_sidebar(body3) == ""

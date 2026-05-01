@@ -458,6 +458,57 @@ def visit_and_extract(
 
 
 # ---------------------------------------------------------------------------
+# Salesforce practice map: load once per batch for parser reconciliation.
+# ---------------------------------------------------------------------------
+
+def _load_sf_practice_map_for_parser() -> Optional[dict]:
+    """
+    Build ``{practice_key → set[sf_job_id]}`` once per batch so the parser can
+    reconcile multiple practice-value candidates against Salesforce. Returns
+    ``None`` on any failure (missing creds, SF unreachable, etc.); the parser
+    treats ``None`` the same as "no reconciliation, use heuristic".
+    """
+    try:
+        import os as _os
+        from utils.salesforce import pull_jobs_for_id_resolve
+        from utils.sf_practice_key import practice_key
+
+        ck = (_os.environ.get("SALESFORCE_CONSUMER_KEY") or "").strip()
+        cs = (_os.environ.get("SALESFORCE_CONSUMER_SECRET") or "").strip()
+        if not ck or not cs:
+            return None
+
+        token_url = _os.environ.get("SALESFORCE_TOKEN_URL") or "https://proxi.my.salesforce.com"
+        use_sandbox = _os.environ.get("SALESFORCE_USE_SANDBOX", "").lower() in ("1", "true", "yes")
+        use_cc = _os.environ.get("SALESFORCE_USE_USERNAME_PASSWORD", "").lower() not in ("1", "true", "yes")
+
+        sf_jobs = pull_jobs_for_id_resolve(
+            consumer_key=ck,
+            consumer_secret=cs,
+            username=_os.environ.get("SALESFORCE_USERNAME") or None,
+            password=_os.environ.get("SALESFORCE_PASSWORD") or None,
+            use_client_credentials=use_cc,
+            token_url=token_url,
+            security_token=_os.environ.get("SALESFORCE_SECURITY_TOKEN") or None,
+            use_sandbox=use_sandbox,
+        )
+        m: dict = {}
+        for j in sf_jobs or []:
+            k = practice_key(j.get("Job_Client_Job_Id__c"))
+            if k:
+                m.setdefault(k, set()).add(j["Id"])
+        print(
+            f"[scrape] loaded SF practice map: "
+            f"{len(sf_jobs or [])} jobs -> {len(m)} unique practice keys",
+            file=sys.stderr,
+        )
+        return m
+    except Exception as exc:
+        print(f"[scrape] SF practice map load failed: {exc}", file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Public: batch scrape (used by Modal + run_incremental)
 # ---------------------------------------------------------------------------
 
@@ -472,6 +523,12 @@ def scrape_job_pages(
     One browser session; login on first URL.
     """
     from utils.job_content_parser import parse_job_content_txt
+
+    # Load Salesforce practice map ONCE for the whole batch so the parser can
+    # reconcile ambiguous practice candidates (e.g. "419 - Georgetown, KY" in
+    # the JD body vs. the real "2419 - Georgetown, KY" in the sidebar).
+    # Pure read against SF; failures degrade gracefully to today's heuristic.
+    sf_practice_map = _load_sf_practice_map_for_parser()
 
     try:
         from playwright.sync_api import sync_playwright
@@ -539,7 +596,7 @@ def scrape_job_pages(
                     })
                 elif not _looks_like_job_content(body_text):
                     # Parse it anyway but flag as suspicious
-                    cleaned = parse_job_content_txt(body_text)
+                    cleaned = parse_job_content_txt(body_text, sf_practice_map=sf_practice_map)
                     print(f"  WARNING for job {job_id}: Content doesn't match expected format", file=sys.stderr)
                     results.append({
                         "job_post_id": job_id,
@@ -551,7 +608,7 @@ def scrape_job_pages(
                     })
                 else:
                     # Success - valid content
-                    cleaned = parse_job_content_txt(body_text)
+                    cleaned = parse_job_content_txt(body_text, sf_practice_map=sf_practice_map)
                     results.append({
                         "job_post_id": job_id,
                         "email_received_date": email_date,
