@@ -51,6 +51,14 @@ _endpoint_image = (
     .add_local_dir(_src_root / "utils", remote_path="/root/utils")
 )
 
+# Rescrape endpoint image: Playwright + FastAPI (needs the browser to actually rescrape).
+_rescrape_image = (
+    modal.Image.debian_slim()
+    .pip_install("psycopg2-binary", "playwright", "python-dotenv", "openai>=1.0.0", "fastapi")
+    .run_commands("playwright install chromium", "playwright install-deps chromium")
+    .add_local_dir(_src_root / "utils", remote_path="/root/utils")
+)
+
 app = modal.App("salesforce-automation")
 
 # TEMPORARY: 2 h Gmail window (was 1 h). Keep lookback ≥ email window for dedupe.
@@ -268,6 +276,188 @@ def daily_summary_job():
     ok = send_daily_summary(stats)
     print(f"daily_summary_job: email sent={ok}, stats={stats.get('scrape_attempts')} attempts")
     return ok
+
+
+# ── Admin-triggered rescrape web endpoint (called by automation-hub) ──────────
+#
+# Re-runs the Kimedics scrape for an explicit list of job_ids — used when a
+# scheduled scrape produced an empty job_content row (login wall, page-structure
+# change) and the job sits stuck without an SF Job__c record. Payload:
+#   { "token": "...", "jobIds": ["19722", ...], "dryRun": false, "invoker": "..." }
+# Response: { "ok": true, "results": [...], "linkRunId": N, "counts": {...} }
+
+@app.function(
+    image=_rescrape_image,
+    secrets=[modal.Secret.from_name("salesforce-automation")],
+    timeout=600,
+)
+@modal.fastapi_endpoint(method="POST")
+def manual_rescrape_endpoint(payload: dict):
+    sys.path.insert(0, "/root")
+    from fastapi import HTTPException
+
+    # Accept either env-var name so the secret can be added under whichever key
+    # the operator already configured on the hub side.
+    expected = (
+        os.environ.get("RESCRAPE_ENDPOINT_TOKEN")
+        or os.environ.get("MODAL_RESCRAPE_TOKEN")
+        or ""
+    ).strip()
+    supplied = (payload.get("token") or "").strip() if isinstance(payload, dict) else ""
+    if not expected or supplied != expected:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    job_ids = [str(x).strip() for x in (payload.get("jobIds") or []) if str(x).strip()]
+    if not job_ids:
+        raise HTTPException(status_code=400, detail="jobIds required")
+    dry_run = bool(payload.get("dryRun"))
+    invoker = str(payload.get("invoker") or "admin_ui")
+
+    from utils.playwright_job_scrape import scrape_job_pages
+    from utils.pipeline_link_scrape import process_link_scrape_batch
+    from utils.supabase_db import get_conn, log_run_finish, log_run_start
+
+    kimedics_email = (os.environ.get("KIMEDICS_EMAIL") or "").strip()
+    kimedics_password = (os.environ.get("KIMEDICS_PASSWORD") or "").strip()
+    if not kimedics_email or not kimedics_password:
+        raise HTTPException(status_code=503, detail="KIMEDICS credentials not configured")
+
+    # For each requested job_id, look up the most recent email_scrapes row so the
+    # rescrape is anchored to the original email (so the resulting job_content
+    # row links back through email_scrape_id, matching the cron pipeline).
+    # Construct the Kimedics URL directly from the job_post_id rather than using
+    # the SendGrid redirect from the email — those tokens expire.
+    with_links: list[tuple[dict, int]] = []
+    skipped: list[dict] = []
+    seen_email_scrape_ids: set[int] = set()
+
+    with get_conn() as conn_lookup:
+        if conn_lookup is None:
+            raise HTTPException(status_code=503, detail="DB connection unavailable")
+        with conn_lookup.cursor() as cur:
+            for jid in job_ids:
+                cur.execute(
+                    """
+                    SELECT id, job_post_id, view_job_link, subject, action_or_change, created_at, "date"
+                    FROM email_scrapes
+                    WHERE job_post_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (jid,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    skipped.append({"job_id": jid, "reason": "no_email_scrape_found"})
+                    continue
+                es_id, job_post_id, _link, subject, action, created_at, email_date = row
+                if int(es_id) in seen_email_scrape_ids:
+                    continue
+                seen_email_scrape_ids.add(int(es_id))
+                synthetic_row = {
+                    "job_post_id": str(job_post_id or jid),
+                    "view_job_link": f"https://portal.kimedics.com/app/workspace/job-posts/{job_post_id or jid}",
+                    "subject": subject or "",
+                    "action_or_change": action or "",
+                    "date": email_date or created_at,
+                }
+                with_links.append((synthetic_row, int(es_id)))
+
+    if not with_links:
+        return {
+            "ok": True,
+            "linkRunId": None,
+            "counts": {},
+            "results": [],
+            "skipped": skipped,
+            "dryRun": dry_run,
+            "invoker": invoker,
+        }
+
+    print(f"manual_rescrape: scraping {len(with_links)} job page(s) (invoker={invoker})")
+    if dry_run:
+        return {
+            "ok": True,
+            "linkRunId": None,
+            "counts": {},
+            "results": [{"job_id": r[0]["job_post_id"], "action": "would_rescrape"} for r in with_links],
+            "skipped": skipped,
+            "dryRun": True,
+            "invoker": invoker,
+        }
+
+    scrape_results = scrape_job_pages(with_links, kimedics_email, kimedics_password)
+
+    link_run_id = None
+    touched: set[str] = set()
+    with get_conn() as conn:
+        if conn is None:
+            raise HTTPException(status_code=503, detail="DB connection unavailable")
+        link_run_id = log_run_start(conn, "link_batch", ["job_post_id", "error"])
+        try:
+            touched = process_link_scrape_batch(
+                conn,
+                link_run_id=link_run_id,
+                scrape_results=scrape_results,
+                schema="public",
+            )
+            if link_run_id:
+                log_run_finish(conn, link_run_id)
+            conn.commit()
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"rescrape pipeline failed: {e}")
+
+    # Best-effort SF push retry on the just-touched job_ids (mirrors the cron's
+    # tail-recovery step) so a freshly written job_content row that hits a
+    # transient SF error gets a second chance immediately.
+    counts: dict[str, int] = {}
+    try:
+        from utils.sf_push_recovery import recover_recent_failures, resolve_sf_credentials
+
+        creds = resolve_sf_credentials()
+        if creds and touched:
+            instance_url, access_token = creds
+            with get_conn() as rec_conn:
+                if rec_conn:
+                    rec_results = recover_recent_failures(
+                        rec_conn,
+                        access_token=access_token,
+                        instance_url=instance_url,
+                        hours=1.0,
+                        recovery_run_id=link_run_id,
+                        invocation="manual_admin_ui",
+                        invoker=f"manual_rescrape:{invoker}",
+                        job_ids=list(touched),
+                    )
+                    rec_conn.commit()
+                    for rr in rec_results:
+                        counts[rr.action] = counts.get(rr.action, 0) + 1
+    except Exception as e:
+        print(f"manual_rescrape: SF retry tail failed (non-fatal): {e}")
+
+    return {
+        "ok": True,
+        "linkRunId": link_run_id,
+        "counts": counts,
+        "results": [
+            {
+                "job_id": r.get("cleaned", {}).get("job_id") or r.get("job_post_id"),
+                "job_post_id": r.get("job_post_id"),
+                "error": r.get("error"),
+                "title_line": (r.get("cleaned") or {}).get("title_line"),
+                "description_present": bool((r.get("cleaned") or {}).get("description_full_text")),
+            }
+            for r in scrape_results
+        ],
+        "skipped": skipped,
+        "touchedJobIds": sorted(touched),
+        "dryRun": False,
+        "invoker": invoker,
+    }
 
 
 # ── Admin-triggered recovery web endpoint (called by automation-hub) ──────────
