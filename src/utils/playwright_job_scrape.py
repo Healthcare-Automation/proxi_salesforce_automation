@@ -31,8 +31,19 @@ BETWEEN_URLS_S = 0.5
 WAIT_FOR_CONTENT_OR_LOGIN_MS = 20_000
 
 # Maximum number of times we retry a single URL when we detect a login page.
-# Increased to be more aggressive about getting logged in
-MAX_LOGIN_RETRIES = 5
+# Two attempts is enough — if a fresh login still produces a login/logged-out
+# page, the auth is broken at the source (Kimedics down, password rotated, IP
+# rate-limited). Retry-count > 2 just burns the Modal timeout budget on a
+# request that won't recover on this run; the auto-retry tail will pick it up
+# later when auth is healthy again.
+MAX_LOGIN_RETRIES = 2
+
+# Batch-level circuit breaker. After this many consecutive jobs in the same
+# batch fail with "looks logged out / login page" after MAX_LOGIN_RETRIES, the
+# remaining jobs are fast-failed with `error="auth_broken_skipped"` instead of
+# burning ~MAX_LOGIN_RETRIES*45s each. Saves the Modal job from timing out and
+# orphaning email_scrapes silently when Kimedics auth is broken globally.
+AUTH_BROKEN_SKIP_THRESHOLD = 2
 
 # Tokens that indicate the extracted text is a login/auth page, not job content.
 _LOGIN_PAGE_MARKERS = frozenset({
@@ -566,10 +577,33 @@ def scrape_job_pages(
         _navigate_and_login_if_needed(page, login_url, kimedics_email, kimedics_password)
 
         # Phase 2 — visit each URL.
+        # Track consecutive auth failures to fast-fail the rest of the batch
+        # when Kimedics auth is broken globally (see AUTH_BROKEN_SKIP_THRESHOLD).
+        consecutive_auth_fails = 0
         for idx, (row, email_scrape_id) in enumerate(rows_with_email_scrape_id, 1):
             job_id = row.get("job_post_id", "")
             url = (row.get("view_job_link") or "").strip()
             email_date = row.get("date")
+
+            # Circuit breaker: skip remaining jobs if consecutive auth-failures
+            # have already proven Kimedics auth is broken on this run. The
+            # auto-retry tail will retry these later when auth recovers.
+            if consecutive_auth_fails >= AUTH_BROKEN_SKIP_THRESHOLD:
+                print(
+                    f"  [auth-broken-skip] job {job_id} skipped — {consecutive_auth_fails} consecutive auth failures earlier in batch",
+                    file=sys.stderr,
+                )
+                results.append({
+                    "job_post_id": job_id,
+                    "email_received_date": email_date,
+                    "view_job_link": url,
+                    "cleaned": {},
+                    "error": "auth_broken_skipped",
+                    "authentication_failed": True,
+                    "email_scrape_id": email_scrape_id,
+                })
+                continue
+
             try:
                 body_text, desc_value = visit_and_extract(
                     page, url, job_id, kimedics_email, kimedics_password,
@@ -578,6 +612,7 @@ def scrape_job_pages(
                     body_text = body_text + "\n\n--- Description (full text) ---\n" + desc_value
                 # Check if we got valid content or authentication failed
                 if _is_logged_out_page(body_text):
+                    consecutive_auth_fails += 1
                     error_msg = "AUTHENTICATION_FAILED: Detected 'Sign Out' - not logged in"
                     print(f"  ERROR for job {job_id}: {error_msg}", file=sys.stderr)
                     results.append({
@@ -589,6 +624,7 @@ def scrape_job_pages(
                         "authentication_failed": True,
                     })
                 elif not body_text.strip():
+                    consecutive_auth_fails += 1
                     error_msg = "NO_CONTENT: Failed to extract any content after retries"
                     print(f"  ERROR for job {job_id}: {error_msg}", file=sys.stderr)
                     results.append({
@@ -613,6 +649,7 @@ def scrape_job_pages(
                     })
                 else:
                     # Success - valid content
+                    consecutive_auth_fails = 0
                     cleaned = parse_job_content_txt(body_text, sf_practice_map=sf_practice_map)
                     results.append({
                         "job_post_id": job_id,

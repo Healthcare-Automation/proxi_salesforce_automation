@@ -23,6 +23,7 @@ Run once (manual):
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import modal
 
@@ -251,7 +252,212 @@ def scrape_gmail_job():
     except Exception as e:
         print(f"Recovery failed: {e}")
 
+    # Tail: auto-retry orphaned email_scrapes (failed/never-processed). Picks
+    # up jobs that earlier runs couldn't scrape (Modal preemption, broken auth,
+    # AUTH_BROKEN_SKIP_THRESHOLD, parser crashes) once Kimedics is healthy
+    # again. Same anchor as the original — uses the existing email_scrape_id,
+    # so the resulting job_content links back to the original gmail run and
+    # the validation popup remains coherent.
+    try:
+        _auto_retry_orphaned_scrapes(
+            kimedics_email=kimedics_email,
+            kimedics_password=kimedics_password,
+        )
+    except Exception as e:
+        print(f"Auto-retry tail failed (non-fatal): {e}")
+
     return len(new_rows)
+
+
+# Per-cron caps. Keep the auto-retry tail bounded so it never threatens the
+# primary 10-min Modal timeout, even with the new circuit breaker.
+_AUTO_RETRY_MAX_PER_CRON = 3        # at most N orphaned jobs picked per run
+_AUTO_RETRY_MAX_ATTEMPTS = 6        # give up after this many auto-retries
+# Exponential backoff: 5min, 10, 20, 40, 80, 160 → ~5.3h total before giveup.
+_AUTO_RETRY_BACKOFF_BASE_MIN = 5
+# Don't retry until the original cron has had a chance to run + finish.
+_AUTO_RETRY_GRACE_MIN = 5
+# Don't bother with email_scrapes older than this — let the operator decide.
+_AUTO_RETRY_LOOKBACK_HOURS = 24
+
+
+def _auto_retry_orphaned_scrapes(*, kimedics_email: str, kimedics_password: str) -> None:
+    """
+    Find email_scrapes rows with no matching job_content (orphaned by an
+    earlier failure) and re-run the scrape pipeline against them, with
+    exponential backoff so we don't thrash a known-broken job. Each attempt
+    emits an ``auto_retry_completed`` event mirroring the manual_rescrape
+    audit shape — the hub surfaces these in the Manual push log and uses
+    them as a resolution path on the Stuck job creation list.
+    """
+    sys.path.insert(0, "/root")
+    from utils.playwright_job_scrape import scrape_job_pages
+    from utils.pipeline_link_scrape import process_link_scrape_batch
+    from utils.supabase_db import get_conn, log_job_event, log_run_finish, log_run_start
+
+    if not kimedics_email or not kimedics_password:
+        print("Auto-retry: KIMEDICS credentials missing; skipping")
+        return
+
+    candidates: list[dict] = []
+    with get_conn() as conn:
+        if conn is None:
+            return
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  es.id            AS email_scrape_id,
+                  es.job_post_id   AS job_id,
+                  es.run_id        AS gmail_run_id,
+                  es.view_job_link AS view_job_link,
+                  es.subject       AS subject,
+                  es.action_or_change AS action_or_change,
+                  es."date"        AS email_date,
+                  es.created_at    AS email_created_at,
+                  COALESCE(att.n, 0)            AS prior_attempts,
+                  att.last_attempt_at           AS last_attempt_at
+                FROM email_scrapes es
+                LEFT JOIN job_content jc ON jc.email_scrape_id = es.id
+                LEFT JOIN LATERAL (
+                  SELECT count(*)::int AS n, MAX(jel.created_at) AS last_attempt_at
+                  FROM job_event_log jel
+                  WHERE jel.event_type = 'auto_retry_completed'
+                    AND (jel.payload->>'email_scrape_id') = es.id::text
+                ) att ON true
+                WHERE jc.id IS NULL
+                  AND es.job_post_id IS NOT NULL
+                  AND es.job_post_id <> ''
+                  AND es.created_at >= NOW() - (%s::text || ' hours')::interval
+                  AND es.created_at <  NOW() - (%s::text || ' minutes')::interval
+                  AND COALESCE(att.n, 0) < %s
+                  AND (
+                    att.last_attempt_at IS NULL
+                    OR att.last_attempt_at <
+                       NOW() - ((%s * POWER(2, COALESCE(att.n, 0)))::text || ' minutes')::interval
+                  )
+                ORDER BY COALESCE(att.n, 0) ASC, es.created_at DESC
+                LIMIT %s
+                """,
+                (
+                    _AUTO_RETRY_LOOKBACK_HOURS,
+                    _AUTO_RETRY_GRACE_MIN,
+                    _AUTO_RETRY_MAX_ATTEMPTS,
+                    _AUTO_RETRY_BACKOFF_BASE_MIN,
+                    _AUTO_RETRY_MAX_PER_CRON,
+                ),
+            )
+            for row in cur.fetchall():
+                candidates.append({
+                    "email_scrape_id": int(row[0]),
+                    "job_id": str(row[1] or ""),
+                    "gmail_run_id": int(row[2]) if row[2] is not None else None,
+                    "view_job_link": (row[3] or "").strip(),
+                    "subject": row[4] or "",
+                    "action_or_change": row[5] or "",
+                    "email_date": row[6],
+                    "email_created_at": row[7],
+                    "prior_attempts": int(row[8] or 0),
+                })
+
+    if not candidates:
+        return
+
+    print(f"Auto-retry: picking up {len(candidates)} orphaned scrape(s)")
+
+    # Build the with_links tuples the way the cron does. Use the canonical
+    # Kimedics URL (rebuilt from job_post_id) rather than the SendGrid redirect
+    # — those tokens expire and we've already failed once on this URL.
+    with_links: list[tuple[dict, int]] = []
+    for c in candidates:
+        synthetic_row = {
+            "job_post_id": c["job_id"],
+            "view_job_link": f"https://portal.kimedics.com/app/workspace/job-posts/{c['job_id']}",
+            "subject": c["subject"],
+            "action_or_change": c["action_or_change"],
+            "date": c["email_date"] or c["email_created_at"],
+        }
+        with_links.append((synthetic_row, c["email_scrape_id"]))
+
+    # Re-scrape using the same Playwright pipeline (now retry-capped + circuit
+    # broken). If auth is broken, the circuit breaker fast-fails the rest and
+    # the next cron will pick them up.
+    scrape_results = scrape_job_pages(with_links, kimedics_email, kimedics_password)
+
+    retry_run_id: Optional[int] = None
+    touched: set[str] = set()
+    with get_conn() as conn:
+        if conn is None:
+            return
+        retry_run_id = log_run_start(conn, "link_batch", ["job_post_id", "error", "auto_retry"])
+        try:
+            touched = process_link_scrape_batch(
+                conn,
+                link_run_id=retry_run_id,
+                scrape_results=scrape_results,
+                schema="public",
+            )
+            if retry_run_id:
+                log_run_finish(conn, retry_run_id)
+            conn.commit()
+        except Exception as e:
+            try: conn.rollback()
+            except Exception: pass
+            print(f"Auto-retry: pipeline write failed: {e}")
+            return
+
+    # Audit: emit one auto_retry_completed event per scraped job. Same payload
+    # shape as manual_rescrape_completed so the hub's Manual push log query
+    # can surface it with no extra logic.
+    try:
+        with get_conn() as ev_conn:
+            if ev_conn:
+                for c, r in zip(candidates, scrape_results):
+                    cl = r.get("cleaned") or {}
+                    jid = (cl.get("job_id") or r.get("job_post_id") or c["job_id"]).strip()
+                    if not jid:
+                        continue
+                    parse_ok = bool((cl.get("title_line") or "").strip())
+                    err = r.get("error") or ""
+                    if err == "auth_broken_skipped":
+                        action = "auth_broken_skipped"
+                    elif parse_ok and not err:
+                        action = "re_scraped"
+                    elif parse_ok and err:
+                        action = "re_scraped_with_warning"
+                    else:
+                        action = "rescrape_parse_failed"
+                    log_job_event(
+                        ev_conn,
+                        job_id=jid,
+                        event_type="auto_retry_completed",
+                        run_id=retry_run_id,
+                        schema="public",
+                        payload={
+                            "invocation": "auto_retry",
+                            "invoker": f"modal:scrape_gmail_job:{retry_run_id or 'unknown'}",
+                            "action": action,
+                            "link_run_id": retry_run_id,
+                            "email_scrape_id": str(c["email_scrape_id"]),
+                            "original_run_id": c["gmail_run_id"],
+                            "attempt_n": c["prior_attempts"] + 1,
+                            "parse_ok": parse_ok,
+                            "title_line": cl.get("title_line") or "",
+                            "description_present": bool((cl.get("description_full_text") or "").strip()),
+                            "sf_job_id": cl.get("sf_job_id") or None,
+                            "error": err[:500] if err else None,
+                        },
+                    )
+                ev_conn.commit()
+    except Exception as e:
+        print(f"Auto-retry: audit log failed (non-fatal): {e}")
+
+    ok = sum(1 for r in scrape_results if not r.get("error") and (r.get("cleaned") or {}).get("title_line"))
+    skipped = sum(1 for r in scrape_results if (r.get("error") or "") == "auth_broken_skipped")
+    print(
+        f"Auto-retry done: {ok}/{len(scrape_results)} succeeded "
+        f"(skipped={skipped}, touched={sorted(touched)}, retry_run_id={retry_run_id})"
+    )
 
 
 # ── Daily summary (9 AM ET = 13:00 UTC, covers EDT; adjust for EST in winter) ─
