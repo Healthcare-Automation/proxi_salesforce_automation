@@ -69,9 +69,14 @@ _rescrape_image = (
 
 app = modal.App("salesforce-automation")
 
-# TEMPORARY: 2 h Gmail window (was 1 h). Keep lookback ≥ email window for dedupe.
-EMAIL_HOURS             = 2.0
-SUPABASE_LOOKBACK_HOURS = 3.0
+# Gmail fetch window. Wide on purpose: every 10-min cron tick re-checks the
+# last day's emails, so anything we missed (Modal preempted before
+# log_email_scrapes committed, IMAP blip, a skipped cron tick) gets logged
+# within ~10 min instead of being lost forever. Dedup against email_scrapes
+# (job_post_id, date) prevents reprocessing. SUPABASE_LOOKBACK_HOURS must be
+# >= EMAIL_HOURS or the dedup set misses edge-of-window rows.
+EMAIL_HOURS             = 24.0
+SUPABASE_LOOKBACK_HOURS = 26.0
 
 # Immediately alert when a job triggers either of these thresholds.
 # (Matching logic lives in scrape_validator.should_send_immediate_alert)
