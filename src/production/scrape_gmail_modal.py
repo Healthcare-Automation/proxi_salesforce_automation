@@ -1017,7 +1017,9 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
                 FROM window_emails we
                 LEFT JOIN jc_by_email jc ON jc.email_scrape_id = we.id
                 LEFT JOIN events      ev ON ev.email_scrape_id = we.id
-                ORDER BY we.created_at ASC
+                -- Sort by Gmail received time (same as the Time column) so
+                -- the table reads chronologically by what the operator sees.
+                ORDER BY we.received_at ASC
                 """,
                 {"start": start_utc, "end": end_utc},
             )
