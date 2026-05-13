@@ -878,32 +878,46 @@ def _pair_runs(runs: list[dict]) -> list[dict]:
 
 def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_summary) -> dict:
     """
-    Query Supabase for the last 24 h and return a stats dict for send_daily_summary.
-    Isolated into a helper so it can be tested locally without Modal.
+    Build the daily report dataset: one row per email_scrape in the day window
+    (5:00 AM – 11:59 PM ET of the previous calendar day, DST-aware), with all
+    downstream pipeline outcomes joined in (scrape result, SF mapping, field
+    patches, new-Job creation, External_Job_ID swap, manual rescrape, auto-
+    retry, stuck status). The email-row is the unit of reporting.
     """
     import psycopg2.extras
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, time, timezone, timedelta
+    try:
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+    except Exception:
+        # Fallback for environments without IANA tzdata: fixed -5 (EST). DST
+        # will be off by an hour in the summer — best effort.
+        ET = timezone(timedelta(hours=-5))
 
-    now    = datetime.now(timezone.utc)
-    since  = now - timedelta(hours=24)
-    period = f"{since.strftime('%b %-d')}–{now.strftime('%-d, %Y')}"
+    # Yesterday 5:00 AM ET → 23:59:59 ET, converted to UTC for the SQL.
+    now_et       = datetime.now(ET)
+    report_date  = (now_et - timedelta(days=1)).date()
+    start_et     = datetime.combine(report_date, time(5, 0, 0), tzinfo=ET)
+    end_et       = datetime.combine(report_date, time(23, 59, 59), tzinfo=ET)
+    start_utc    = start_et.astimezone(timezone.utc)
+    end_utc      = end_et.astimezone(timezone.utc)
+    period_label = f"{start_et.strftime('%b %-d, %Y')} · 5:00 AM – 11:59 PM ET"
 
-    stats = {
-        "period_label":       period,
-        "emails_received":    0,
-        "scrape_attempts":    0,
-        "scrape_success":     0,
-        "scrape_partial":     0,
-        "scrape_failed":      0,
-        "total_warnings":     0,
-        "total_criticals":    0,
-        "sf_mapped":          0,   # has sf_job_id
-        "sf_unmapped":        0,   # scraped but no sf_job_id yet
-        "sf_worksite_mapped": 0,   # has sf_worksite_account_id
-        "sf_unmapped_jobs":   [],  # list of {job_post_id, job_title, status, view_job_link, scraped_at}
-        "example_jobs":       [],
-        "issue_log":          [],
-        "runs":               [],
+    stats: dict = {
+        "period_label":         period_label,
+        "window_start_utc":     start_utc,
+        "window_end_utc":       end_utc,
+        "emails_received":      0,
+        "scraped_ok":           0,
+        "sf_mapped":            0,
+        "sf_jobs_created":      0,
+        "field_patches_total":  0,
+        "ext_id_swaps":         0,
+        "manual_rescrapes":     0,
+        "auto_retries":         0,
+        "stuck_jobs":           0,
+        "scrape_failures":      0,
+        "rows":                 [],
     }
 
     with get_conn() as conn:
@@ -912,119 +926,110 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
             return stats
 
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-
-            # ── Email scrapes (last 24h) ─────────────────────────────────────
+            # One row per email_scrape with everything we need joined in.
+            # Anchor events on jel.job_id = email_scrape.job_post_id within a
+            # generous window after the email (matches the validation popup's
+            # behavior).
             cur.execute(
-                "SELECT COUNT(*) AS n FROM email_scrapes WHERE created_at > %s;",
-                (since,),
+                """
+                WITH window_emails AS (
+                  SELECT id, job_post_id, run_id, view_job_link, subject,
+                         action_or_change, created_at
+                  FROM email_scrapes
+                  WHERE created_at >= %(start)s AND created_at <= %(end)s
+                ),
+                jc_by_email AS (
+                  SELECT email_scrape_id,
+                    bool_or(COALESCE(title_line, '') <> ''
+                            AND COALESCE(description_full_text, '') <> '') AS scrape_ok,
+                    bool_or(COALESCE(sf_job_id, '') <> '')                 AS sf_mapped,
+                    (array_agg(DISTINCT sf_job_id) FILTER (WHERE COALESCE(sf_job_id,'') <> ''))[1] AS sf_job_id,
+                    (array_agg(job_title  ORDER BY created_at DESC) FILTER (WHERE COALESCE(job_title,'') <> ''))[1] AS job_title,
+                    (array_agg(posting_org ORDER BY created_at DESC) FILTER (WHERE COALESCE(posting_org,'') <> ''))[1] AS posting_org,
+                    (array_agg(practice_value ORDER BY created_at DESC) FILTER (WHERE COALESCE(practice_value,'') <> ''))[1] AS practice_value
+                  FROM job_content
+                  WHERE email_scrape_id IN (SELECT id FROM window_emails)
+                  GROUP BY email_scrape_id
+                ),
+                events AS (
+                  -- Per-email aggregates of downstream events. We anchor by
+                  -- job_id (Kimedics) + a generous 7-day window after the
+                  -- email arrived. This is the same logic the validation
+                  -- popup uses.
+                  SELECT we.id AS email_scrape_id,
+                    count(*) FILTER (WHERE jel.event_type = 'sf_scrape_fields_patched') AS patch_events,
+                    COALESCE(SUM(jsonb_array_length(COALESCE(jel.payload->'fields_changed','[]'::jsonb)))
+                             FILTER (WHERE jel.event_type = 'sf_scrape_fields_patched'), 0) AS fields_changed,
+                    bool_or(jel.event_type = 'job_created_in_salesforce')              AS created_sf_job,
+                    bool_or(
+                      jel.event_type = 'sf_scrape_fields_patched'
+                      AND jel.payload->'fields_changed' ? 'External_Job_ID__c'
+                      AND COALESCE(jel.payload->'prev'->>'External_Job_ID__c','') <> ''
+                      AND COALESCE(jel.payload->'prev'->>'External_Job_ID__c','')
+                          <> COALESCE(jel.payload->'next'->>'External_Job_ID__c','')
+                    ) AS ext_id_swap,
+                    bool_or(jel.event_type = 'manual_rescrape_completed')              AS manual_rescraped,
+                    bool_or(jel.event_type = 'auto_retry_completed')                   AS auto_retried,
+                    -- Unresolved failure (same logic as Stuck job creation list).
+                    bool_or(
+                      jel.event_type IN ('job_create_failed', 'worksite_create_failed')
+                      AND NOT EXISTS (
+                        SELECT 1 FROM job_event_log ok
+                        WHERE ok.job_id = jel.job_id
+                          AND ok.event_type = 'job_created_in_salesforce'
+                          AND ok.created_at >= jel.created_at
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM job_event_log rs
+                        WHERE rs.job_id = jel.job_id
+                          AND rs.event_type IN ('manual_rescrape_completed', 'auto_retry_completed')
+                          AND rs.created_at >= jel.created_at
+                          AND COALESCE(rs.payload->>'action','') IN ('re_scraped','re_scraped_with_warning')
+                      )
+                    ) AS stuck
+                  FROM window_emails we
+                  LEFT JOIN job_event_log jel
+                    ON jel.job_id = we.job_post_id
+                   AND jel.created_at >= we.created_at - INTERVAL '5 minutes'
+                   AND jel.created_at <= we.created_at + INTERVAL '7 days'
+                  GROUP BY we.id
+                )
+                SELECT
+                  we.id, we.job_post_id, we.subject, we.action_or_change,
+                  we.view_job_link, we.created_at,
+                  COALESCE(jc.scrape_ok, false)    AS scrape_ok,
+                  COALESCE(jc.sf_mapped, false)    AS sf_mapped,
+                  jc.sf_job_id, jc.job_title, jc.posting_org, jc.practice_value,
+                  COALESCE(ev.patch_events, 0)     AS patch_events,
+                  COALESCE(ev.fields_changed, 0)   AS fields_changed,
+                  COALESCE(ev.created_sf_job, false) AS created_sf_job,
+                  COALESCE(ev.ext_id_swap, false)  AS ext_id_swap,
+                  COALESCE(ev.manual_rescraped, false) AS manual_rescraped,
+                  COALESCE(ev.auto_retried, false) AS auto_retried,
+                  COALESCE(ev.stuck, false)        AS stuck
+                FROM window_emails we
+                LEFT JOIN jc_by_email jc ON jc.email_scrape_id = we.id
+                LEFT JOIN events      ev ON ev.email_scrape_id = we.id
+                ORDER BY we.created_at ASC
+                """,
+                {"start": start_utc, "end": end_utc},
             )
-            row = cur.fetchone()
-            stats["emails_received"] = int((row or {}).get("n", 0))
+            for r in cur.fetchall():
+                d = dict(r)
+                d["et_time"] = d["created_at"].astimezone(ET).strftime("%-I:%M %p ET")
+                stats["rows"].append(d)
 
-            # ── Pipeline runs (last 24h) ─────────────────────────────────────
-            cur.execute(
-                """SELECT id AS run_id, run_type, started_at, finished_at
-                   FROM scrape_runs
-                   WHERE created_at > %s
-                   ORDER BY started_at ASC
-                   LIMIT 100;""",
-                (since,),
-            )
-            raw_runs = [dict(r) for r in cur.fetchall()]
-            stats["runs"] = _pair_runs(raw_runs)
-
-            # ── Job content rows (last 24h) ──────────────────────────────────
-            cur.execute(
-                """SELECT
-                     job_post_id, job_id, title_line, location_line, practice_value,
-                     city, state, job_title, posting_org, priority, status,
-                     point_of_contact, provider_start_date, provider_end_date,
-                     posted_date, description_full_text, sf_job_id, sf_worksite_account_id,
-                     view_job_link, raw_columns_json, created_at
-                   FROM job_content
-                   WHERE created_at > %s
-                   ORDER BY created_at DESC;""",
-                (since,),
-            )
-            rows = cur.fetchall()
-
-        # ── Classify each row ────────────────────────────────────────────────
-        total = len(rows)
-        stats["scrape_attempts"] = total
-        example_jobs: list[dict] = []
-        issue_log:    list[dict] = []
-
-        for row in rows:
-            d = dict(row)
-            # Rebuild cleaned dict from DB columns for validation
-            cleaned = {k: (d.get(k) or "") for k in [
-                "title_line", "job_id", "job_title", "status", "priority",
-                "provider_start_date", "provider_end_date", "posted_date",
-                "location_line", "state", "city", "posting_org", "point_of_contact",
-                "practice_value", "description_full_text",
-            ]}
-            # raw_columns_json may have extra fields (e.g. position_type)
-            if d.get("raw_columns_json"):
-                try:
-                    import json
-                    extra = d["raw_columns_json"]
-                    if isinstance(extra, str):
-                        extra = json.loads(extra)
-                    for k in ("rates",):
-                        if not cleaned.get(k) and extra.get(k):
-                            cleaned[k] = extra[k]
-                except Exception:
-                    pass
-
-            issues = validate_scraped_job(cleaned, job_post_id=str(d.get("job_post_id") or ""))
-            summ   = issues_summary(issues)
-            stats["total_criticals"] += summ["critical"]
-            stats["total_warnings"]  += summ["warning"]
-
-            # SF mapping status
-            has_sf_job_id   = bool((d.get("sf_job_id") or "").strip())
-            has_sf_worksite = bool((d.get("sf_worksite_account_id") or "").strip())
-            if has_sf_job_id:
-                stats["sf_mapped"] += 1
-            if has_sf_worksite:
-                stats["sf_worksite_mapped"] += 1
-
-            title = (d.get("title_line") or "").strip()
-            if not title:
-                stats["scrape_failed"] += 1
-                issue_log.append({
-                    "job_post_id":   d.get("job_post_id", "?"),
-                    "view_job_link": d.get("view_job_link", ""),
-                    "issues_text":   issues_as_text(issues, str(d.get("job_post_id", ""))),
-                })
-            elif summ["critical"] > 0 or summ["warning"] >= 3:
-                stats["scrape_partial"] += 1
-                issue_log.append({
-                    "job_post_id":   d.get("job_post_id", "?"),
-                    "view_job_link": d.get("view_job_link", ""),
-                    "issues_text":   issues_as_text(issues, str(d.get("job_post_id", ""))),
-                })
-            else:
-                stats["scrape_success"] += 1
-                # Track unmapped jobs (successfully scraped but no SF job ID yet)
-                if not has_sf_job_id:
-                    stats["sf_unmapped"] += 1
-                    stats["sf_unmapped_jobs"].append({
-                        "job_post_id":   d.get("job_post_id", "?"),
-                        "job_title":     (d.get("job_title") or "").strip(),
-                        "status":        (d.get("status") or "").strip(),
-                        "posting_org":   (d.get("posting_org") or "").strip(),
-                        "view_job_link": d.get("view_job_link", ""),
-                        "scraped_at":    str(d.get("created_at", ""))[:16],
-                    })
-                example_jobs.append(cleaned | {
-                    "job_post_id": d.get("job_post_id"),
-                    "sf_job_id":   d.get("sf_job_id") or "",
-                    "scraped_at":  str(d.get("created_at", ""))[:19],
-                })
-
-        stats["example_jobs"] = example_jobs
-        stats["issue_log"]    = issue_log
+    rows = stats["rows"]
+    stats["emails_received"]     = len(rows)
+    stats["scraped_ok"]          = sum(1 for r in rows if r["scrape_ok"])
+    stats["sf_mapped"]           = sum(1 for r in rows if r["sf_mapped"])
+    stats["sf_jobs_created"]     = sum(1 for r in rows if r["created_sf_job"])
+    stats["field_patches_total"] = sum(int(r["fields_changed"] or 0) for r in rows)
+    stats["ext_id_swaps"]        = sum(1 for r in rows if r["ext_id_swap"])
+    stats["manual_rescrapes"]    = sum(1 for r in rows if r["manual_rescraped"])
+    stats["auto_retries"]        = sum(1 for r in rows if r["auto_retried"])
+    stats["stuck_jobs"]          = sum(1 for r in rows if r["stuck"])
+    stats["scrape_failures"]     = sum(1 for r in rows if not r["scrape_ok"] and not r["stuck"])
 
     return stats
 
