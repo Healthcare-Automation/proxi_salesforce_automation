@@ -403,12 +403,22 @@ def send_daily_summary(stats: dict) -> bool:
             else:
                 scrape_html = _chip("—", "slate", "No content row written for this email")
 
-            # SF mapping
+            # SF mapping — link to the Salesforce Lightning record when mapped
+            # so the operator can open Kimedics (Job column) and SF side-by-side.
             if r["sf_mapped"]:
+                sf_url = (
+                    f"https://proxi.lightning.force.com/lightning/r/Job__c/{sfid}/view"
+                    if sfid else ""
+                )
+                chip = _chip("✓", "green", f"Open Salesforce record · sf_job_id={sfid}")
+                id_html = (
+                    f'<span style="font-family:monospace;color:#2471a3;font-size:10px;">{sfid[:10]}…</span>'
+                    if sfid else ""
+                )
+                inner = chip + (" " + id_html if id_html else "")
                 sf_html = (
-                    _chip("✓", "green", f"sf_job_id={sfid}")
-                    + (f'<span style="font-family:monospace;color:#666;font-size:10px;">{sfid[:8]}…</span>'
-                       if sfid else "")
+                    f'<a href="{sf_url}" style="text-decoration:none;">{inner}</a>'
+                    if sf_url else inner
                 )
             elif r["scrape_ok"]:
                 sf_html = _chip("pending", "amber", "Scraped but no SF Job__c yet")
