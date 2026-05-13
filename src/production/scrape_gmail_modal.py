@@ -935,10 +935,15 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
             cur.execute(
                 """
                 WITH window_emails AS (
+                  -- Window on the *email-received* time (Gmail header ``date``),
+                  -- not when our cron logged it. Falls back to created_at if
+                  -- date is missing on a historical row.
                   SELECT id, job_post_id, run_id, view_job_link, subject,
-                         action_or_change, created_at
+                         action_or_change, created_at,
+                         COALESCE("date", created_at) AS received_at
                   FROM email_scrapes
-                  WHERE created_at >= %(start)s AND created_at <= %(end)s
+                  WHERE COALESCE("date", created_at) >= %(start)s
+                    AND COALESCE("date", created_at) <= %(end)s
                 ),
                 jc_by_email AS (
                   SELECT email_scrape_id,
@@ -998,7 +1003,7 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
                 )
                 SELECT
                   we.id, we.job_post_id, we.subject, we.action_or_change,
-                  we.view_job_link, we.created_at,
+                  we.view_job_link, we.received_at, we.created_at,
                   COALESCE(jc.scrape_ok, false)    AS scrape_ok,
                   COALESCE(jc.sf_mapped, false)    AS sf_mapped,
                   jc.sf_job_id, jc.job_title, jc.posting_org, jc.practice_value,
@@ -1018,7 +1023,9 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
             )
             for r in cur.fetchall():
                 d = dict(r)
-                d["et_time"] = d["created_at"].astimezone(ET).strftime("%-I:%M %p ET")
+                # "Time" column shows when the email was *received*
+                # (Gmail header date), not when our cron logged it.
+                d["et_time"] = d["received_at"].astimezone(ET).strftime("%-I:%M %p ET")
                 stats["rows"].append(d)
 
     rows = stats["rows"]
