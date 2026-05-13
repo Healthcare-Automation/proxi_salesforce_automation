@@ -894,14 +894,16 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
         # will be off by an hour in the summer — best effort.
         ET = timezone(timedelta(hours=-5))
 
-    # Yesterday 5:00 AM ET → 23:59:59 ET, converted to UTC for the SQL.
+    # Yesterday 00:00 ET → 23:59:59 ET (full calendar day, ET-based), converted
+    # to UTC for the SQL. Full-day window so we never miss anything that
+    # arrived between midnight and 5 AM.
     now_et       = datetime.now(ET)
     report_date  = (now_et - timedelta(days=1)).date()
-    start_et     = datetime.combine(report_date, time(5, 0, 0), tzinfo=ET)
+    start_et     = datetime.combine(report_date, time(0, 0, 0), tzinfo=ET)
     end_et       = datetime.combine(report_date, time(23, 59, 59), tzinfo=ET)
     start_utc    = start_et.astimezone(timezone.utc)
     end_utc      = end_et.astimezone(timezone.utc)
-    period_label = f"{start_et.strftime('%b %-d, %Y')} · 5:00 AM – 11:59 PM ET"
+    period_label = f"{start_et.strftime('%b %-d, %Y')} · 12:00 AM – 11:59 PM ET"
 
     stats: dict = {
         "period_label":         period_label,
