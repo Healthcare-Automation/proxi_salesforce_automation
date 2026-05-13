@@ -263,69 +263,61 @@ def send_scrape_alert(
 
 def send_daily_summary(stats: dict) -> bool:
     """
-    Send the daily digest email.
+    Send the daily digest email — one row per email_scrape received in the
+    reporting window (yesterday 5:00 AM – 11:59 PM ET), with the downstream
+    pipeline outcome summarized inline.
 
-    When ``emails_received``, ``scrape_attempts``, and ``runs`` are all empty
-    for the period, skips sending and returns False (no SMTP traffic on quiet days).
+    Skips sending if no emails landed in the window. Expected stats keys:
 
-    Expected keys in stats (all optional / gracefully handled if missing):
-      period_label        str
-      emails_received     int
-      scrape_attempts     int
-      scrape_success      int   — all critical fields present, no major issues
-      scrape_partial      int   — title_line present but 3+ warnings
-      scrape_failed       int   — title_line empty (complete failure)
-      total_warnings      int
-      total_criticals     int
-      sf_mapped           int   — jobs with sf_job_id resolved
-      sf_unmapped         int   — successfully scraped but no sf_job_id yet
-      sf_worksite_mapped  int   — jobs with sf_worksite_account_id resolved
-      sf_unmapped_jobs    list[dict]  — {job_post_id, job_title, status, posting_org,
-                                         view_job_link, scraped_at}
-      example_jobs        list[dict]  — up to 5 recent successful job dicts
-      issue_log           list[dict]  — {job_post_id, issues_text} for flagged jobs
-      runs                list[dict]  — {run_id, run_type, started_at, finished_at}
+      period_label         str
+      emails_received      int
+      scraped_ok           int   — job_content has title + description
+      sf_mapped            int   — job_content has sf_job_id
+      sf_jobs_created      int   — new Job__c created in SF during window
+      field_patches_total  int   — total SF fields patched (across all emails)
+      ext_id_swaps         int   — External_Job_ID__c repointed on existing record
+      manual_rescrapes     int   — operator hit Rescrape in admin
+      auto_retries         int   — cron auto-retried an orphaned scrape
+      stuck_jobs           int   — unresolved job_create_failed (still needs help)
+      scrape_failures      int   — scrape didn't produce real content + not stuck
+      rows                 list[dict]  — one per email, see _build_daily_stats
     """
     g = stats.get
 
-    period           = g("period_label",       "Last 24 hours")
-    emails           = g("emails_received",     0)
-    attempts         = g("scrape_attempts",     0)
-    success          = g("scrape_success",      0)
-    partial          = g("scrape_partial",      0)
-    failed           = g("scrape_failed",       0)
-    warnings         = g("total_warnings",      0)
-    criticals        = g("total_criticals",     0)
-    sf_mapped        = g("sf_mapped",           0)
-    sf_unmapped      = g("sf_unmapped",         0)
-    sf_ws_mapped     = g("sf_worksite_mapped",  0)
-    sf_unmapped_jobs = g("sf_unmapped_jobs",    [])
-    examples         = g("example_jobs",        [])
-    issue_log        = g("issue_log",           [])
-    runs             = g("runs",                [])
+    period          = g("period_label",         "Last 24 hours")
+    emails          = g("emails_received",      0)
+    scraped_ok      = g("scraped_ok",           0)
+    sf_mapped       = g("sf_mapped",            0)
+    sf_jobs_created = g("sf_jobs_created",      0)
+    patches_total   = g("field_patches_total",  0)
+    ext_id_swaps    = g("ext_id_swaps",         0)
+    manual_rescr    = g("manual_rescrapes",     0)
+    auto_retries    = g("auto_retries",         0)
+    stuck_jobs      = g("stuck_jobs",           0)
+    scrape_fails    = g("scrape_failures",      0)
+    rows            = g("rows",                 [])
 
-    if emails == 0 and attempts == 0 and not runs:
+    if emails == 0:
         print(
-            "[alert_email] Daily summary skipped — no emails, scrapes, or "
-            "pipeline runs in the reporting period"
+            "[alert_email] Daily summary skipped — no emails received in the "
+            f"reporting period ({period})"
         )
         return False
 
-    # Overall health badge
-    sf_map_rate = round(sf_mapped / success * 100) if success else 0
-    if criticals > 0 or failed > 0:
+    # ── Health badge ──────────────────────────────────────────────────────────
+    if stuck_jobs > 0 or scrape_fails > 0:
         health_badge = '<span class="badge badge-crit">NEEDS ATTENTION</span>'
         subject_pfx  = "🚨"
-    elif warnings > 3 or partial > 0 or sf_unmapped > 0:
-        health_badge = '<span class="badge badge-warn">WARNINGS</span>'
+    elif ext_id_swaps > 0:
+        health_badge = '<span class="badge badge-warn">REVIEW SWAPS</span>'
         subject_pfx  = "⚠️"
     else:
         health_badge = '<span class="badge badge-ok">HEALTHY</span>'
         subject_pfx  = "✅"
 
     subject = (
-        f"{subject_pfx} Proxi Daily Report — {period} — "
-        f"{success}/{attempts} scraped · {sf_mapped}/{success} SF mapped"
+        f"{subject_pfx} Proxi Daily — {period} — "
+        f"{emails} emails · {scraped_ok} scraped · {sf_mapped} mapped · {patches_total} field patches"
     )
 
     # ── Stat boxes ────────────────────────────────────────────────────────────
@@ -336,225 +328,218 @@ def send_daily_summary(stats: dict) -> bool:
             f'<div class="lbl">{label}</div></div>'
         )
 
+    color_ok = "#27ae60"
+    color_amber = "#d35400"
+    color_red = "#c0392b"
     stats_html = (
         '<div class="stat-row">'
-        + _box(emails,      "Emails Received")
-        + _box(attempts,    "Scrape Attempts")
-        + _box(success,     "Scrapes OK",         "#27ae60")
-        + _box(partial,     "Partial",             "#d35400" if partial else "#aaa")
-        + _box(failed,      "Failed",              "#c0392b" if failed  else "#aaa")
-        + _box(sf_mapped,   "SF Job ID Mapped",    "#27ae60" if sf_unmapped == 0 else "#d35400")
-        + _box(sf_unmapped, "SF Not Mapped Yet",   "#c0392b" if sf_unmapped  > 0 else "#aaa")
-        + _box(sf_ws_mapped,"SF Worksite Mapped")
+        + _box(emails,          "Emails Received")
+        + _box(scraped_ok,      "Scraped OK",       color_ok if scraped_ok == emails else color_amber)
+        + _box(sf_mapped,       "SF Job__c Mapped", color_ok if sf_mapped == emails else color_amber)
+        + _box(sf_jobs_created, "New SF Records")
+        + _box(patches_total,   "SF Fields Patched")
+        + _box(ext_id_swaps,    "ID Swaps",         color_amber if ext_id_swaps else "#aaa")
+        + _box(auto_retries,    "Auto Retries",     "#0e7490" if auto_retries else "#aaa")
+        + _box(manual_rescr,    "Manual Rescrapes", "#0369a1" if manual_rescr else "#aaa")
+        + _box(stuck_jobs,      "Stuck (needs fix)", color_red if stuck_jobs else "#aaa")
+        + _box(scrape_fails,    "Scrape Failures",  color_red if scrape_fails else "#aaa")
         + "</div>"
     )
 
-    # ── Pipeline runs ─────────────────────────────────────────────────────────
-    runs_rows = ""
-    if runs:
-        for r in runs[:15]:
-            g_id  = r.get("gmail_run_id")
-            lb_id = r.get("link_batch_run_id")
-            # Run IDs: show both if paired
-            if g_id and lb_id:
-                ids = f'<span style="color:#555;">#{g_id}</span> + <span style="color:#555;">#{lb_id}</span>'
-            else:
-                ids = f'<span style="color:#555;">#{g_id or lb_id}</span>'
-            start    = str(r.get("started_at",  ""))[:19]
-            finished = str(r.get("finished_at", ""))[:19] or "<em>running…</em>"
-            dur      = r.get("duration", "—")
-            g_dur    = r.get("gmail_dur", "—")
-            lb_dur   = r.get("link_batch_dur", "—")
-            breakdown = f'<span style="font-size:11px;color:#999;">gmail {g_dur} · scrape {lb_dur}</span>'
-            runs_rows += (
-                f"<tr>"
-                f"<td class='mono'>{ids}</td>"
-                f"<td class='mono'>{start}</td>"
-                f"<td class='mono'>{finished}</td>"
-                f"<td style='font-weight:600;'>{dur}</td>"
-                f"<td>{breakdown}</td>"
-                f"</tr>"
-            )
-        runs_section = f"""
-        <div class="section">
-          <h2>Pipeline Runs</h2>
-          <table style="font-size:12px;">
-            <tr>
-              <th>Run IDs</th>
-              <th>Started</th>
-              <th>Finished</th>
-              <th>Duration</th>
-              <th>Breakdown</th>
-            </tr>
-            {runs_rows}
-          </table>
-        </div>"""
-    else:
-        runs_section = ""
-
-    # ── SF mapping section ────────────────────────────────────────────────────
-    if sf_unmapped_jobs:
-        unmap_rows = ""
-        for j in sf_unmapped_jobs[:30]:
-            jid   = j.get("job_post_id", "?")
-            jtit  = j.get("job_title", "—")
-            jstat = j.get("status", "—")
-            jorg  = j.get("posting_org", "—")
-            jtime = j.get("scraped_at", "")[:16]
-            link  = j.get("view_job_link", "")
-            jlink = f'<a href="{link}" style="color:#2471a3;">#{jid}</a>' if link else f"#{jid}"
-            unmap_rows += (
-                f"<tr><td>{jlink}</td><td>{jtit}</td>"
-                f"<td>{jstat}</td><td>{jorg}</td><td class='mono'>{jtime}</td></tr>"
-            )
-        sf_section = f"""
-        <div class="section">
-          <h2>Salesforce Mapping Status</h2>
-          <p style="margin:0 0 10px;">
-            <strong style="color:#27ae60;">{sf_mapped}</strong> jobs have SF Job ID &nbsp;·&nbsp;
-            <strong style="color:#d35400;">{sf_unmapped}</strong> successfully scraped but not yet mapped
-            &nbsp;·&nbsp; <strong>{sf_ws_mapped}</strong> have worksite resolved
-            &nbsp;·&nbsp; Mapping rate: <strong>{sf_map_rate}%</strong>
-          </p>
-          <p style="font-size:12px;color:#888;margin:0 0 10px;">
-            Unmapped jobs below were scraped successfully but <code>sf_job_id</code> has not been
-            resolved yet. This usually means the SF record doesn't exist yet or the resolve step
-            is pending. Not necessarily an error — check if these are new jobs.
-          </p>
-          <table style="font-size:12px;">
-            <tr><th>Job</th><th>Title</th><th>Status</th><th>Org</th><th>Scraped At</th></tr>
-            {unmap_rows}
-          </table>
-        </div>"""
-    else:
-        sf_icon = "✓" if sf_mapped > 0 else "—"
-        sf_section = f"""
-        <div class="section">
-          <h2>Salesforce Mapping Status</h2>
-          <p style="color:#27ae60;">{sf_icon} All {sf_mapped} scraped job(s) have SF Job ID mapped.
-          Worksite resolved: {sf_ws_mapped}. Mapping rate: {sf_map_rate}%.</p>
-        </div>"""
-
-    # ── Example jobs ──────────────────────────────────────────────────────────
-    example_fields = [
-        ("job_id",              "Job ID"),
-        ("job_title",           "Title"),
-        ("status",              "Status"),
-        ("city",                "City"),
-        ("state",               "ST"),
-        ("provider_start_date", "Start"),
-        ("posting_org",         "Org"),
-        ("sf_job_id",           "SF Job ID"),
-    ]
-    if examples:
-        col_headers = "".join(f"<th>{lbl}</th>" for _, lbl in example_fields)
-        ex_rows = ""
-        for ex in examples:
-            cells = ""
-            for key, _ in example_fields:
-                val = (ex.get(key) or "").strip()
-                if not val and key == "sf_job_id":
-                    cells += '<td style="color:#d35400;font-style:italic;">not mapped</td>'
-                else:
-                    cells += f'<td>{val or "—"}</td>'
-            ex_rows += f"<tr>{cells}</tr>"
-        examples_section = f"""
-        <div class="section">
-          <h2>All Scraped Jobs ({len(examples)})</h2>
-          <p style="font-size:12px;color:#888;margin:0 0 10px;">
-            All successfully scraped jobs this period. SF Job ID column confirms end-to-end pipeline health.</p>
-          <table style="font-size:12px;">
-            <tr>{col_headers}</tr>
-            {ex_rows}
-          </table>
-        </div>"""
-    else:
-        examples_section = (
-            '<div class="section"><h2>All Scraped Jobs</h2>'
-            '<p style="color:#c0392b;">No successful scrapes in this period.</p></div>'
+    # ── One row per email ─────────────────────────────────────────────────────
+    def _chip(text: str, color: str, title: str = "") -> str:
+        bg = {
+            "green":  "#dcfce7", "amber": "#fef3c7", "red": "#fee2e2",
+            "blue":   "#dbeafe", "cyan":  "#cffafe", "violet": "#ede9fe",
+            "slate":  "#e2e8f0",
+        }.get(color, "#e2e8f0")
+        fg = {
+            "green":  "#166534", "amber": "#92400e", "red": "#991b1b",
+            "blue":   "#1e40af", "cyan":  "#155e75", "violet": "#5b21b6",
+            "slate":  "#334155",
+        }.get(color, "#334155")
+        t = f' title="{title}"' if title else ""
+        return (
+            f'<span{t} style="display:inline-block;padding:1px 6px;border-radius:8px;'
+            f'background:{bg};color:{fg};font-size:11px;font-weight:600;margin:1px 2px 1px 0;">{text}</span>'
         )
 
-    # ── Flagged jobs ──────────────────────────────────────────────────────────
-    if issue_log:
-        flag_rows = ""
-        for entry in issue_log[:20]:
-            jid   = entry.get("job_post_id", "?")
-            link  = entry.get("view_job_link", "")
-            itxt  = entry.get("issues_text", "").replace("\n", "<br>")
-            jlink = f'<a href="{link}">#{jid}</a>' if link else f"#{jid}"
-            flag_rows += f"<tr><td style='white-space:nowrap;'>{jlink}</td><td>{itxt}</td></tr>"
-        flagged_section = f"""
+    def _email_kind_chip(subject_text: str, action: str) -> str:
+        s = (subject_text or "").lower()
+        a = (action or "").lower()
+        if "new job post" in s:
+            return _chip("new", "violet", "New job post from Aspen Dental")
+        if a.startswith("status:"):
+            tail = action.split(":", 1)[1].strip().lower()
+            return _chip(f"status: {tail}", "slate", subject_text or "")
+        if "description updated" in s or a == "updated":
+            return _chip("desc updated", "blue", subject_text or "")
+        return _chip(a or "email", "slate", subject_text or "")
+
+    if rows:
+        body_rows = []
+        for r in rows:
+            jid   = r.get("job_post_id") or "—"
+            link  = r.get("view_job_link") or ""
+            title = (r.get("job_title") or "").strip() or "—"
+            org   = (r.get("posting_org") or "").strip()
+            sfid  = (r.get("sf_job_id") or "").strip()
+            tm    = r.get("et_time") or ""
+
+            jid_html = (
+                f'<a href="{link}" style="color:#2471a3;text-decoration:none;">#{jid}</a>'
+                if link else f"#{jid}"
+            )
+
+            # Scrape result
+            if r["scrape_ok"]:
+                scrape_html = _chip("✓", "green", "title + description populated")
+            elif r["stuck"]:
+                scrape_html = _chip("stuck", "red",
+                                    "Scrape produced no usable content and creation failed without recovery")
+            elif r["auto_retried"] or r["manual_rescraped"]:
+                scrape_html = _chip("retrying", "amber",
+                                    "Initial scrape didn't populate fields; a retry/rescrape ran for this job")
+            else:
+                scrape_html = _chip("—", "slate", "No content row written for this email")
+
+            # SF mapping
+            if r["sf_mapped"]:
+                sf_html = (
+                    _chip("✓", "green", f"sf_job_id={sfid}")
+                    + (f'<span style="font-family:monospace;color:#666;font-size:10px;">{sfid[:8]}…</span>'
+                       if sfid else "")
+                )
+            elif r["scrape_ok"]:
+                sf_html = _chip("pending", "amber", "Scraped but no SF Job__c yet")
+            else:
+                sf_html = _chip("—", "slate", "Mapping deferred — no content")
+
+            # SF Fields column: "+3 fields" or "—" or "new job"
+            field_bits: list[str] = []
+            if r["created_sf_job"]:
+                field_bits.append(_chip("new SF job", "violet", "job_created_in_salesforce"))
+            patches = int(r.get("fields_changed") or 0)
+            if patches > 0:
+                field_bits.append(_chip(f"+{patches} fields", "green",
+                                        "Total Job__c fields patched in SF for this job"))
+            if not field_bits:
+                field_bits.append('<span style="color:#aaa;">—</span>')
+            fields_html = " ".join(field_bits)
+
+            # Notes
+            notes: list[str] = []
+            if r["ext_id_swap"]:
+                notes.append(_chip("ID swap", "amber",
+                                   "External_Job_ID__c was repointed on an existing SF record"))
+            if r["auto_retried"]:
+                notes.append(_chip("auto retry", "cyan", "Cron re-ran a previously failed scrape"))
+            if r["manual_rescraped"]:
+                notes.append(_chip("rescraped", "blue", "Operator hit Rescrape in /admin/recovery"))
+            notes_html = " ".join(notes) if notes else '<span style="color:#aaa;">—</span>'
+
+            org_html = f'<span style="color:#666;font-size:11px;">{org}</span>' if org else ""
+            title_html = (
+                f'<div style="color:#111;font-size:12px;">{title}</div>'
+                + (f'<div>{org_html}</div>' if org_html else "")
+            )
+
+            email_kind = _email_kind_chip(r.get("subject", ""), r.get("action_or_change", ""))
+
+            body_rows.append(
+                "<tr>"
+                f"<td class='mono' style='white-space:nowrap;'>{tm}</td>"
+                f"<td style='white-space:nowrap;'>{email_kind}</td>"
+                f"<td style='white-space:nowrap;'>{jid_html}</td>"
+                f"<td>{title_html}</td>"
+                f"<td style='text-align:center;'>{scrape_html}</td>"
+                f"<td style='text-align:center;'>{sf_html}</td>"
+                f"<td>{fields_html}</td>"
+                f"<td>{notes_html}</td>"
+                "</tr>"
+            )
+
+        emails_section = f"""
         <div class="section">
-          <h2>Flagged Jobs ({len(issue_log)} issues)</h2>
-          <table>
-            <tr><th>Job</th><th>Issues</th></tr>
-            {flag_rows}
+          <h2>Email-by-email outcome</h2>
+          <p style="font-size:12px;color:#666;margin:0 0 8px;">
+            One row per email received. Each row shows whether the job was scraped, whether SF was mapped,
+            how many fields were patched, and any notable actions (ID swap, rescrape, stuck, etc.).
+          </p>
+          <table style="font-size:12px;width:100%;">
+            <tr>
+              <th>Time</th><th>Email</th><th>Job</th><th>Title / Org</th>
+              <th>Scrape</th><th>SF</th><th>SF Fields</th><th>Notes</th>
+            </tr>
+            {''.join(body_rows)}
           </table>
         </div>"""
     else:
-        flagged_section = (
-            '<div class="section"><h2>Flagged Jobs</h2>'
-            '<p style="color:#27ae60;">✓ No issues flagged in this period.</p></div>'
+        emails_section = (
+            '<div class="section"><h2>Email-by-email outcome</h2>'
+            '<p style="color:#888;">No emails received in this period.</p></div>'
         )
 
     # ── Assemble body ─────────────────────────────────────────────────────────
     body = f"""
     <div class="section">
-      <h2>Overall Health — {period}</h2>
-      <p style="margin:0 0 12px;">Status: {health_badge}
-        &nbsp;·&nbsp; {criticals} critical issue(s) · {warnings} warning(s)</p>
+      <h2>Daily report — {period}</h2>
+      <p style="margin:0 0 12px;">Status: {health_badge}</p>
       {stats_html}
     </div>
 
-    {sf_section}
-
-    {runs_section}
-
-    {examples_section}
-
-    {flagged_section}
+    {emails_section}
 
     <div class="section">
       <p style="font-size:12px;color:#888;margin:0;">
-        This report covers activity in the last 24 hours.
-        Critical alerts are sent immediately when they occur.
-        Reply to this email or contact andy if something looks wrong.
+        Window: yesterday 5:00 AM–11:59 PM ET (full-day cutoff so reporting never spills into the next day).
+        Each row corresponds to one email from Kimedics; the chips summarize what happened downstream
+        in the scrape + Salesforce pipeline. Critical alerts (auth failures, parse crashes) are sent
+        immediately when they occur.
       </p>
     </div>
     """
 
-    # Plain-text fallback
+    # ── Plain-text fallback ───────────────────────────────────────────────────
+    def _pt_row(r: dict) -> str:
+        kind = r.get("action_or_change") or r.get("subject") or "?"
+        scrape = "OK" if r["scrape_ok"] else ("STUCK" if r["stuck"] else "—")
+        sf = "OK" if r["sf_mapped"] else ("pending" if r["scrape_ok"] else "—")
+        patches = int(r.get("fields_changed") or 0)
+        notes = []
+        if r["created_sf_job"]: notes.append("new SF job")
+        if r["ext_id_swap"]:    notes.append("ID swap")
+        if r["auto_retried"]:   notes.append("auto retry")
+        if r["manual_rescraped"]: notes.append("rescraped")
+        notes_str = ", ".join(notes) if notes else ""
+        title = (r.get("job_title") or "?")[:40]
+        return (
+            f"  {r.get('et_time',''):>10}  #{r.get('job_post_id','?'):<6}  "
+            f"{kind:<22}  scrape={scrape:<7}  sf={sf:<8}  +{patches:>2}f  {notes_str}"
+            f"  | {title}"
+        )
+
     text = textwrap.dedent(f"""
-    Proxi Daily Scrape Report — {period}
-    {'='*50}
-    Emails received   : {emails}
-    Scrape attempts   : {attempts}
-    Successful        : {success}
-    Partial           : {partial}
-    Failed            : {failed}
-    Total warnings    : {warnings}
-    Total criticals   : {criticals}
+    Proxi Daily Report — {period}
+    {'='*72}
+    Emails received        : {emails}
+    Scraped OK             : {scraped_ok}
+    SF Job__c mapped       : {sf_mapped}
+    New SF records         : {sf_jobs_created}
+    SF fields patched      : {patches_total}
+    External_Job_ID swaps  : {ext_id_swaps}
+    Auto retries           : {auto_retries}
+    Manual rescrapes       : {manual_rescr}
+    Stuck (needs fix)      : {stuck_jobs}
+    Scrape failures        : {scrape_fails}
 
-    SF Mapping
-    ----------
-    SF Job ID mapped  : {sf_mapped} / {success} ({sf_map_rate}%)
-    Not yet mapped    : {sf_unmapped}
-    Worksite mapped   : {sf_ws_mapped}
-
-    Unmapped jobs:
-    {chr(10).join(f'  #{j.get("job_post_id","?")} {j.get("job_title","?")} | {j.get("status","?")} | {j.get("posting_org","?")}' for j in sf_unmapped_jobs[:15]) or "  None"}
-
-    Recent jobs (example data):
-    {chr(10).join(f'  #{e.get("job_id","?")} {e.get("job_title","?")} | {e.get("status","?")} | SF:{e.get("sf_job_id","—")}' for e in examples[:5]) or "  None"}
-
-    Flagged:
-    {chr(10).join(f'  #{e.get("job_post_id","?")} — {e.get("issues_text","?")}' for e in issue_log[:10]) or "  None"}
-    """).strip()
+    Per-email outcome:
+    """).strip() + "\n" + ("\n".join(_pt_row(r) for r in rows) if rows else "  (no emails)")
 
     return _send(
         subject,
         _html_wrap(
-            "📊 Proxi Daily Scrape Report",
+            "📊 Proxi Daily Report",
             f"{period} · Proxi Salesforce Automation",
             body,
         ),
