@@ -24,6 +24,7 @@ from typing import Any, Optional
 
 from utils.address_display_format import (
     format_us_address_line_for_display,
+    looks_like_real_street,
     strip_redundant_city_state_from_shipping_street,
 )
 from utils.sf_job_rest_minimal import create_account_record, filter_createable_fields, describe_sobject
@@ -103,6 +104,14 @@ def fetch_or_create_worksite_account_id(
         if dedup:
             ship_street = dedup
     if ship_street == "":
+        ship_street = None
+    # Final guard: when ``address_line`` only contained ``"City, ST"`` (no
+    # actual street content), the value above is still ``"Freeport, IL"`` and
+    # would land in ``ShippingStreet`` — leaving the new worksite Account
+    # with City and State both duplicated into the Street field. Skip the
+    # Street field entirely unless the value looks like a real street
+    # address. ShippingCity / ShippingState carry the location either way.
+    if ship_street and not looks_like_real_street(ship_street):
         ship_street = None
 
     # Default Account Owner for all new worksites
