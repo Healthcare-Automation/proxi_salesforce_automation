@@ -134,16 +134,41 @@ def send_scrape_alert(
     issues:        list,                 # list[ValidationIssue] from scrape_validator
     cleaned:       Optional[dict] = None,
     view_job_link: Optional[str] = None,
+    *,
+    sibling_success:  bool = False,
+    downstream_events: Optional[list] = None,  # [(event_type, count), …]
+    recent_history:   Optional[dict] = None,
+    sf_mapping:       Optional[dict] = None,
+    empty_row:        bool = False,
+    batch_size:       int  = 1,
 ) -> bool:
     """
-    Send an immediate alert email when a scraped job fails validation.
+    Per-job consolidated alert email — fired from
+    ``pipeline_link_scrape._decide_and_send_alerts`` after Pass 2 has gathered
+    the full pipeline context (validator output + SF events + sibling-scrape
+    outcome + recent history). Body now mirrors / exceeds the daily summary's
+    error surface.
 
     Parameters
     ----------
-    job_post_id   : Kimedics job post ID (e.g. "19476")
-    issues        : list of ValidationIssue from validate_scraped_job()
-    cleaned       : the parsed job dict (for the data snapshot section)
-    view_job_link : direct link to the Kimedics job page
+    job_post_id      Kimedics job post id
+    issues           list[ValidationIssue] from validate_scraped_job()
+    cleaned          parsed job dict (snapshot section)
+    view_job_link    direct link to the Kimedics page
+
+    Keyword-only context (added so the alert matches daily-summary coverage):
+    sibling_success    a sibling scrape for this job_id in the same batch
+                       succeeded (alert is for an earlier transient blip)
+    downstream_events  list of (event_type, count) for this run — e.g.
+                       sf_scrape_fields_error, job_create_failed,
+                       worksite_create_failed, sf_field_quarantined,
+                       sf_sync_skipped_no_mapping
+    recent_history     {unresolved_failed, auto_retries_24h, manual_rescr_24h,
+                       failures_24h}
+    sf_mapping         {sf_job_id, patched_fields, created_record}
+    empty_row          this run wrote a job_content row with job_id NULL or
+                       empty title — silent scrape failure (e.g. job 19782)
+    batch_size         how many scrape rows in this batch for this job_id
     """
     from utils.scrape_validator import Severity, issues_as_html, issues_summary
 
@@ -151,12 +176,31 @@ def send_scrape_alert(
     critical_n = summary["critical"]
     warning_n  = summary["warning"]
     cleaned    = cleaned or {}
+    downstream_events = downstream_events or []
+    recent_history    = recent_history or {}
+    sf_mapping        = sf_mapping or {}
 
-    # Subject line: escalate based on severity
+    # Total downstream-error count drives severity in subject.
+    downstream_total = sum(n for _, n in downstream_events)
+    unresolved       = int(recent_history.get("unresolved_failed", 0) or 0)
+
+    # Subject — bake downstream signal in so operators can triage from inbox.
+    parts: list[str] = []
     if critical_n > 0:
-        subject = f"🚨 CRITICAL Scrape Alert — Job #{job_post_id} — {critical_n} critical issue(s)"
+        parts.append(f"{critical_n} critical")
+    if warning_n > 0 and critical_n == 0:
+        parts.append(f"{warning_n} warning(s)")
+    if downstream_total > 0:
+        parts.append(f"{downstream_total} SF event(s)")
+    if unresolved > 0:
+        parts.append(f"{unresolved} unresolved")
+    detail = " · ".join(parts) or "issues detected"
+    if critical_n > 0 or unresolved > 0 or empty_row:
+        subject = f"🚨 Scrape Alert — Job #{job_post_id} — {detail}"
+    elif downstream_total > 0:
+        subject = f"⚠️  Scrape + SF Alert — Job #{job_post_id} — {detail}"
     else:
-        subject = f"⚠️  Scrape Warning — Job #{job_post_id} — {warning_n} warnings"
+        subject = f"⚠️  Scrape Warning — Job #{job_post_id} — {detail}"
 
     # Badge HTML
     def _badge(sev: str, n: int) -> str:
@@ -210,17 +254,114 @@ def send_scrape_alert(
             f'<td class="mono">{desc_preview}{"…" if len(cleaned.get("description_full_text",""))>300 else ""}</td></tr>'
         )
 
+    # ── Sibling-batch banner ────────────────────────────────────────────────
+    sibling_banner = ""
+    if sibling_success:
+        sibling_banner = """
+        <div class="section" style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:6px;padding:12px 14px;">
+          <p style="margin:0;color:#15803d;font-size:13px;">
+            <strong>Note:</strong> A sibling scrape for the same job in the same batch <strong>succeeded</strong>.
+            Salesforce was updated by that paired scrape — this alert reflects the transient first attempt only.
+            If you only need to know whether SF stayed in sync, the answer is <strong>yes</strong>.
+          </p>
+        </div>"""
+
+    # ── Empty-row banner (job_content with job_id NULL or empty title) ──────
+    empty_banner = ""
+    if empty_row:
+        empty_banner = """
+        <div class="section" style="background:#fef2f2;border:1px solid #fecaca;border-radius:6px;padding:12px 14px;">
+          <p style="margin:0;color:#991b1b;font-size:13px;">
+            <strong>Silent scrape failure:</strong> a <code>job_content</code> row was written this run with empty
+            critical fields. Auto-retry will pick this up within ~5 min; if it persists, click Rescrape on the admin page.
+          </p>
+        </div>"""
+
+    # ── Downstream Salesforce events (this run) ─────────────────────────────
+    downstream_html = ""
+    if downstream_events:
+        ev_rows = []
+        # Plain-language labels for non-technical readers.
+        labels = {
+            "sf_scrape_fields_error":     "SF field push error",
+            "job_create_failed":          "SF Job__c create failed",
+            "worksite_create_failed":     "SF Worksite__c create failed",
+            "sf_field_quarantined":       "Field quarantined (SF rejected)",
+            "sf_sync_skipped_no_mapping": "Sync skipped (no SF mapping)",
+        }
+        for et, n in downstream_events:
+            ev_rows.append(
+                f'<tr><td style="color:#7f1d1d;font-weight:600;padding:4px 10px;font-size:12px;'
+                f'white-space:nowrap;">{n}×</td>'
+                f'<td style="padding:4px 10px;font-size:12px;">{labels.get(et, et)}</td>'
+                f'<td style="padding:4px 10px;font-family:monospace;font-size:11px;color:#888;">{et}</td></tr>'
+            )
+        downstream_html = f"""
+        <div class="section">
+          <h2>Salesforce events on this run</h2>
+          <table style="border-collapse:collapse;font-size:12px;">{''.join(ev_rows)}</table>
+        </div>"""
+
+    # ── SF mapping state ────────────────────────────────────────────────────
+    sf_html = ""
+    sfid = (sf_mapping.get("sf_job_id") or "").strip()
+    patched_fields = int(sf_mapping.get("patched_fields", 0) or 0)
+    created = bool(sf_mapping.get("created_record"))
+    if sfid or patched_fields or created:
+        sf_link = (
+            f'<a href="https://proxi.lightning.force.com/lightning/r/Job__c/{sfid}/view" '
+            f'style="color:#2471a3;">Open SF record · {sfid}</a>'
+            if sfid else "—"
+        )
+        sf_html = f"""
+        <div class="section">
+          <h2>Salesforce state</h2>
+          <table style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="color:#666;width:160px;padding:4px 10px;">sf_job_id</td><td style="padding:4px 10px;">{sf_link}</td></tr>
+            <tr><td style="color:#666;padding:4px 10px;">Fields patched this run</td><td style="padding:4px 10px;">{patched_fields}</td></tr>
+            <tr><td style="color:#666;padding:4px 10px;">New SF record created</td><td style="padding:4px 10px;">{'yes' if created else 'no'}</td></tr>
+          </table>
+        </div>"""
+
+    # ── Recent history (last 24h) ───────────────────────────────────────────
+    hist_html = ""
+    if recent_history and any(recent_history.values()):
+        un = recent_history.get("unresolved_failed", 0)
+        au = recent_history.get("auto_retries_24h", 0)
+        mn = recent_history.get("manual_rescr_24h", 0)
+        fl = recent_history.get("failures_24h", 0)
+        hist_html = f"""
+        <div class="section">
+          <h2>Recent activity (last 24 hours)</h2>
+          <table style="border-collapse:collapse;font-size:13px;">
+            <tr><td style="color:#666;width:200px;padding:4px 10px;">Unresolved failures</td>
+                <td style="padding:4px 10px;color:{'#991b1b' if un else '#0f172a'};font-weight:{'700' if un else '400'};">{un}</td></tr>
+            <tr><td style="color:#666;padding:4px 10px;">Auto-retries fired</td><td style="padding:4px 10px;">{au}</td></tr>
+            <tr><td style="color:#666;padding:4px 10px;">Manual rescrapes</td><td style="padding:4px 10px;">{mn}</td></tr>
+            <tr><td style="color:#666;padding:4px 10px;">Total failure events</td><td style="padding:4px 10px;">{fl}</td></tr>
+          </table>
+        </div>"""
+
     body = f"""
     <div class="section">
       <h2>Summary</h2>
-      <p style="margin:0 0 8px;">Job <strong>#{job_post_id}</strong> failed validation with: {badges}</p>
+      <p style="margin:0 0 8px;">Job <strong>#{job_post_id}</strong> flagged with: {badges}</p>
       {link_html}
     </div>
+
+    {sibling_banner}
+    {empty_banner}
 
     <div class="section">
       <h2>Validation Issues</h2>
       {issues_as_html(issues)}
     </div>
+
+    {downstream_html}
+
+    {sf_html}
+
+    {hist_html}
 
     <div class="section">
       <h2>Scraped Data Snapshot</h2>
@@ -229,9 +370,11 @@ def send_scrape_alert(
 
     <div class="section">
       <p style="font-size:12px;color:#888;margin:0;">
-        This alert was sent because the scraped data does not meet quality thresholds.
-        Check the Kimedics portal to verify the page is intact, then review
-        <code>playwright_job_scrape.py</code> selectors if the issue persists.
+        Consolidated per-job alert. The validator, this run's Salesforce events,
+        sibling-batch outcomes, and the last 24 hours of activity were all
+        consulted before sending. If a sibling scrape succeeded for this job in
+        the same batch, Salesforce is already in sync — the banner at the top
+        will say so.
       </p>
     </div>
     """
@@ -555,6 +698,539 @@ def send_daily_summary(stats: dict) -> bool:
         ),
         text,
     )
+
+
+# ── Weekly client-facing pulse ──────────────────────────────────────────────────────
+
+def send_weekly_summary(stats: dict) -> bool:
+    """
+    Client-facing weekly pulse — outcome-first framing for the head of a
+    recruiting firm. Renders a self-contained HTML email that adapts to
+    mobile widths and dark mode in modern clients (Apple Mail, iOS Mail,
+    Gmail mobile app, Outlook iOS/Android). Skips sending when the week
+    had zero email activity.
+    """
+    cur  = stats.get("current") or {}
+    prv  = stats.get("previous") or {}
+    period = stats.get("period_label", "Last week")
+
+    emails    = int(cur.get("emails_received", 0))
+    scraped   = int(cur.get("scraped_ok", 0))
+    new_jobs  = int(cur.get("sf_jobs_created", 0))
+    patches   = int(cur.get("field_patches_total", 0))
+    needs     = int(cur.get("needs_attention", 0))
+    latency   = cur.get("median_latency_min")
+    top_prac  = cur.get("top_practices", [])
+    top_jobs  = cur.get("top_jobs", [])
+    hrs_saved = float(stats.get("hours_saved_estimate", 0.0))
+    dollars_saved  = int(stats.get("dollars_saved_estimate", 0))
+    hourly_rate    = int(stats.get("hourly_rate_usd", 80))
+    manual_min     = int(stats.get("manual_baseline_min", 120))
+    speed_x        = stats.get("speed_multiplier_x")
+    top_states     = stats.get("top_states", [])
+    states_total   = int(stats.get("states_total", 0))
+    peak_day       = stats.get("peak_day")
+    peak_day_count = int(stats.get("peak_day_count", 0))
+    peak_hour      = stats.get("peak_hour")
+    peak_hour_n    = int(stats.get("peak_hour_count", 0))
+    trend          = stats.get("trend_weekly", [])
+    cumulative     = stats.get("cumulative", {}) or {}
+    narrative      = stats.get("narrative", "")
+    series         = stats.get("daily_series", [])
+
+    if emails == 0:
+        print(f"[alert_email] Weekly pulse skipped — no emails in {period}")
+        return False
+
+    prv_emails  = int(prv.get("emails_received", 0))
+    prv_patches = int(prv.get("field_patches_total", 0))
+    prv_new     = int(prv.get("sf_jobs_created", 0))
+
+    def _delta(cur_v, prev_v):
+        if prev_v == 0: return None
+        return round((cur_v - prev_v) / prev_v * 100)
+
+    def _delta_html(pct: Optional[int]):
+        if pct is None:
+            return '<span class="dim" style="color:#a1a1aa;font-size:12px;">first reporting period</span>'
+        if pct == 0:
+            return '<span class="dim" style="color:#71717a;font-size:12px;">unchanged WoW</span>'
+        color = "#16a34a" if pct > 0 else "#dc2626"
+        arrow = "↑" if pct > 0 else "↓"
+        return f'<span style="color:{color};font-size:12px;font-weight:600;">{arrow} {abs(pct)}% WoW</span>'
+
+    coverage_pct = round(scraped / emails * 100) if emails else 0
+
+    # Health framing — restrained palette.
+    if needs == 0:
+        health_text = "All systems healthy"
+        health_dot  = "#16a34a"
+        health_bg   = "#ecfdf5"
+        health_fg   = "#15803d"
+    elif needs <= 2:
+        health_text = f"{needs} item{'s' if needs != 1 else ''} flagged for review"
+        health_dot  = "#f59e0b"
+        health_bg   = "#fffbeb"
+        health_fg   = "#b45309"
+    else:
+        health_text = f"{needs} items flagged for review"
+        health_dot  = "#dc2626"
+        health_bg   = "#fef2f2"
+        health_fg   = "#b91c1c"
+
+    subject = f"Proxi Weekly Pulse · {period} · {emails} updates, {patches} SF changes, ~{hrs_saved:g} hrs saved"
+
+    # ── Hero stat cell ───────────────────────────────────────────────────────
+    def _hero(num, label, delta_html):
+        return f"""
+        <td class="card hero-cell" style="padding:20px 18px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;width:33.33%;vertical-align:top;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">{label}</div>
+          <div class="num hero-num" style="font-size:38px;line-height:1.05;font-weight:700;color:#18181b;margin:6px 0 4px;letter-spacing:-0.02em;">{num}</div>
+          <div>{delta_html}</div>
+        </td>"""
+
+    hero_row = f"""
+    <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
+      <tr>
+        {_hero(f"{emails:,}",   "Job updates ingested",   _delta_html(_delta(emails,  prv_emails)))}
+        {_hero(f"{patches:,}",  "Salesforce field updates", _delta_html(_delta(patches, prv_patches)))}
+        {_hero(f"{new_jobs:,}", "New roles added to SF",  _delta_html(_delta(new_jobs, prv_new)))}
+      </tr>
+    </table>"""
+
+    # ── Narrative paragraph ─────────────────────────────────────────────────
+    narrative_html = f"""
+    <div class="card" style="margin:18px 0 0;padding:18px 22px;background:#fafafa;border:1px solid #e4e4e7;border-radius:8px;">
+      <div class="text" style="font-size:14px;color:#27272a;line-height:1.55;">{narrative}</div>
+    </div>""" if narrative else ""
+
+    # ── ROI — week + cumulative + dollars ───────────────────────────────────
+    cum_h     = float(cumulative.get("hours_saved", 0) or 0)
+    cum_d     = int(cumulative.get("dollars_saved", 0) or 0)
+    launch    = cumulative.get("launch_iso") or ""
+    cum_eml   = int(cumulative.get("emails", 0) or 0)
+    cum_pat   = int(cumulative.get("patches", 0) or 0)
+    cum_field = int(cumulative.get("fields", 0) or 0)
+    cum_new   = int(cumulative.get("new_jobs", 0) or 0)
+    roi_html = ""
+    if hrs_saved >= 1 or cum_h >= 1:
+        roi_html = f"""
+        <div class="roi" style="margin:18px 0 0;padding:22px 24px;background:#18181b;border-radius:8px;">
+          <div style="color:#a1a1aa;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;">Time recouped this week</div>
+          <table role="presentation" cellpadding="0" cellspacing="0" class="duo-stack" style="width:100%;margin-top:6px;">
+            <tr>
+              <td style="vertical-align:top;width:50%;">
+                <div style="color:#ffffff;font-size:40px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;">~{hrs_saved:g} hrs</div>
+                <div style="color:#a1a1aa;font-size:13px;margin-top:6px;">of manual Kimedics → Salesforce entry</div>
+              </td>
+              <td style="vertical-align:top;width:50%;padding-left:20px;">
+                <div style="color:#ffffff;font-size:28px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;">${dollars_saved:,}</div>
+                <div style="color:#a1a1aa;font-size:13px;margin-top:6px;">recruiter capacity returned at ${hourly_rate}/hr</div>
+              </td>
+            </tr>
+          </table>
+        </div>"""
+
+    # ── Speed advantage ─────────────────────────────────────────────────────
+    speed_html = ""
+    if latency is not None and speed_x:
+        bar_max = max(manual_min, latency, 1)
+        ours_pct   = max(2, int(latency / bar_max * 100))
+        manual_pct = int(manual_min / bar_max * 100)
+        speed_html = f"""
+        <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Speed advantage</div>
+          <div class="num" style="font-size:24px;font-weight:700;color:#18181b;margin:6px 0 4px;letter-spacing:-0.02em;">{speed_x}× faster than manual</div>
+          <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">
+            Median time from Kimedics email to Salesforce: <strong style="color:#18181b;">{latency:.0f} min</strong>. Manual baseline: <strong style="color:#18181b;">~{manual_min} min</strong>.
+          </div>
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">
+            <tr>
+              <td style="width:64px;font-size:12px;color:#52525b;font-weight:600;padding:4px 0;">Proxi</td>
+              <td style="padding:4px 0;">
+                <div style="height:12px;background:#f4f4f5;border-radius:6px;">
+                  <div style="height:12px;width:{ours_pct}%;background:#27272a;border-radius:6px;"></div>
+                </div>
+              </td>
+              <td style="width:84px;text-align:right;font-size:13px;color:#18181b;font-weight:700;padding:4px 0 4px 10px;">{latency:.0f} min</td>
+            </tr>
+            <tr>
+              <td style="width:64px;font-size:12px;color:#52525b;font-weight:600;padding:4px 0;">Manual</td>
+              <td style="padding:4px 0;">
+                <div style="height:12px;background:#f4f4f5;border-radius:6px;">
+                  <div style="height:12px;width:{manual_pct}%;background:#a1a1aa;border-radius:6px;"></div>
+                </div>
+              </td>
+              <td style="width:84px;text-align:right;font-size:13px;color:#52525b;font-weight:700;padding:4px 0 4px 10px;">~{manual_min} min</td>
+            </tr>
+          </table>
+        </div>"""
+
+    # ── Editorial bar chart helper ──────────────────────────────────────────
+    # Three-row table: [count] / [bar in fixed-height cell with hairline
+    # baseline] / [label]. Monochrome zinc-800 fill — restrained, NYT-like.
+    BAR_COLOR     = "#27272a"
+    BAR_COLOR_DIM = "#d4d4d8"
+    NUM_COLOR     = "#18181b"
+    NUM_DIM       = "#a1a1aa"
+    LABEL_COLOR   = "#71717a"
+    BASELINE      = "#e4e4e7"
+
+    def _bar_chart(items, bar_h: int = 92, bar_w: int = 36) -> str:
+        max_v = max((c for _, c in items), default=0) or 1
+        num_cells, bar_cells, lbl_cells = [], [], []
+        for label, count in items:
+            fill = max(3, int((count / max_v) * (bar_h - 8))) if count > 0 else 0
+            num_cells.append(
+                f'<td style="text-align:center;padding:0 4px 6px;font-size:13px;font-weight:600;'
+                f'color:{NUM_COLOR if count > 0 else NUM_DIM};letter-spacing:-0.01em;font-variant-numeric:tabular-nums;">{count}</td>'
+            )
+            if count > 0:
+                bar_inner = (
+                    f'<div style="width:{bar_w}px;height:{fill}px;background:{BAR_COLOR};'
+                    f'border-radius:3px 3px 0 0;margin:0 auto;"></div>'
+                )
+            else:
+                bar_inner = (
+                    f'<div style="width:{bar_w}px;height:2px;background:{BAR_COLOR_DIM};'
+                    f'margin:0 auto;"></div>'
+                )
+            bar_cells.append(
+                f'<td style="text-align:center;vertical-align:bottom;padding:0 4px;'
+                f'height:{bar_h}px;border-bottom:1px solid {BASELINE};">{bar_inner}</td>'
+            )
+            lbl_cells.append(
+                f'<td style="text-align:center;padding:8px 4px 0;font-size:11px;'
+                f'color:{LABEL_COLOR};font-weight:500;letter-spacing:.02em;">{label}</td>'
+            )
+        return (
+            '<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">'
+            f'<tr>{"".join(num_cells)}</tr>'
+            f'<tr>{"".join(bar_cells)}</tr>'
+            f'<tr>{"".join(lbl_cells)}</tr>'
+            '</table>'
+        )
+
+    # ── Daily activity ──────────────────────────────────────────────────────
+    weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    daily_items = [(wl, c) for (_d_iso, c), wl in zip(series, weekday_labels)]
+    daily_section = f"""
+    <div class="card" style="margin:18px 0 0;padding:20px 22px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+      <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:16px;">Daily activity</div>
+      {_bar_chart(daily_items, bar_h=92, bar_w=34)}
+    </div>"""
+
+    # ── 4-week trend ─────────────────────────────────────────────────────────
+    trend_html = ""
+    if trend:
+        trend_chart = _bar_chart(list(trend), bar_h=80, bar_w=52)
+        trend_html = f"""
+        <div class="card" style="margin:18px 0 0;padding:20px 22px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:16px;">4-week trend · job updates per week</div>
+          {trend_chart}
+        </div>"""
+
+    # ── Reliability single line (not its own card) ───────────────────────────
+    sla_bits = [f"<strong style='color:#18181b;'>{coverage_pct}%</strong> coverage"]
+    if latency is not None:
+        sla_bits.append(f"<strong style='color:#18181b;'>{latency:.0f} min</strong> median email→SF")
+    sla_bits.append(
+        f"<strong style='color:#18181b;'>{needs}</strong> needs attention" if needs
+        else "<strong style='color:#18181b;'>0</strong> manual interventions"
+    )
+    reliability = f"""
+    <div style="margin:18px 0 0;padding:14px 18px;background:{health_bg};border-radius:8px;display:block;">
+      <div style="font-size:13px;color:{health_fg};font-weight:600;">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:{health_dot};margin-right:8px;vertical-align:middle;"></span>{health_text}
+      </div>
+      <div class="muted" style="font-size:13px;color:#52525b;margin-top:4px;">{' · '.join(sla_bits)}</div>
+    </div>"""
+
+    # ── US tile-map ──────────────────────────────────────────────────────────
+    _US_TILES = [
+        (0, 0, 'AK'),
+        (0, 10, 'ME'),
+        (1, 9, 'VT'), (1, 10, 'NH'),
+        (2, 1, 'WA'), (2, 2, 'ID'), (2, 3, 'MT'), (2, 4, 'ND'),
+        (2, 5, 'MN'), (2, 6, 'WI'), (2, 7, 'MI'),
+        (2, 9, 'NY'), (2, 10, 'MA'), (2, 11, 'RI'),
+        (3, 1, 'OR'), (3, 2, 'NV'), (3, 3, 'WY'), (3, 4, 'SD'),
+        (3, 5, 'IA'), (3, 6, 'IL'), (3, 7, 'IN'), (3, 8, 'OH'),
+        (3, 9, 'PA'), (3, 10, 'NJ'), (3, 11, 'CT'),
+        (4, 1, 'CA'), (4, 2, 'UT'), (4, 3, 'CO'), (4, 4, 'NE'),
+        (4, 5, 'MO'), (4, 6, 'KY'), (4, 7, 'WV'), (4, 8, 'VA'),
+        (4, 9, 'MD'), (4, 10, 'DE'), (4, 11, 'DC'),
+        (5, 3, 'AZ'), (5, 4, 'NM'), (5, 5, 'KS'), (5, 6, 'AR'),
+        (5, 7, 'TN'), (5, 8, 'NC'), (5, 9, 'SC'),
+        (6, 5, 'OK'), (6, 6, 'LA'), (6, 7, 'MS'), (6, 8, 'AL'), (6, 9, 'GA'),
+        (7, 5, 'TX'), (7, 9, 'FL'),
+        (8, 0, 'HI'), (8, 11, 'PR'),
+    ]
+    state_counts = {st: c for st, c in top_states}
+    max_state = max(state_counts.values()) if state_counts else 1
+
+    def _state_color(c: int) -> tuple[str, str]:
+        """Monochrome zinc ramp — editorial, matches the bar charts."""
+        if c == 0:
+            return ("#fafafa", "#a1a1aa")
+        ratio = c / max_state
+        if ratio <= 0.25:
+            return ("#e4e4e7", "#3f3f46")
+        elif ratio <= 0.50:
+            return ("#a1a1aa", "#18181b")
+        elif ratio <= 0.75:
+            return ("#52525b", "#ffffff")
+        else:
+            return ("#18181b", "#ffffff")
+
+    grid = [[None] * 12 for _ in range(9)]
+    for r, c, code in _US_TILES:
+        grid[r][c] = code
+
+    cell = 34
+    rows_html = []
+    for row in grid:
+        cells = []
+        for cell_code in row:
+            if cell_code is None:
+                cells.append(f'<td class="map-cell" style="width:{cell}px;height:{cell}px;padding:2px;"></td>')
+            else:
+                c = state_counts.get(cell_code, 0)
+                bg, fg = _state_color(c)
+                # On hover: numeric label via title attribute (most clients show on hover).
+                title = f"{cell_code}: {c} update{'s' if c != 1 else ''}"
+                # Show count only when ≥ 1; otherwise just the abbreviation in muted.
+                inner = (
+                    f'<div style="background:{bg};color:{fg};border-radius:4px;'
+                    f'height:{cell}px;line-height:{cell}px;text-align:center;'
+                    f'font-size:11px;font-weight:700;letter-spacing:.02em;">'
+                    f'{cell_code}'
+                    + (f' <span style="font-weight:600;opacity:.85;">{c}</span>' if c > 0 else "")
+                    + '</div>'
+                )
+                cells.append(
+                    f'<td class="map-cell" title="{title}" style="width:{cell}px;height:{cell}px;padding:2px;">{inner}</td>'
+                )
+        rows_html.append(f"<tr>{''.join(cells)}</tr>")
+
+    legend_steps = [
+        ("#fafafa", "0"),
+        ("#e4e4e7", "1–25%"),
+        ("#a1a1aa", "26–50%"),
+        ("#52525b", "51–75%"),
+        ("#18181b", "76–100%"),
+    ]
+    legend_cells = "".join(
+        f'<td style="padding:0 6px;font-size:10px;color:#71717a;vertical-align:middle;">'
+        f'<span style="display:inline-block;width:12px;height:12px;background:{bg};border-radius:2px;vertical-align:middle;margin-right:4px;"></span>{label}'
+        f'</td>'
+        for bg, label in legend_steps
+    )
+
+    map_html = f"""
+    <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+      <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">National footprint</div>
+      <div class="num" style="font-size:24px;color:#18181b;font-weight:700;margin:6px 0 4px;letter-spacing:-0.02em;">{states_total} state{'s' if states_total != 1 else ''} active</div>
+      <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">Cell intensity scales with job-update volume; cell number is the count.</div>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:0 auto;">
+        {''.join(rows_html)}
+      </table>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:14px auto 0;border-collapse:collapse;">
+        <tr>{legend_cells}</tr>
+      </table>
+    </div>"""
+
+    # ── Cadence: peak day + peak hour ────────────────────────────────────────
+    cadence_html = ""
+    if peak_day or peak_hour is not None:
+        peak_hour_label = ""
+        if peak_hour is not None:
+            h12 = peak_hour % 12 or 12
+            ampm = "AM" if peak_hour < 12 else "PM"
+            peak_hour_label = f"{h12} {ampm} ET"
+        cadence_html = f"""
+        <table role="presentation" cellpadding="0" cellspacing="8" class="duo-stack" style="width:100%;border-collapse:separate;margin-top:10px;">
+          <tr>
+            <td class="card" style="padding:18px 20px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;width:50%;vertical-align:top;">
+              <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Peak day</div>
+              <div class="num" style="font-size:22px;color:#18181b;font-weight:700;margin-top:4px;letter-spacing:-0.02em;">{peak_day or '—'}</div>
+              <div class="muted" style="font-size:13px;color:#52525b;margin-top:2px;">{peak_day_count} update{'s' if peak_day_count != 1 else ''} received</div>
+            </td>
+            <td class="card" style="padding:18px 20px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;width:50%;vertical-align:top;">
+              <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Peak hour</div>
+              <div class="num" style="font-size:22px;color:#18181b;font-weight:700;margin-top:4px;letter-spacing:-0.02em;">{peak_hour_label or '—'}</div>
+              <div class="muted" style="font-size:13px;color:#52525b;margin-top:2px;">{peak_hour_n} update{'s' if peak_hour_n != 1 else ''} in that window</div>
+            </td>
+          </tr>
+        </table>"""
+
+    # ── Top practices (numbers prominent) ────────────────────────────────────
+    top_prac_html = ""
+    if top_prac:
+        max_p = max(c for _, c in top_prac) or 1
+        rows = []
+        for name, count in top_prac:
+            pct = int(count / max_p * 100)
+            rows.append(
+                f"""<tr>
+                  <td style="padding:8px 0;font-size:13px;color:#18181b;width:55%;">{name}</td>
+                  <td style="padding:8px 0;width:30%;">
+                    <div style="height:8px;background:#f4f4f5;border-radius:4px;">
+                      <div style="height:8px;width:{pct}%;background:#27272a;border-radius:4px;"></div>
+                    </div>
+                  </td>
+                  <td style="padding:8px 0 8px 12px;font-size:13px;color:#18181b;font-weight:700;text-align:right;width:15%;">{count}</td>
+                </tr>"""
+            )
+        top_prac_html = f"""
+        <div class="card" style="margin:18px 0 0;padding:18px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;">Most active practices</div>
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">
+            {''.join(rows)}
+          </table>
+        </div>"""
+
+    # ── Top job records ──────────────────────────────────────────────────────
+    top_jobs_html = ""
+    if top_jobs:
+        rows = []
+        for j in top_jobs:
+            sfid = j.get("sf_job_id") or ""
+            sf_link = (
+                f'<a href="https://proxi.lightning.force.com/lightning/r/Job__c/{sfid}/view" '
+                f'style="color:#3f3f46;text-decoration:none;font-weight:600;border-bottom:1px solid #d4d4d8;">Open in Salesforce ↗</a>'
+                if sfid else ""
+            )
+            title_org = (j.get("title") or "—") + (f' · <span class="muted" style="color:#52525b;">{j["org"]}</span>' if j.get("org") else "")
+            rows.append(
+                f"""<tr>
+                  <td style="padding:10px 0;vertical-align:top;font-size:13px;width:16%;">
+                    <a href="https://portal.kimedics.com/app/workspace/job-posts/{j['job_id']}" style="color:#18181b;text-decoration:none;font-weight:700;">#{j['job_id']}</a>
+                  </td>
+                  <td style="padding:10px 0;vertical-align:top;font-size:13px;color:#18181b;width:52%;">{title_org}</td>
+                  <td style="padding:10px 0;vertical-align:top;font-size:13px;color:#18181b;font-weight:700;width:14%;text-align:right;">{j['patches']} fields</td>
+                  <td style="padding:10px 0;vertical-align:top;font-size:12px;width:18%;text-align:right;">{sf_link}</td>
+                </tr>"""
+            )
+        top_jobs_html = f"""
+        <div class="card" style="margin:18px 0 0;padding:18px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;">Most updated job records</div>
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">
+            {''.join(rows)}
+          </table>
+        </div>"""
+
+    # ── All-time stats (small footer line) ───────────────────────────────────
+    all_time_html = ""
+    if launch and (cum_eml or cum_field):
+        all_time_html = f"""
+        <div class="muted" style="margin:18px 0 0;padding:14px 4px 0;border-top:1px solid #e4e4e7;font-size:11px;color:#71717a;line-height:1.6;">
+          <span style="font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#52525b;">All-time since {launch}</span> ·
+          {cum_eml:,} emails processed ·
+          {cum_field:,} SF field updates ·
+          {cum_new:,} roles added to SF ·
+          ~{cum_h:g} hrs returned (~${cum_d:,})
+        </div>"""
+
+    # ── Assemble full document ───────────────────────────────────────────────
+    style_block = """
+    <style>
+      body { margin:0; padding:0; }
+      a { color:#3f3f46; }
+      /* Mobile: stack hero/duo cards, shrink chart cells. */
+      @media only screen and (max-width: 600px) {
+        .hero-stack > tbody > tr, .duo-stack > tbody > tr { display:block !important; }
+        .hero-stack td, .duo-stack td { display:block !important; width:100% !important; box-sizing:border-box; }
+        .hero-num { font-size:32px !important; }
+        .map-cell { width:26px !important; height:26px !important; padding:1px !important; }
+        .map-cell > div { height:26px !important; line-height:26px !important; font-size:10px !important; }
+        .padded { padding:14px 16px !important; }
+      }
+      /* Dark mode: invert backgrounds and lift text.
+         Inline ``background`` / ``color`` declarations need !important here
+         so they win against the inline style attribute. */
+      @media (prefers-color-scheme: dark) {
+        body, .wrap-bg { background:#09090b !important; }
+        .card { background:#18181b !important; border-color:#27272a !important; }
+        .text, .num { color:#fafafa !important; }
+        .muted { color:#a1a1aa !important; }
+        .dim   { color:#71717a !important; }
+        a { color:#d4d4d8 !important; }
+        .roi  { background:#0a0a0c !important; border:1px solid #27272a; }
+      }
+    </style>
+    """
+
+    body_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="supported-color-schemes" content="light dark">
+  <title>Proxi Weekly Pulse</title>
+  {style_block}
+</head>
+<body style="margin:0;padding:0;background:#fafafa;color:#18181b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <div class="wrap-bg" style="background:#fafafa;padding:24px 12px 32px;">
+    <div style="max-width:720px;margin:0 auto;">
+      <!-- Header -->
+      <div style="padding:8px 4px 0;">
+        <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.08em;">Proxi · Weekly pulse</div>
+        <div class="text" style="margin:6px 0 2px;font-size:24px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{period}</div>
+      </div>
+
+      {narrative_html}
+      {hero_row}
+      {roi_html}
+      {speed_html}
+      {daily_section}
+      {trend_html}
+      {reliability}
+      {map_html}
+      {cadence_html}
+      {top_prac_html}
+      {top_jobs_html}
+      {all_time_html}
+
+      <div class="muted" style="margin:24px 0 0;padding:12px 4px 0;font-size:11px;color:#a1a1aa;line-height:1.6;">
+        Reporting window: {period} (US Eastern). Generated automatically — reply with questions.
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+    # Plain-text fallback (concise; full table renders in HTML).
+    daily_txt = "  " + "  ".join(f"{wl}:{c}" for (_, c), wl in zip(series, ["M","T","W","T","F","S","S"]))
+    text = textwrap.dedent(f"""
+    Proxi Weekly Pulse — {period}
+    ============================================
+
+    Job updates ingested    : {emails}    (prior week: {prv_emails})
+    Salesforce field updates: {patches}   (prior week: {prv_patches})
+    New roles added to SF   : {new_jobs}  (prior week: {prv_new})
+
+    Time recouped this week : ~{hrs_saved:g} hours (~${dollars_saved:,} at ${hourly_rate}/hr)
+    {f"All-time since {launch}: {cum_eml:,} emails · {cum_field:,} field updates · ~{cum_h:g} hrs returned (~${cum_d:,})" if launch else ""}
+
+    Reliability             : {coverage_pct}% coverage{f" · median {latency:.0f} min email→SF" if latency is not None else ""} · {needs} need attention
+    Speed                   : {f"{speed_x}× faster than manual" if speed_x else "—"}
+
+    Daily activity:
+    {daily_txt}
+
+    States active: {states_total}
+    Peak day    : {peak_day or '—'} ({peak_day_count})
+    Peak hour   : {(peak_hour % 12 or 12) if peak_hour is not None else '—'} {'AM' if (peak_hour is not None and peak_hour < 12) else 'PM' if peak_hour is not None else ''} ET
+
+    Most updated jobs:
+    {chr(10).join(f"  · #{j['job_id']}  {j['title']}  ({j['patches']} field updates)" for j in top_jobs) or "  (none)"}
+
+    Proxi · Kimedics → Salesforce automation
+    """).strip()
+
+    return _send(subject, body_html, text)
 
 
 # ── Authentication failure alert ────────────────────────────────────────────────────
