@@ -204,6 +204,41 @@ def format_us_address_line_for_display(value: Optional[str]) -> str:
     return _strip_empty_comma_segments(out)
 
 
+def looks_like_real_street(value: Optional[str]) -> bool:
+    """
+    Return True when ``value`` plausibly contains an actual street address
+    (a number-prefixed line, or a known street-type / road-type token), as
+    opposed to being just a city / city+state / empty placeholder.
+
+    Used to gate ``ShippingStreet`` on new worksite Account records: when the
+    only address info Kimedics gave us was ``"Freeport, IL"``, we want to skip
+    ``ShippingStreet`` entirely rather than dump city+state into a Street
+    field and leave the Account looking like the one in the user report.
+    """
+    s = _collapse_ws(value or "")
+    if not s or len(s) < 4:
+        return False
+    # Number-prefixed lines (most US street addresses begin with a building #).
+    if re.match(r"^\s*\d", s):
+        return True
+    # Common street-type / road-type tokens. Match as whole words, period-
+    # tolerant. Keep this list focused on tokens that strongly imply a real
+    # physical street, not generic place words.
+    _STREET_TOKEN_RE = re.compile(
+        r"\b("
+        r"st|street|ave|av|avenue|blvd|boulevard|"
+        r"rd|road|dr|drive|ln|lane|hwy|highway|"
+        r"pkwy|parkway|way|ct|court|pl|place|"
+        r"cir|circle|ter|terrace|trl|trail|"
+        r"pike|loop|crossing|sq|square|"
+        r"plaza|po\s*box|p\.o\.\s*box|suite|ste|"
+        r"floor|fl|unit|apt|apartment|#|building|bldg"
+        r")\.?\b",
+        re.IGNORECASE,
+    )
+    return bool(_STREET_TOKEN_RE.search(s))
+
+
 def strip_redundant_city_state_from_shipping_street(
     street: Optional[str],
     *,
