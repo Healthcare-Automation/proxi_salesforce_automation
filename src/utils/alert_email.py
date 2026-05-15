@@ -29,7 +29,11 @@ from typing import Any, Sequence, Optional
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-ALERT_RECIPIENTS = ["anddy0622@gmail.com", "seanhyang1@gmail.com"]
+ALERT_RECIPIENTS = [
+    "anddy0622@gmail.com",
+    "seanhyang1@gmail.com",
+    "proxi@scrubnetwork.com",
+]
 SMTP_HOST        = "smtp.gmail.com"
 SMTP_PORT        = 587
 _SENDER_DEFAULT  = "proxi@scrubnetwork.com"

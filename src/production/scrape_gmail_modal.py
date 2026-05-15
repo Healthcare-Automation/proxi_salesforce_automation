@@ -465,11 +465,15 @@ def _auto_retry_orphaned_scrapes(*, kimedics_email: str, kimedics_password: str)
     )
 
 
-# ── Daily summary (9 AM ET = 13:00 UTC, covers EDT; adjust for EST in winter) ─
+# ── Daily summary (00:00 ET = 04:00 UTC during EDT, ≈1 PM KST) ──────────────
+# We fire at 04:00 UTC so the report lands at midnight Eastern (the user's
+# preferred slot) and ≈13:00 KST for the Korea-based operator. Under EST
+# (winter) this becomes 23:00 ET — still "end of the previous calendar day"
+# which is what the digest reports on, so the semantics stay the same.
 
 @app.function(
     image=_light_image,
-    schedule=modal.Cron("0 13 * * *"),
+    schedule=modal.Cron("0 4 * * *"),
     secrets=[modal.Secret.from_name("salesforce-automation")],
     timeout=120,
 )
@@ -1549,6 +1553,56 @@ def run_daily_summary_once():
     """Run the daily summary + validation digest once (same as scheduled ``daily_summary_job``)."""
     ok = daily_summary_job.remote()
     print(f"Done: daily summary email sent={ok}")
+
+
+@app.function(
+    image=_light_image,
+    secrets=[modal.Secret.from_name("salesforce-automation")],
+    timeout=180,
+)
+def daily_summary_for_date(date_iso: str):
+    """One-off: run the daily summary reporting on a specific ET calendar day.
+
+    ``date_iso`` is YYYY-MM-DD interpreted as the ET calendar day to report on.
+    Patches ``datetime.now`` inside ``_build_daily_stats`` so its "yesterday"
+    derivation lands on the supplied date.
+    """
+    sys.path.insert(0, "/root")
+    from utils.supabase_db import get_conn
+    from utils.scrape_validator import (
+        validate_scraped_job, issues_as_text, issues_summary,
+    )
+    from utils.alert_email import send_daily_summary
+    import datetime as _dt
+    try:
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+    except Exception:
+        ET = _dt.timezone(_dt.timedelta(hours=-5))
+
+    target_date = _dt.datetime.strptime(date_iso, "%Y-%m-%d").date()
+    target = _dt.datetime.combine(target_date + _dt.timedelta(days=1),
+                                  _dt.time(12, 0), tzinfo=ET)
+    real = _dt.datetime
+    class _P(real):
+        @classmethod
+        def now(cls, tz=None):
+            return target if tz is None else target.astimezone(tz)
+    _dt.datetime = _P
+    try:
+        stats = _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_summary)
+    finally:
+        _dt.datetime = real
+    ok = send_daily_summary(stats)
+    print(f"daily_summary_for_date: date={date_iso} sent={ok} emails={stats.get('emails_received')}")
+    return ok
+
+
+@app.local_entrypoint()
+def run_daily_summary_for_date(date: str):
+    """``modal run … :: run_daily_summary_for_date --date 2026-05-13``"""
+    ok = daily_summary_for_date.remote(date)
+    print(f"Done: daily summary for {date} sent={ok}")
 
 
 @app.local_entrypoint()
