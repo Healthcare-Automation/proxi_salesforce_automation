@@ -496,6 +496,31 @@ def daily_summary_job():
     return ok
 
 
+# ── Weekly client-facing pulse (Monday 9 AM ET = 13:00 UTC) ──────────────────
+
+@app.function(
+    image=_light_image,
+    schedule=modal.Cron("0 13 * * 1"),  # Monday 13:00 UTC ≈ 9 AM ET
+    secrets=[modal.Secret.from_name("salesforce-automation")],
+    timeout=180,
+)
+def weekly_summary_job():
+    """
+    Build and send the C-level weekly pulse: a single email summarizing the
+    previous calendar week's automation activity with throughput, ROI, and
+    reliability framed for a non-technical executive audience.
+    """
+    sys.path.insert(0, "/root")
+    from utils.supabase_db import get_conn
+    from utils.alert_email import send_weekly_summary
+
+    print("weekly_summary_job: starting...")
+    stats = _build_weekly_stats(get_conn)
+    ok = send_weekly_summary(stats)
+    print(f"weekly_summary_job: email sent={ok}, emails={stats.get('emails_received')}")
+    return ok
+
+
 # ── Admin-triggered rescrape web endpoint (called by automation-hub) ──────────
 #
 # Re-runs the Kimedics scrape for an explicit list of job_ids — used when a
@@ -982,6 +1007,22 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
                     ) AS ext_id_swap,
                     bool_or(jel.event_type = 'manual_rescrape_completed')              AS manual_rescraped,
                     bool_or(jel.event_type = 'auto_retry_completed')                   AS auto_retried,
+                    -- Amendments / push errors that we want surfaced in the
+                    -- daily report (in addition to the existing failure flags).
+                    count(*) FILTER (WHERE jel.event_type = 'sf_field_quarantined')        AS fields_quarantined,
+                    count(*) FILTER (WHERE jel.event_type = 'sf_scrape_fields_recovered')  AS push_recovered,
+                    count(*) FILTER (WHERE jel.event_type = 'sf_scrape_fields_error')      AS push_errors,
+                    -- Unresolved field-update errors: a push error with no later
+                    -- recovered / patched event. This is the "still broken" signal.
+                    bool_or(
+                      jel.event_type = 'sf_scrape_fields_error'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM job_event_log ok2
+                        WHERE ok2.job_id = jel.job_id
+                          AND ok2.event_type IN ('sf_scrape_fields_recovered','sf_scrape_fields_patched')
+                          AND ok2.created_at >= jel.created_at
+                      )
+                    ) AS push_error_unresolved,
                     -- Unresolved failure (same logic as Stuck job creation list).
                     bool_or(
                       jel.event_type IN ('job_create_failed', 'worksite_create_failed')
@@ -1018,6 +1059,10 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
                   COALESCE(ev.ext_id_swap, false)  AS ext_id_swap,
                   COALESCE(ev.manual_rescraped, false) AS manual_rescraped,
                   COALESCE(ev.auto_retried, false) AS auto_retried,
+                  COALESCE(ev.fields_quarantined, 0) AS fields_quarantined,
+                  COALESCE(ev.push_recovered, 0)   AS push_recovered,
+                  COALESCE(ev.push_errors, 0)      AS push_errors,
+                  COALESCE(ev.push_error_unresolved, false) AS push_error_unresolved,
                   COALESCE(ev.stuck, false)        AS stuck
                 FROM window_emails we
                 LEFT JOIN jc_by_email jc ON jc.email_scrape_id = we.id
@@ -1046,8 +1091,450 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
     stats["auto_retries"]        = sum(1 for r in rows if r["auto_retried"])
     stats["stuck_jobs"]          = sum(1 for r in rows if r["stuck"])
     stats["scrape_failures"]     = sum(1 for r in rows if not r["scrape_ok"] and not r["stuck"])
+    # Amendments — SF push errors that recovered (field dropped), fields
+    # quarantined by SF, and any push errors still unresolved. These are
+    # rows where SF was patched but with edits, or rows where SF rejected
+    # some/all of the update — operators wanted these surfaced in the report.
+    stats["fields_quarantined"]   = sum(int(r["fields_quarantined"] or 0) for r in rows)
+    stats["pushes_recovered"]     = sum(1 for r in rows if int(r["push_recovered"] or 0) > 0)
+    stats["push_errors_total"]    = sum(int(r["push_errors"] or 0) for r in rows)
+    stats["push_errors_unresolved"] = sum(1 for r in rows if r["push_error_unresolved"])
 
     return stats
+
+
+def _build_weekly_stats(get_conn) -> dict:
+    """
+    Build the C-level weekly pulse dataset for ``send_weekly_summary``.
+    Reports on the previous calendar week (Mon 00:00 → Sun 23:59:59 ET), with
+    week-over-week deltas computed against the week before that.
+    """
+    import psycopg2.extras
+    from datetime import datetime, time, timezone, timedelta
+    try:
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+    except Exception:
+        ET = timezone(timedelta(hours=-5))
+
+    now_et = datetime.now(ET)
+    # Previous calendar week (Mon-Sun in ET).
+    weekday_today = now_et.weekday()  # Mon=0
+    last_sunday   = (now_et - timedelta(days=weekday_today + 1)).date()
+    last_monday   = last_sunday - timedelta(days=6)
+    prior_sunday  = last_monday - timedelta(days=1)
+    prior_monday  = prior_sunday - timedelta(days=6)
+
+    def window_utc(d_start, d_end):
+        s = datetime.combine(d_start, time(0, 0, 0), tzinfo=ET).astimezone(timezone.utc)
+        e = datetime.combine(d_end,   time(23, 59, 59), tzinfo=ET).astimezone(timezone.utc)
+        return s, e
+
+    cur_start_utc, cur_end_utc = window_utc(last_monday,  last_sunday)
+    prv_start_utc, prv_end_utc = window_utc(prior_monday, prior_sunday)
+
+    period_label = f"{last_monday.strftime('%b %-d')} – {last_sunday.strftime('%b %-d, %Y')}"
+
+    def _aggregate(get_conn, start_utc, end_utc):
+        agg = {
+            "emails_received":      0,
+            "scraped_ok":           0,
+            "sf_mapped":            0,
+            "sf_jobs_created":      0,
+            "field_patches_total":  0,
+            "median_latency_min":   None,
+            "daily_counts":         {},   # date_iso → emails_count
+            "top_practices":        [],   # [(practice_value, count), ...]
+            "top_jobs":             [],   # [{job_id, title, org, sf_job_id, patches}, ...]
+            "needs_attention":      0,    # stuck jobs (unresolved) — flagged subtly
+        }
+        with get_conn() as conn:
+            if conn is None:
+                return agg
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Aggregate via the same email-anchored shape as the daily report.
+                cur.execute(
+                    """
+                    WITH window_emails AS (
+                      SELECT id, job_post_id, COALESCE("date", created_at) AS received_at
+                      FROM email_scrapes
+                      WHERE COALESCE("date", created_at) >= %(start)s
+                        AND COALESCE("date", created_at) <= %(end)s
+                        AND job_post_id IS NOT NULL AND job_post_id <> ''
+                    ),
+                    jc AS (
+                      SELECT email_scrape_id,
+                        bool_or(COALESCE(title_line,'') <> '' AND COALESCE(description_full_text,'') <> '') AS scrape_ok,
+                        bool_or(COALESCE(sf_job_id,'')   <> '')                                            AS sf_mapped,
+                        (array_agg(job_title    ORDER BY created_at DESC) FILTER (WHERE COALESCE(job_title,'')<>''))[1]   AS job_title,
+                        (array_agg(posting_org  ORDER BY created_at DESC) FILTER (WHERE COALESCE(posting_org,'')<>''))[1] AS posting_org,
+                        (array_agg(practice_value ORDER BY created_at DESC) FILTER (WHERE COALESCE(practice_value,'')<>''))[1] AS practice_value,
+                        (array_agg(sf_job_id    ORDER BY created_at DESC) FILTER (WHERE COALESCE(sf_job_id,'')<>''))[1]   AS sf_job_id
+                      FROM job_content
+                      WHERE email_scrape_id IN (SELECT id FROM window_emails)
+                      GROUP BY email_scrape_id
+                    ),
+                    ev AS (
+                      SELECT we.id AS email_scrape_id, we.job_post_id, we.received_at,
+                        count(*) FILTER (WHERE jel.event_type = 'sf_scrape_fields_patched') AS patch_events,
+                        COALESCE(SUM(jsonb_array_length(COALESCE(jel.payload->'fields_changed','[]'::jsonb)))
+                                 FILTER (WHERE jel.event_type = 'sf_scrape_fields_patched'), 0) AS fields_changed,
+                        bool_or(jel.event_type = 'job_created_in_salesforce') AS created_sf_job,
+                        MIN(jel.created_at) FILTER (WHERE jel.event_type IN ('sf_scrape_fields_patched','job_created_in_salesforce')) AS first_sf_action_at,
+                        bool_or(
+                          jel.event_type IN ('job_create_failed', 'worksite_create_failed')
+                          AND NOT EXISTS (
+                            SELECT 1 FROM job_event_log ok
+                            WHERE ok.job_id = jel.job_id
+                              AND ok.event_type = 'job_created_in_salesforce'
+                              AND ok.created_at >= jel.created_at
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM job_event_log rs
+                            WHERE rs.job_id = jel.job_id
+                              AND rs.event_type IN ('manual_rescrape_completed', 'auto_retry_completed')
+                              AND rs.created_at >= jel.created_at
+                              AND COALESCE(rs.payload->>'action','') IN ('re_scraped','re_scraped_with_warning')
+                          )
+                        ) AS stuck
+                      FROM window_emails we
+                      LEFT JOIN job_event_log jel ON jel.job_id = we.job_post_id
+                        AND jel.created_at >= we.received_at - INTERVAL '5 minutes'
+                        AND jel.created_at <= we.received_at + INTERVAL '7 days'
+                      GROUP BY we.id, we.job_post_id, we.received_at
+                    )
+                    SELECT
+                      ev.email_scrape_id, ev.job_post_id, ev.received_at,
+                      COALESCE(jc.scrape_ok, false) AS scrape_ok,
+                      COALESCE(jc.sf_mapped, false) AS sf_mapped,
+                      jc.job_title, jc.posting_org, jc.practice_value, jc.sf_job_id,
+                      COALESCE(ev.fields_changed, 0)    AS fields_changed,
+                      COALESCE(ev.created_sf_job, false) AS created_sf_job,
+                      COALESCE(ev.stuck, false)         AS stuck,
+                      ev.first_sf_action_at
+                    FROM ev
+                    LEFT JOIN jc ON jc.email_scrape_id = ev.email_scrape_id
+                    """,
+                    {"start": start_utc, "end": end_utc},
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+
+        agg["emails_received"]     = len(rows)
+        agg["scraped_ok"]          = sum(1 for r in rows if r["scrape_ok"])
+        agg["sf_mapped"]           = sum(1 for r in rows if r["sf_mapped"])
+        agg["sf_jobs_created"]     = sum(1 for r in rows if r["created_sf_job"])
+        agg["field_patches_total"] = sum(int(r["fields_changed"] or 0) for r in rows)
+        agg["needs_attention"]     = sum(1 for r in rows if r["stuck"])
+
+        # Latency (email → first SF action) in minutes.
+        latencies: list[float] = []
+        for r in rows:
+            ra = r["received_at"]
+            fa = r["first_sf_action_at"]
+            if ra is None or fa is None:
+                continue
+            try:
+                delta = (fa - ra).total_seconds() / 60.0
+                if delta >= 0:
+                    latencies.append(delta)
+            except Exception:
+                pass
+        if latencies:
+            latencies.sort()
+            mid = len(latencies) // 2
+            med = latencies[mid] if len(latencies) % 2 else (latencies[mid-1] + latencies[mid]) / 2
+            agg["median_latency_min"] = round(med, 1)
+
+        # Daily counts (ET date).
+        daily: dict = {}
+        for r in rows:
+            d = r["received_at"].astimezone(ET).date().isoformat()
+            daily[d] = daily.get(d, 0) + 1
+        agg["daily_counts"] = daily
+
+        # Top practices.
+        prac: dict = {}
+        for r in rows:
+            p = (r.get("practice_value") or "").strip()
+            if not p:
+                continue
+            prac[p] = prac.get(p, 0) + 1
+        agg["top_practices"] = sorted(prac.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        # Top job records by patch volume.
+        jobs: dict = {}
+        for r in rows:
+            jid = r.get("job_post_id") or ""
+            if not jid:
+                continue
+            entry = jobs.setdefault(jid, {
+                "job_id":      jid,
+                "title":       (r.get("job_title") or "").strip(),
+                "org":         (r.get("posting_org") or "").strip(),
+                "sf_job_id":   r.get("sf_job_id") or "",
+                "patches":     0,
+                "emails":      0,
+            })
+            entry["patches"] += int(r.get("fields_changed") or 0)
+            entry["emails"]  += 1
+        agg["top_jobs"] = sorted(jobs.values(), key=lambda j: j["patches"], reverse=True)[:5]
+
+        return agg
+
+    cur_agg = _aggregate(get_conn, cur_start_utc, cur_end_utc)
+    prv_agg = _aggregate(get_conn, prv_start_utc, prv_end_utc)
+
+    # ── "New roles added to SF" — client-facing meaning ─────────────────────
+    # The internal event ``job_created_in_salesforce`` only fires when Proxi
+    # itself POSTs a new Job__c — but most "new job post" emails match to an
+    # already-existing SF record. The number a recruiting executive cares
+    # about is: distinct first-time job_post_ids this week that ended up
+    # mapped to an SF Job__c (whether Proxi created the record or matched
+    # to an existing one).
+    def _new_roles_in_sf(get_conn, start_utc, end_utc):
+        with get_conn() as conn:
+            if conn is None:
+                return 0
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(DISTINCT es.job_post_id)::int
+                    FROM email_scrapes es
+                    JOIN job_content   jc ON jc.email_scrape_id = es.id
+                    WHERE COALESCE(es."date", es.created_at) >= %s
+                      AND COALESCE(es."date", es.created_at) <= %s
+                      AND es.action_or_change = 'new'
+                      AND COALESCE(jc.sf_job_id, '') <> ''
+                    """,
+                    (start_utc, end_utc),
+                )
+                return int(cur.fetchone()[0])
+    cur_agg["sf_jobs_created"] = _new_roles_in_sf(get_conn, cur_start_utc, cur_end_utc)
+    prv_agg["sf_jobs_created"] = _new_roles_in_sf(get_conn, prv_start_utc, prv_end_utc)
+
+    # ROI: conservative per-task seconds for a recruiter doing the work by
+    # hand (open Kimedics → find job → copy → switch → open SF → paste → save).
+    SEC_PER_FIELD       = 30
+    SEC_PER_NEW_RECORD  = 180
+    SEC_PER_EMAIL_AWARE = 45
+    # Loaded recruiter cost — conservative; client can override.
+    HOURLY_RATE_USD     = 80
+    # Manual baseline: typical "next time someone gets to it" lag, in minutes.
+    # Used to compute the "Nx faster than manual" headline.
+    MANUAL_BASELINE_MIN = 120  # 2 hours
+
+    def _hours_saved(agg):
+        return round(
+            (agg["field_patches_total"] * SEC_PER_FIELD
+             + agg["sf_jobs_created"]   * SEC_PER_NEW_RECORD
+             + agg["emails_received"]   * SEC_PER_EMAIL_AWARE) / 3600.0,
+            1,
+        )
+
+    hours_saved     = _hours_saved(cur_agg)
+    hours_saved_prv = _hours_saved(prv_agg)
+    dollars_saved   = round(hours_saved * HOURLY_RATE_USD)
+
+    # ── States touched (top 5 + total distinct states) ──────────────────────
+    top_states: list[tuple[str, int]] = []
+    states_total = 0
+    with get_conn() as conn:
+        if conn is not None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT jc.state, count(*)::int AS n
+                    FROM job_content jc
+                    JOIN email_scrapes es ON es.id = jc.email_scrape_id
+                    WHERE COALESCE(es."date", es.created_at) >= %s
+                      AND COALESCE(es."date", es.created_at) <= %s
+                      AND COALESCE(jc.state, '') <> ''
+                    GROUP BY jc.state
+                    ORDER BY n DESC
+                    """,
+                    (cur_start_utc, cur_end_utc),
+                )
+                for row in cur.fetchall():
+                    top_states.append((row[0], int(row[1])))
+            states_total = len(top_states)
+
+    # ── Cadence: peak day-of-week + peak 2-hour window over the period ──────
+    # Use the daily_counts already computed for day-of-week.
+    weekday_totals = {i: 0 for i in range(7)}
+    for d_iso, n in cur_agg["daily_counts"].items():
+        try:
+            d = datetime.strptime(d_iso, "%Y-%m-%d").date()
+            weekday_totals[d.weekday()] += n
+        except Exception:
+            pass
+    weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    peak_day_idx = max(weekday_totals, key=weekday_totals.get)
+    peak_day = weekday_names[peak_day_idx]
+    peak_day_count = weekday_totals[peak_day_idx]
+
+    # Hour-of-day from DB.
+    peak_hour, peak_hour_count = None, 0
+    with get_conn() as conn:
+        if conn is not None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT EXTRACT(HOUR FROM (COALESCE("date", created_at) AT TIME ZONE 'America/New_York'))::int AS hr,
+                           count(*)::int AS n
+                    FROM email_scrapes
+                    WHERE COALESCE("date", created_at) >= %s AND COALESCE("date", created_at) <= %s
+                      AND job_post_id IS NOT NULL AND job_post_id <> ''
+                    GROUP BY hr ORDER BY n DESC LIMIT 1
+                    """,
+                    (cur_start_utc, cur_end_utc),
+                )
+                row = cur.fetchone()
+                if row:
+                    peak_hour, peak_hour_count = int(row[0]), int(row[1])
+
+    # ── 4-week throughput trend (emails per week, ending current week) ──────
+    trend: list[tuple[str, int]] = []
+    with get_conn() as conn:
+        if conn is not None:
+            with conn.cursor() as cur:
+                for back in range(3, -1, -1):
+                    wk_end_date = last_sunday - timedelta(days=back * 7)
+                    wk_start_date = wk_end_date - timedelta(days=6)
+                    ws, we = window_utc(wk_start_date, wk_end_date)
+                    cur.execute(
+                        """
+                        SELECT count(*)::int FROM email_scrapes
+                        WHERE COALESCE("date", created_at) >= %s
+                          AND COALESCE("date", created_at) <= %s
+                          AND job_post_id IS NOT NULL AND job_post_id <> ''
+                        """,
+                        (ws, we),
+                    )
+                    n = int(cur.fetchone()[0])
+                    trend.append((wk_end_date.strftime("%b %-d"), n))
+
+    # ── Cumulative since launch ─────────────────────────────────────────────
+    cum = {
+        "emails":       0,
+        "patches":      0,
+        "fields":       0,
+        "new_jobs":     0,
+        "launch_iso":   None,
+        "hours_saved":  0.0,
+    }
+    with get_conn() as conn:
+        if conn is not None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                      MIN(COALESCE("date", created_at)) AS launch,
+                      count(*)::int AS emails
+                    FROM email_scrapes
+                    WHERE job_post_id IS NOT NULL AND job_post_id <> ''
+                      AND COALESCE("date", created_at) <= %s
+                    """,
+                    (cur_end_utc,),
+                )
+                row = cur.fetchone()
+                if row:
+                    cum["launch_iso"] = row[0].astimezone(ET).date().isoformat() if row[0] else None
+                    cum["emails"]     = int(row[1] or 0)
+                cur.execute(
+                    """
+                    SELECT
+                      count(*)::int AS n,
+                      COALESCE(SUM(jsonb_array_length(COALESCE(payload->'fields_changed','[]'::jsonb))), 0)::int AS f
+                    FROM job_event_log
+                    WHERE event_type = 'sf_scrape_fields_patched'
+                      AND created_at <= %s
+                    """,
+                    (cur_end_utc,),
+                )
+                row = cur.fetchone()
+                if row:
+                    cum["patches"] = int(row[0] or 0)
+                    cum["fields"]  = int(row[1] or 0)
+                cur.execute(
+                    """
+                    SELECT count(*)::int FROM job_event_log
+                    WHERE event_type = 'job_created_in_salesforce' AND created_at <= %s
+                    """,
+                    (cur_end_utc,),
+                )
+                cum["new_jobs"] = int(cur.fetchone()[0])
+    cum["hours_saved"] = round(
+        (cum["fields"] * SEC_PER_FIELD
+         + cum["new_jobs"] * SEC_PER_NEW_RECORD
+         + cum["emails"]   * SEC_PER_EMAIL_AWARE) / 3600.0,
+        1,
+    )
+    cum["dollars_saved"] = round(cum["hours_saved"] * HOURLY_RATE_USD)
+
+    # ── Speed multiplier ────────────────────────────────────────────────────
+    speed_x = None
+    median_lat = cur_agg.get("median_latency_min")
+    if median_lat and median_lat > 0:
+        speed_x = round(MANUAL_BASELINE_MIN / median_lat)
+
+    # ── Narrative paragraph ─────────────────────────────────────────────────
+    parts: list[str] = []
+    # Volume trend sentence
+    if prv_agg["emails_received"] > 0:
+        pct = round((cur_agg["emails_received"] - prv_agg["emails_received"])
+                    / prv_agg["emails_received"] * 100)
+        if abs(pct) >= 10:
+            verb = "climbed" if pct > 0 else "eased"
+            parts.append(f"Activity {verb} {abs(pct)}% this week — {cur_agg['emails_received']} job updates flowed in")
+        else:
+            parts.append(f"Steady week — {cur_agg['emails_received']} job updates flowed in")
+    else:
+        parts.append(f"{cur_agg['emails_received']} job updates flowed in this week")
+    if top_states:
+        if len(top_states) >= 2:
+            parts[-1] += f" across {states_total} states, with {top_states[0][0]} and {top_states[1][0]} leading"
+        else:
+            parts[-1] += f" across {states_total} state{'s' if states_total != 1 else ''}, led by {top_states[0][0]}"
+    parts[-1] += "."
+    # Speed sentence
+    if median_lat is not None and speed_x:
+        parts.append(f"Median time from email to Salesforce was {median_lat:.0f} minutes — roughly {speed_x}× faster than a typical manual workflow.")
+    # Spotlight sentence
+    top_jobs = cur_agg.get("top_jobs", [])
+    if top_jobs and top_jobs[0]["patches"] >= 5:
+        j0 = top_jobs[0]
+        parts.append(f"Hottest record: job #{j0['job_id']} received {j0['patches']} field updates this week alone.")
+    narrative = " ".join(parts)
+
+    return {
+        "period_label":        period_label,
+        "window_start_utc":    cur_start_utc,
+        "window_end_utc":      cur_end_utc,
+        "current":             cur_agg,
+        "previous":            prv_agg,
+        "hours_saved_estimate":     hours_saved,
+        "hours_saved_prev":         hours_saved_prv,
+        "dollars_saved_estimate":   dollars_saved,
+        "hourly_rate_usd":          HOURLY_RATE_USD,
+        "manual_baseline_min":      MANUAL_BASELINE_MIN,
+        "speed_multiplier_x":       speed_x,
+        "top_states":               top_states[:8],
+        "states_total":             states_total,
+        "peak_day":                 peak_day if peak_day_count > 0 else None,
+        "peak_day_count":           peak_day_count,
+        "peak_hour":                peak_hour,
+        "peak_hour_count":          peak_hour_count,
+        "trend_weekly":             trend,   # last 4 weeks
+        "cumulative":               cum,
+        "narrative":                narrative,
+        "daily_series":        [
+            (
+                (last_monday + timedelta(days=i)).isoformat(),
+                cur_agg["daily_counts"].get((last_monday + timedelta(days=i)).isoformat(), 0),
+            )
+            for i in range(7)
+        ],
+    }
 
 
 @app.local_entrypoint()
@@ -1062,3 +1549,10 @@ def run_daily_summary_once():
     """Run the daily summary + validation digest once (same as scheduled ``daily_summary_job``)."""
     ok = daily_summary_job.remote()
     print(f"Done: daily summary email sent={ok}")
+
+
+@app.local_entrypoint()
+def run_weekly_summary_once():
+    """Run the C-level weekly pulse once (same as scheduled ``weekly_summary_job``)."""
+    ok = weekly_summary_job.remote()
+    print(f"Done: weekly pulse email sent={ok}")

@@ -438,6 +438,10 @@ def send_daily_summary(stats: dict) -> bool:
     auto_retries    = g("auto_retries",         0)
     stuck_jobs      = g("stuck_jobs",           0)
     scrape_fails    = g("scrape_failures",      0)
+    fields_quarantined    = g("fields_quarantined",      0)
+    pushes_recovered      = g("pushes_recovered",        0)
+    push_errors_total     = g("push_errors_total",       0)
+    push_errors_unresolved = g("push_errors_unresolved", 0)
     rows            = g("rows",                 [])
 
     if emails == 0:
@@ -448,19 +452,28 @@ def send_daily_summary(stats: dict) -> bool:
         return False
 
     # ── Health badge ──────────────────────────────────────────────────────────
-    if stuck_jobs > 0 or scrape_fails > 0:
+    if stuck_jobs > 0 or scrape_fails > 0 or push_errors_unresolved > 0:
         health_badge = '<span class="badge badge-crit">NEEDS ATTENTION</span>'
         subject_pfx  = "🚨"
-    elif ext_id_swaps > 0:
-        health_badge = '<span class="badge badge-warn">REVIEW SWAPS</span>'
+    elif ext_id_swaps > 0 or fields_quarantined > 0 or pushes_recovered > 0:
+        health_badge = '<span class="badge badge-warn">REVIEW AMENDMENTS</span>'
         subject_pfx  = "⚠️"
     else:
         health_badge = '<span class="badge badge-ok">HEALTHY</span>'
         subject_pfx  = "✅"
 
+    # Subject includes amendments when present so operators can triage from inbox.
+    subject_amend = ""
+    if pushes_recovered or fields_quarantined or push_errors_unresolved:
+        bits = []
+        if pushes_recovered:     bits.append(f"{pushes_recovered} recovered")
+        if fields_quarantined:   bits.append(f"{fields_quarantined} field{'s' if fields_quarantined != 1 else ''} dropped")
+        if push_errors_unresolved: bits.append(f"{push_errors_unresolved} push err")
+        subject_amend = " · " + " · ".join(bits)
     subject = (
         f"{subject_pfx} Proxi Daily — {period} — "
         f"{emails} emails · {scraped_ok} scraped · {sf_mapped} mapped · {patches_total} field patches"
+        f"{subject_amend}"
     )
 
     # ── Stat boxes ────────────────────────────────────────────────────────────
@@ -482,6 +495,9 @@ def send_daily_summary(stats: dict) -> bool:
         + _box(sf_jobs_created, "New SF Records")
         + _box(patches_total,   "SF Fields Patched")
         + _box(ext_id_swaps,    "ID Swaps",         color_amber if ext_id_swaps else "#aaa")
+        + _box(pushes_recovered, "Push Recovered",  color_amber if pushes_recovered else "#aaa")
+        + _box(fields_quarantined, "Fields Dropped", color_amber if fields_quarantined else "#aaa")
+        + _box(push_errors_unresolved, "Push Errors", color_red if push_errors_unresolved else "#aaa")
         + _box(auto_retries,    "Auto Retries",     "#0e7490" if auto_retries else "#aaa")
         + _box(manual_rescr,    "Manual Rescrapes", "#0369a1" if manual_rescr else "#aaa")
         + _box(stuck_jobs,      "Stuck (needs fix)", color_red if stuck_jobs else "#aaa")
@@ -580,8 +596,24 @@ def send_daily_summary(stats: dict) -> bool:
                 field_bits.append('<span style="color:#aaa;">—</span>')
             fields_html = " ".join(field_bits)
 
-            # Notes
+            # Notes — chips show amendments + actions for this email.
             notes: list[str] = []
+            quar_n = int(r.get("fields_quarantined") or 0)
+            rec_n  = int(r.get("push_recovered") or 0)
+            err_n  = int(r.get("push_errors") or 0)
+            err_unresolved = bool(r.get("push_error_unresolved"))
+            if quar_n > 0:
+                notes.append(_chip(
+                    f"{quar_n} field dropped" if quar_n == 1 else f"{quar_n} fields dropped",
+                    "amber",
+                    "Salesforce rejected the value (length / type / picklist); recovery auto-dropped the field and re-pushed the rest",
+                ))
+            if rec_n > 0 and not err_unresolved:
+                notes.append(_chip("push recovered", "cyan",
+                                   "An SF push error was auto-recovered and the rest of the fields landed"))
+            if err_unresolved:
+                notes.append(_chip("push error", "red",
+                                   "Salesforce field push errored and has not yet been recovered"))
             if r["ext_id_swap"]:
                 notes.append(_chip("ID swap", "amber",
                                    "External_Job_ID__c was repointed on an existing SF record"))
@@ -661,6 +693,10 @@ def send_daily_summary(stats: dict) -> bool:
         patches = int(r.get("fields_changed") or 0)
         notes = []
         if r["created_sf_job"]: notes.append("new SF job")
+        qn = int(r.get("fields_quarantined") or 0)
+        if qn > 0:              notes.append(f"{qn} field dropped" if qn == 1 else f"{qn} fields dropped")
+        if r.get("push_error_unresolved"): notes.append("push error")
+        elif int(r.get("push_recovered") or 0) > 0: notes.append("push recovered")
         if r["ext_id_swap"]:    notes.append("ID swap")
         if r["auto_retried"]:   notes.append("auto retry")
         if r["manual_rescraped"]: notes.append("rescraped")
