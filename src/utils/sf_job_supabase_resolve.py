@@ -116,6 +116,35 @@ def _try_create_sf_job_after_no_match(
     if (latest.get("sf_job_id") or "").strip():
         return False
 
+    # ── Refuse to auto-create without a practice_value. ──
+    # Job_Client_Job_Id__c is what ties Kimedics to an existing Salesforce
+    # Job__c (unique on the SF side). With no practice_value we cannot dedupe,
+    # so creating risks a duplicate Job__c that later blocks PATCHes with
+    # DUPLICATE_VALUE. Emit a quarantine-style event so the recovery loop
+    # retries on the next scrape (once the parser produces a practice_value)
+    # and the per-batch + daily alerts pick it up.
+    practice_raw_guard = (latest.get("practice_value") or "").strip()
+    if not practice_raw_guard:
+        log_job_event(
+            conn,
+            job_id=jid,
+            event_type="mapping_blocked_no_practice_value",
+            schema=schema,
+            run_id=run_id,
+            payload={
+                "reason": "empty_practice_value",
+                "detail": (
+                    "Refused to auto-create Job__c — practice_value is empty so "
+                    "Job_Client_Job_Id__c-based dedup is impossible. Will retry on "
+                    "next scrape once the parser fills practice_value."
+                ),
+                "city": (latest.get("city") or "").strip() or None,
+                "state": (latest.get("state") or "").strip() or None,
+                "automation_kind": "salesforce_job_create_blocked",
+            },
+        )
+        return False
+
     tok = _sf_rest_token()
     if not tok:
         log_job_event(

@@ -174,11 +174,13 @@ def _decide_and_send_alerts(conn, per_row_state, link_run_id: int, schema: str) 
 
         # Build downstream-event count list for body + decision.
         downstream_events = [
-            ("sf_scrape_fields_error",     signals.get("sf_error",       0)),
-            ("job_create_failed",          signals.get("job_failed",     0)),
-            ("worksite_create_failed",     signals.get("worksite_failed",0)),
-            ("sf_field_quarantined",       signals.get("quarantined",    0)),
-            ("sf_sync_skipped_no_mapping", signals.get("skipped",        0)),
+            ("sf_scrape_fields_error",            signals.get("sf_error",            0)),
+            ("job_create_failed",                 signals.get("job_failed",          0)),
+            ("worksite_create_failed",            signals.get("worksite_failed",     0)),
+            ("sf_field_quarantined",              signals.get("quarantined",         0)),
+            ("sf_sync_skipped_no_mapping",        signals.get("skipped",             0)),
+            ("mapping_blocked_no_practice_value", signals.get("blocked_no_practice", 0)),
+            ("scrape_silent_failure",             signals.get("silent_failure",      0)),
         ]
         downstream_total = sum(n for _, n in downstream_events)
         history_total = sum([
@@ -204,6 +206,37 @@ def _decide_and_send_alerts(conn, per_row_state, link_run_id: int, schema: str) 
 
         # Empty-row signal (we wrote a job_content with job_id NULL or empty title).
         empty_row = signals.get("empty_row_this_run", False)
+
+        # When the scrape silently failed (job_content row written but every
+        # critical field empty — auth wall, layout change, login redirect),
+        # log a scrape_silent_failure event so the auto-retry / quarantine
+        # surface tracks it the same way it tracks mapping_blocked_no_practice_value.
+        # Without this event, the empty-row signal lived only inside the alert
+        # decision and operators had no per-run counter to reason about.
+        if empty_row:
+            try:
+                from utils.supabase_db import log_job_event
+                log_job_event(
+                    conn,
+                    job_id=worst["job_post_id"],
+                    event_type="scrape_silent_failure",
+                    run_id=link_run_id,
+                    schema=schema,
+                    payload={
+                        "reason": "empty_critical_fields",
+                        "detail": (
+                            "Scrape wrote a job_content row with empty critical fields "
+                            "(title_line / description_full_text / job_title). Auto-retry "
+                            "will pick this up on the next cron tick."
+                        ),
+                        "view_job_link": worst.get("view_job_link"),
+                        "batch_size": len(rows),
+                        "sibling_success": any_success_in_batch,
+                        "automation_kind": "kimedics_scrape_silent_failure",
+                    },
+                )
+            except Exception as ev_err:
+                print(f"  [alert_email] failed to log scrape_silent_failure for #{worst['job_post_id']}: {ev_err}")
 
         if not (validator_says_alert or downstream_says_alert or empty_row):
             continue  # nothing to alert on for this job
@@ -251,12 +284,14 @@ def _query_alerting_signals(conn, job_ids: list[str], link_run_id: int, schema: 
             """
             SELECT
               job_id,
-              count(*) FILTER (WHERE event_type='sf_scrape_fields_error')     AS sf_error,
-              count(*) FILTER (WHERE event_type='job_create_failed')          AS job_failed,
-              count(*) FILTER (WHERE event_type='worksite_create_failed')     AS worksite_failed,
-              count(*) FILTER (WHERE event_type='sf_field_quarantined')       AS quarantined,
-              count(*) FILTER (WHERE event_type='sf_sync_skipped_no_mapping') AS skipped,
-              count(*) FILTER (WHERE event_type='sf_scrape_fields_patched')   AS patched_events,
+              count(*) FILTER (WHERE event_type='sf_scrape_fields_error')            AS sf_error,
+              count(*) FILTER (WHERE event_type='job_create_failed')                 AS job_failed,
+              count(*) FILTER (WHERE event_type='worksite_create_failed')            AS worksite_failed,
+              count(*) FILTER (WHERE event_type='sf_field_quarantined')              AS quarantined,
+              count(*) FILTER (WHERE event_type='sf_sync_skipped_no_mapping')        AS skipped,
+              count(*) FILTER (WHERE event_type='mapping_blocked_no_practice_value') AS blocked_no_practice,
+              count(*) FILTER (WHERE event_type='scrape_silent_failure')             AS silent_failure,
+              count(*) FILTER (WHERE event_type='sf_scrape_fields_patched')          AS patched_events,
               bool_or(event_type='job_created_in_salesforce')                 AS created_record,
               SUM(jsonb_array_length(COALESCE(payload->'fields_changed','[]'::jsonb)))
                 FILTER (WHERE event_type='sf_scrape_fields_patched')          AS patched_fields
@@ -267,16 +302,18 @@ def _query_alerting_signals(conn, job_ids: list[str], link_run_id: int, schema: 
             (link_run_id, job_ids),
         )
         for row in cur.fetchall():
-            jid, sf_err, jf, wf, q, sk, p_evt, created, p_fld = row
+            jid, sf_err, jf, wf, q, sk, bnp, sf_sil, p_evt, created, p_fld = row
             out.setdefault(jid, {}).update({
-                "sf_error":        int(sf_err or 0),
-                "job_failed":      int(jf or 0),
-                "worksite_failed": int(wf or 0),
-                "quarantined":     int(q or 0),
-                "skipped":         int(sk or 0),
-                "patched_events":  int(p_evt or 0),
-                "patched_fields":  int(p_fld or 0),
-                "created_record":  bool(created),
+                "sf_error":            int(sf_err or 0),
+                "job_failed":          int(jf or 0),
+                "worksite_failed":     int(wf or 0),
+                "quarantined":         int(q or 0),
+                "skipped":             int(sk or 0),
+                "blocked_no_practice": int(bnp or 0),
+                "silent_failure":      int(sf_sil or 0),
+                "patched_events":      int(p_evt or 0),
+                "patched_fields":      int(p_fld or 0),
+                "created_record":      bool(created),
             })
 
         # 2. Recent unresolved failures (same rule as the Stuck list).

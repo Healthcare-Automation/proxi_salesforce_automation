@@ -287,11 +287,13 @@ def send_scrape_alert(
         ev_rows = []
         # Plain-language labels for non-technical readers.
         labels = {
-            "sf_scrape_fields_error":     "SF field push error",
-            "job_create_failed":          "SF Job__c create failed",
-            "worksite_create_failed":     "SF Worksite__c create failed",
-            "sf_field_quarantined":       "Field quarantined (SF rejected)",
-            "sf_sync_skipped_no_mapping": "Sync skipped (no SF mapping)",
+            "sf_scrape_fields_error":            "SF field push error",
+            "job_create_failed":                 "SF Job__c create failed",
+            "worksite_create_failed":            "SF Worksite__c create failed",
+            "sf_field_quarantined":              "Field quarantined (SF rejected)",
+            "sf_sync_skipped_no_mapping":        "Sync skipped (no SF mapping)",
+            "mapping_blocked_no_practice_value": "Blocked: empty practice_value (would create duplicate)",
+            "scrape_silent_failure":             "Silent scrape failure (empty job_content row)",
         }
         for et, n in downstream_events:
             ev_rows.append(
@@ -443,6 +445,8 @@ def send_daily_summary(stats: dict) -> bool:
     stuck_jobs      = g("stuck_jobs",           0)
     scrape_fails    = g("scrape_failures",      0)
     fields_quarantined    = g("fields_quarantined",      0)
+    blocked_no_practice   = g("blocked_no_practice",     0)
+    silent_failures       = g("silent_failures",         0)
     pushes_recovered      = g("pushes_recovered",        0)
     push_errors_total     = g("push_errors_total",       0)
     push_errors_unresolved = g("push_errors_unresolved", 0)
@@ -456,7 +460,7 @@ def send_daily_summary(stats: dict) -> bool:
         return False
 
     # ── Health badge ──────────────────────────────────────────────────────────
-    if stuck_jobs > 0 or scrape_fails > 0 or push_errors_unresolved > 0:
+    if stuck_jobs > 0 or scrape_fails > 0 or push_errors_unresolved > 0 or blocked_no_practice > 0 or silent_failures > 0:
         health_badge = '<span class="badge badge-crit">NEEDS ATTENTION</span>'
         subject_pfx  = "🚨"
     elif ext_id_swaps > 0 or fields_quarantined > 0 or pushes_recovered > 0:
@@ -468,11 +472,13 @@ def send_daily_summary(stats: dict) -> bool:
 
     # Subject includes amendments when present so operators can triage from inbox.
     subject_amend = ""
-    if pushes_recovered or fields_quarantined or push_errors_unresolved:
+    if pushes_recovered or fields_quarantined or push_errors_unresolved or blocked_no_practice or silent_failures:
         bits = []
-        if pushes_recovered:     bits.append(f"{pushes_recovered} recovered")
-        if fields_quarantined:   bits.append(f"{fields_quarantined} field{'s' if fields_quarantined != 1 else ''} dropped")
+        if pushes_recovered:       bits.append(f"{pushes_recovered} recovered")
+        if fields_quarantined:     bits.append(f"{fields_quarantined} field{'s' if fields_quarantined != 1 else ''} dropped")
         if push_errors_unresolved: bits.append(f"{push_errors_unresolved} push err")
+        if blocked_no_practice:    bits.append(f"{blocked_no_practice} blocked (no practice)")
+        if silent_failures:        bits.append(f"{silent_failures} silent fail")
         subject_amend = " · " + " · ".join(bits)
     subject = (
         f"{subject_pfx} Proxi Daily — {period} — "
@@ -501,6 +507,8 @@ def send_daily_summary(stats: dict) -> bool:
         + _box(ext_id_swaps,    "ID Swaps",         color_amber if ext_id_swaps else "#aaa")
         + _box(pushes_recovered, "Push Recovered",  color_amber if pushes_recovered else "#aaa")
         + _box(fields_quarantined, "Fields Dropped", color_amber if fields_quarantined else "#aaa")
+        + _box(blocked_no_practice, "Blocked: No Practice", color_red if blocked_no_practice else "#aaa")
+        + _box(silent_failures, "Silent Scrape Fails", color_red if silent_failures else "#aaa")
         + _box(push_errors_unresolved, "Push Errors", color_red if push_errors_unresolved else "#aaa")
         + _box(auto_retries,    "Auto Retries",     "#0e7490" if auto_retries else "#aaa")
         + _box(manual_rescr,    "Manual Rescrapes", "#0369a1" if manual_rescr else "#aaa")

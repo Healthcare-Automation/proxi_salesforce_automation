@@ -70,7 +70,11 @@ _CANDIDATE_SQL = """
         SELECT DISTINCT ON (jel.job_id)
             jel.id, jel.job_id, jel.event_type, jel.run_id, jel.payload, jel.created_at
         FROM {schema}.job_event_log jel
-        WHERE jel.event_type IN ('sf_scrape_fields_error', 'sf_mapping_pull_failed')
+        WHERE jel.event_type IN (
+                'sf_scrape_fields_error',
+                'sf_mapping_pull_failed',
+                'mapping_blocked_no_practice_value'
+            )
           AND jel.created_at >= %(since)s
           {job_filter}
         ORDER BY jel.job_id, jel.created_at DESC
@@ -80,7 +84,12 @@ _CANDIDATE_SQL = """
     WHERE NOT EXISTS (
         SELECT 1 FROM {schema}.job_event_log ok
         WHERE ok.job_id = le.job_id
-          AND ok.event_type IN ('sf_scrape_fields_patched', 'sf_scrape_fields_recovered')
+          AND ok.event_type IN (
+                'sf_scrape_fields_patched',
+                'sf_scrape_fields_recovered',
+                'job_created_in_salesforce',
+                'sf_ids_update'
+            )
           AND ok.created_at >= le.created_at
     )
     ORDER BY le.created_at ASC
@@ -250,6 +259,7 @@ def recover_job_push(
     job_id = str(error_event.get("job_id") or "").strip()
     original_event_id = error_event.get("id")
     original_run_id = error_event.get("run_id")
+    event_type = str(error_event.get("event_type") or "").strip()
     payload = error_event.get("payload") or {}
     if isinstance(payload, str):
         try:
@@ -274,6 +284,58 @@ def recover_job_push(
     from utils.supabase_db import get_job_current
     rows = get_job_current(conn, job_ids=[job_id], limit=1, schema=schema)
     job_row = rows[0] if rows else {}
+
+    # ── mapping_blocked_no_practice_value: re-attempt mapping if practice_value has been filled. ──
+    # This event is emitted by sf_job_supabase_resolve when we refused to auto-create
+    # a Job__c because practice_value was empty. The fix is upstream (parser); we just
+    # keep re-running the resolver until practice_value lands, then let it match/create
+    # normally. If it's still empty, we re-emit the same event so the next pass sees it.
+    if event_type == "mapping_blocked_no_practice_value":
+        practice_now = (job_row.get("practice_value") or "").strip() if job_row else ""
+        if not practice_now:
+            if not dry_run:
+                try:
+                    log_job_event(
+                        conn,
+                        job_id=job_id,
+                        event_type="mapping_blocked_no_practice_value",
+                        run_id=original_run_id,
+                        schema=schema,
+                        payload={
+                            "reason": "empty_practice_value",
+                            "detail": (
+                                "Recovery re-checked job_current.practice_value — still empty. "
+                                "Will retry next pass. Upstream parser fix needed."
+                            ),
+                            "recovered_from_event_id": original_event_id,
+                            "recovery_run_id": recovery_run_id,
+                            "invocation": invocation,
+                            "automation_kind": "salesforce_job_create_blocked",
+                        },
+                    )
+                except Exception:
+                    pass
+            return res_stub(
+                "skipped",
+                error="practice_value still empty; awaiting parser fix",
+            )
+        if dry_run:
+            return res_stub(
+                "dry_run",
+                error=f"would re-resolve job (practice_value now: {practice_now[:80]!r})",
+            )
+        try:
+            from utils.sf_job_supabase_resolve import resolve_sf_ids_for_job_ids
+            resolve_sf_ids_for_job_ids(
+                conn, [job_id], schema=schema, run_id=recovery_run_id,
+            )
+            return res_stub(
+                "re_parsed",
+                sf_job_id=(job_row.get("sf_job_id") or None),
+                error=None,
+            )
+        except Exception as e:
+            return res_stub("unhandled", error=f"resolver retry failed: {str(e)[:300]}")
 
     # Build describe/label lookup once (needed to resolve "Volume" → "Job_Volume__c")
     describe: dict = {}

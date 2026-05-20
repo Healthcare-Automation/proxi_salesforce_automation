@@ -323,14 +323,28 @@ def _auto_retry_orphaned_scrapes(*, kimedics_email: str, kimedics_password: str)
                   COALESCE(att.n, 0)            AS prior_attempts,
                   att.last_attempt_at           AS last_attempt_at
                 FROM email_scrapes es
-                LEFT JOIN job_content jc ON jc.email_scrape_id = es.id
                 LEFT JOIN LATERAL (
                   SELECT count(*)::int AS n, MAX(jel.created_at) AS last_attempt_at
                   FROM job_event_log jel
                   WHERE jel.event_type = 'auto_retry_completed'
                     AND (jel.payload->>'email_scrape_id') = es.id::text
                 ) att ON true
-                WHERE jc.id IS NULL
+                -- Treat both true orphans (no job_content row) AND silent
+                -- failures (job_content row exists but every critical field
+                -- is empty — auth wall, layout change, login redirect) as
+                -- "not yet successfully scraped." Without this, the alert's
+                -- "Auto-retry will pick this up within ~5 min" promise was
+                -- broken because the empty row made the email_scrape look
+                -- complete.
+                WHERE NOT EXISTS (
+                        SELECT 1 FROM job_content j2
+                        WHERE j2.email_scrape_id = es.id
+                          AND (
+                            COALESCE(NULLIF(j2.title_line, ''), '') <> ''
+                            OR COALESCE(NULLIF(j2.description_full_text, ''), '') <> ''
+                            OR COALESCE(NULLIF(j2.job_title, ''), '') <> ''
+                          )
+                      )
                   AND es.job_post_id IS NOT NULL
                   AND es.job_post_id <> ''
                   AND es.created_at >= NOW() - (%s::text || ' hours')::interval
@@ -1013,9 +1027,11 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
                     bool_or(jel.event_type = 'auto_retry_completed')                   AS auto_retried,
                     -- Amendments / push errors that we want surfaced in the
                     -- daily report (in addition to the existing failure flags).
-                    count(*) FILTER (WHERE jel.event_type = 'sf_field_quarantined')        AS fields_quarantined,
-                    count(*) FILTER (WHERE jel.event_type = 'sf_scrape_fields_recovered')  AS push_recovered,
-                    count(*) FILTER (WHERE jel.event_type = 'sf_scrape_fields_error')      AS push_errors,
+                    count(*) FILTER (WHERE jel.event_type = 'sf_field_quarantined')              AS fields_quarantined,
+                    count(*) FILTER (WHERE jel.event_type = 'mapping_blocked_no_practice_value') AS blocked_no_practice,
+                    count(*) FILTER (WHERE jel.event_type = 'scrape_silent_failure')             AS silent_failures,
+                    count(*) FILTER (WHERE jel.event_type = 'sf_scrape_fields_recovered')        AS push_recovered,
+                    count(*) FILTER (WHERE jel.event_type = 'sf_scrape_fields_error')            AS push_errors,
                     -- Unresolved field-update errors: a push error with no later
                     -- recovered / patched event. This is the "still broken" signal.
                     bool_or(
@@ -1064,6 +1080,8 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
                   COALESCE(ev.manual_rescraped, false) AS manual_rescraped,
                   COALESCE(ev.auto_retried, false) AS auto_retried,
                   COALESCE(ev.fields_quarantined, 0) AS fields_quarantined,
+                  COALESCE(ev.blocked_no_practice, 0) AS blocked_no_practice,
+                  COALESCE(ev.silent_failures, 0)  AS silent_failures,
                   COALESCE(ev.push_recovered, 0)   AS push_recovered,
                   COALESCE(ev.push_errors, 0)      AS push_errors,
                   COALESCE(ev.push_error_unresolved, false) AS push_error_unresolved,
@@ -1100,6 +1118,8 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
     # rows where SF was patched but with edits, or rows where SF rejected
     # some/all of the update — operators wanted these surfaced in the report.
     stats["fields_quarantined"]   = sum(int(r["fields_quarantined"] or 0) for r in rows)
+    stats["blocked_no_practice"]  = sum(int(r["blocked_no_practice"] or 0) for r in rows)
+    stats["silent_failures"]      = sum(int(r["silent_failures"] or 0) for r in rows)
     stats["pushes_recovered"]     = sum(1 for r in rows if int(r["push_recovered"] or 0) > 0)
     stats["push_errors_total"]    = sum(int(r["push_errors"] or 0) for r in rows)
     stats["push_errors_unresolved"] = sum(1 for r in rows if r["push_error_unresolved"])
@@ -1603,6 +1623,32 @@ def run_daily_summary_for_date(date: str):
     """``modal run … :: run_daily_summary_for_date --date 2026-05-13``"""
     ok = daily_summary_for_date.remote(date)
     print(f"Done: daily summary for {date} sent={ok}")
+
+
+@app.function(
+    image=_light_image,
+    secrets=[modal.Secret.from_name("salesforce-automation")],
+    timeout=60,
+)
+def preview_insight_compress(value: str) -> dict:
+    """Run sanitize_insight_for_salesforce on a value and report what happens."""
+    sys.path.insert(0, "/root")
+    from utils.insight_sanitize import sanitize_insight_for_salesforce
+    out = sanitize_insight_for_salesforce(value)
+    return {
+        "input_len":  len(value),
+        "output":     out,
+        "output_len": len(out or ""),
+    }
+
+
+@app.local_entrypoint()
+def run_preview_insight(value: str):
+    """``modal run … :: run_preview_insight --value '*This assignment …'``"""
+    info = preview_insight_compress.remote(value)
+    print(f"INPUT  ({info['input_len']:3d} chars)")
+    print(f"OUTPUT ({info['output_len']:3d} chars / 255):")
+    print(info["output"])
 
 
 @app.local_entrypoint()
