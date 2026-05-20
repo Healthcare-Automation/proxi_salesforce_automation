@@ -181,14 +181,23 @@ def scrape_gmail_job():
     with get_conn() as conn:
         if conn:
             link_run_id = log_run_start(conn, "link_batch", ["job_post_id", "error"])
-            process_link_scrape_batch(
-                conn,
-                link_run_id=link_run_id,
-                scrape_results=scrape_results,
-                schema="public",
-            )
-            if link_run_id:
-                log_run_finish(conn, link_run_id)
+            # finally-guard log_run_finish: a downstream exception (alert email
+            # send, SF transient, etc.) must not leave scrape_runs.finished_at
+            # NULL — the validation dashboard reads that as Failed even though
+            # the underlying job_content + events landed fine.
+            try:
+                process_link_scrape_batch(
+                    conn,
+                    link_run_id=link_run_id,
+                    scrape_results=scrape_results,
+                    schema="public",
+                )
+            finally:
+                if link_run_id:
+                    try:
+                        log_run_finish(conn, link_run_id)
+                    except Exception as _e:
+                        print(f"log_run_finish(link_batch={link_run_id}) failed: {_e}")
 
     # Check for authentication failures and send immediate alert
     auth_failures = [r for r in scrape_results if r.get("authentication_failed")]
@@ -416,12 +425,19 @@ def _auto_retry_orphaned_scrapes(*, kimedics_email: str, kimedics_password: str)
                 scrape_results=scrape_results,
                 schema="public",
             )
-            if retry_run_id:
-                log_run_finish(conn, retry_run_id)
             conn.commit()
         except Exception as e:
             try: conn.rollback()
             except Exception: pass
+        finally:
+            # Stamp finished_at regardless of how the batch terminated, so the
+            # validation dashboard doesn't report this run as Failed when the
+            # work landed but a later step raised.
+            if retry_run_id:
+                try:
+                    log_run_finish(conn, retry_run_id)
+                except Exception as _e:
+                    print(f"log_run_finish(auto_retry={retry_run_id}) failed: {_e}")
             print(f"Auto-retry: pipeline write failed: {e}")
             return
 
@@ -662,15 +678,20 @@ def manual_rescrape_endpoint(payload: dict):
                 scrape_results=scrape_results,
                 schema="public",
             )
-            if link_run_id:
-                log_run_finish(conn, link_run_id)
             conn.commit()
         except Exception as e:
             try:
                 conn.rollback()
             except Exception:
                 pass
+            # log_run_finish still runs in the finally block below.
             raise HTTPException(status_code=500, detail=f"rescrape pipeline failed: {e}")
+        finally:
+            if link_run_id:
+                try:
+                    log_run_finish(conn, link_run_id)
+                except Exception as _e:
+                    print(f"log_run_finish(manual_rescrape={link_run_id}) failed: {_e}")
 
     # Best-effort SF push retry on the just-touched job_ids (mirrors the cron's
     # tail-recovery step) so a freshly written job_content row that hits a
