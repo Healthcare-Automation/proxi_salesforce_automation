@@ -24,14 +24,15 @@ Order
 5. **AI** fallback on practice string when deterministic matching had 0 hits.
    Only acts on ``high`` confidence (``medium`` is intentionally dropped).
 6. **No match**: log ``mapping_no_match``; then ``_try_create_sf_job_after_no_match``:
-   - If the resolved worksite already hosts a Job__c whose ``Job_Client_Job_Id__c``
-     references our city/state, **ID-swap** into it (no duplicate create).
-   - Otherwise POST a new ``Job__c`` (creating the worksite first if
-     ``PROXI_SF_CREATE_WORKSITES=true``).
+   - Resolve a worksite Account Id from ``sf_worksite_location_map`` (or
+     create one when ``PROXI_SF_CREATE_WORKSITES=true``).
+   - POST a brand-new ``Job__c`` at that worksite using Kimedics values.
+   - Existing Job__c records at the same worksite (e.g. closed prior postings)
+     are NOT touched — each Kimedics ``job_id`` gets its own SF Job__c.
+     History is preserved.
 
 The next field-sync cycle PATCHes every Kimedics-derived value onto the
-linked Job__c — including ``External_Job_ID__c`` — so an ID-swap naturally
-overwrites the existing record's values without a second code path.
+newly-created (or, in the recovery cases above, re-linked) Job__c.
 """
 
 from __future__ import annotations
@@ -229,49 +230,12 @@ def _try_create_sf_job_after_no_match(
 
     latest["sf_worksite_account_id"] = w
 
-    # ── Existing Job__c at resolved worksite → ID-swap instead of create. ──
-    # If the resolved worksite already hosts a Job__c whose Job_Client_Job_Id__c
-    # references our city/state, repoint that existing record's
-    # External_Job_ID__c to our Kimedics job_id (via the local mapping table —
-    # the next field-sync cycle then PATCHes the rest of the values onto it).
-    # This avoids both (a) duplicate Job__c rows at the same worksite and (b)
-    # a human-in-the-loop "review" state that would freeze new postings forever.
-    if sf_jobs and w and city and state:
-        practice_raw = (latest.get("practice_value") or "").strip()
-        cl = city.lower()
-        su = state.upper()
-        suspicious: list[dict] = []
-        for j in sf_jobs:
-            j_w = (j.get("Job_Worksite_Location_1__c") or "").strip()
-            if j_w != w:
-                continue
-            j_practice = (j.get("Job_Client_Job_Id__c") or "")
-            if not j_practice:
-                continue
-            j_low = j_practice.lower()
-            if cl in j_low and su in j_practice.upper():
-                suspicious.append(j)
-        pick = _pick_swap_candidate(suspicious)
-        if pick is not None:
-            sfid = (pick.get("Id") or "").strip()
-            if sfid:
-                prev_ext = (pick.get("External_Job_ID__c") or "").strip()
-                update_sf_ids_for_job(
-                    conn,
-                    job_id=jid,
-                    sf_job_id=sfid,
-                    sf_worksite_account_id=w,
-                    source="sf_existing_job_at_worksite_id_swap",
-                    mapping_status="resolved",
-                    mapping_detail=(
-                        "ID-swap into existing Job__c at resolved worksite "
-                        f"(candidates={len(suspicious)}, prev External_Job_ID__c="
-                        f"{prev_ext or '<empty>'!r})"
-                    ),
-                    run_id=run_id,
-                    schema=schema,
-                )
-                return True
+    # Each new Kimedics posting that reaches this path gets its own fresh
+    # Job__c at the resolved worksite. Historical Job__c records at the same
+    # worksite (e.g. closed prior postings) stay where they are — they're
+    # history, not duplicates. The previous "ID-swap if anything's at the
+    # worksite" guard violated the design rule "no human in the loop AND
+    # one Kimedics job_id == one Salesforce Job__c."
 
     eid_trim = _truncate_external_job_id(jid)
     if eid_trim:
