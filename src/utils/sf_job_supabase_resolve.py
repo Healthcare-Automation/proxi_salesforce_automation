@@ -1,22 +1,37 @@
 """
 Fill missing ``sf_job_id`` / ``sf_worksite_account_id`` on Supabase after a Kimedics scrape.
 
-Order:
+Design rule
+-----------
+Every incoming Kimedics job either (a) links to an existing Salesforce Job__c,
+or (b) creates a new Salesforce Job__c (and Worksite__c, when needed) within
+the same pipeline run. There is **no human-in-the-loop step**. Earlier versions
+of this resolver emitted ``mapping_review_required`` / ``mapping_ambiguous``
+and stopped — those events still appear in the historical log but are no
+longer generated.
+
+Order
+-----
 1. Skip if ``job_current`` already has both ``sf_job_id`` and ``sf_worksite_account_id``.
 2. Merge from newest ``job_content`` with both ids (history carry-forward).
-3. **External Job ID** match: Kimedics ``job_id`` ↔ ``External_Job_ID__c`` (1:1 only; same truncation as push).
-   Primary when many jobs already carry ``External_Job_ID__c`` in Salesforce (avoids wrong practice / Client Job Id typos).
-4. **Practice** match: normalized ``practice_value`` ↔ ``Job_Client_Job_Id__c`` (1:1 only; N>1 → ambiguous, no update).
-   Used when external id is absent or unmatched in the pulled SF snapshot.
-5. **AI** fallback on practice string when practice key had 0 hits.
-6. **No match**: log ``mapping_no_match``; if ``PROXI_SF_CREATE_JOBS=true`` and ``PROXI_SF_UPDATE_JOBS``
-   is not false, **POST** a new ``Job__c`` (needs a worksite Account Id from ``sf_worksite_location_map``
-   or ``PROXI_SF_CREATE_WORKSITES=true``).
+3. **External Job ID** match: Kimedics ``job_id`` ↔ ``External_Job_ID__c``.
+   1:1 → link. N>1 → deterministically pick the most recently modified candidate,
+   ID-swap into it, and emit ``mapping_external_id_duplicate_resolved`` so the
+   duplicates can be cleaned up out-of-band.
+4. **Practice** match: normalized ``practice_value`` ↔ ``Job_Client_Job_Id__c``.
+   1:1 → link. N>1 → deterministically pick (prefer no existing
+   ``External_Job_ID__c``; break ties by ``LastModifiedDate``), ID-swap into it.
+5. **AI** fallback on practice string when deterministic matching had 0 hits.
+   Only acts on ``high`` confidence (``medium`` is intentionally dropped).
+6. **No match**: log ``mapping_no_match``; then ``_try_create_sf_job_after_no_match``:
+   - If the resolved worksite already hosts a Job__c whose ``Job_Client_Job_Id__c``
+     references our city/state, **ID-swap** into it (no duplicate create).
+   - Otherwise POST a new ``Job__c`` (creating the worksite first if
+     ``PROXI_SF_CREATE_WORKSITES=true``).
 
-Before POST, a **direct SOQL** by ``External_Job_ID__c`` runs so an existing ``Job__c`` (e.g. after
-Supabase was reset but Salesforce was not) **re-links** instead of duplicate-create failing.
-
-Does not create jobs when mapping is ambiguous (1:N).
+The next field-sync cycle PATCHes every Kimedics-derived value onto the
+linked Job__c — including ``External_Job_ID__c`` — so an ID-swap naturally
+overwrites the existing record's values without a second code path.
 """
 
 from __future__ import annotations
@@ -30,6 +45,27 @@ from utils.sf_write_flags import proxi_sf_writes_enabled
 
 def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _pick_swap_candidate(candidates: Sequence[dict]) -> Optional[dict]:
+    """Pick which existing Job__c the resolver should ID-swap into.
+
+    Rule:
+      1. Prefer candidates with NO existing ``External_Job_ID__c`` (so we don't
+         stomp another Kimedics ↔ SF link).
+      2. Break ties by most-recently modified.
+
+    Returns None if the list is empty. Never raises.
+    """
+    if not candidates:
+        return None
+
+    def _mtime(c: dict) -> str:
+        return (c.get("LastModifiedDate") or "")
+
+    no_ext = [c for c in candidates if not (c.get("External_Job_ID__c") or "").strip()]
+    pool = no_ext if no_ext else list(candidates)
+    return sorted(pool, key=_mtime, reverse=True)[0]
 
 
 def _sf_rest_token() -> Optional[tuple[str, str]]:
@@ -193,11 +229,13 @@ def _try_create_sf_job_after_no_match(
 
     latest["sf_worksite_account_id"] = w
 
-    # ── Pre-create safety: do NOT create a duplicate Job__c at the same worksite. ──
+    # ── Existing Job__c at resolved worksite → ID-swap instead of create. ──
     # If the resolved worksite already hosts a Job__c whose Job_Client_Job_Id__c
-    # references our city/state, the most likely explanation is that our
-    # practice_value is malformed (e.g. "419 - Georgetown, KY" should be "2419 -
-    # Georgetown, KY"). Skip the create and flag for manual review.
+    # references our city/state, repoint that existing record's
+    # External_Job_ID__c to our Kimedics job_id (via the local mapping table —
+    # the next field-sync cycle then PATCHes the rest of the values onto it).
+    # This avoids both (a) duplicate Job__c rows at the same worksite and (b)
+    # a human-in-the-loop "review" state that would freeze new postings forever.
     if sf_jobs and w and city and state:
         practice_raw = (latest.get("practice_value") or "").strip()
         cl = city.lower()
@@ -213,32 +251,27 @@ def _try_create_sf_job_after_no_match(
             j_low = j_practice.lower()
             if cl in j_low and su in j_practice.upper():
                 suspicious.append(j)
-        if suspicious:
-            log_job_event(
-                conn,
-                job_id=jid,
-                event_type="mapping_review_required",
-                schema=schema,
-                run_id=run_id,
-                payload={
-                    "reason": "existing_job_at_resolved_worksite_with_matching_location",
-                    "detail": (
-                        "Skipped Job__c create — the resolved worksite already has "
-                        "a Job__c with a Job_Client_Job_Id__c that matches our "
-                        "city/state. Our practice_value may be malformed. Manual "
-                        "review required."
+        pick = _pick_swap_candidate(suspicious)
+        if pick is not None:
+            sfid = (pick.get("Id") or "").strip()
+            if sfid:
+                prev_ext = (pick.get("External_Job_ID__c") or "").strip()
+                update_sf_ids_for_job(
+                    conn,
+                    job_id=jid,
+                    sf_job_id=sfid,
+                    sf_worksite_account_id=w,
+                    source="sf_existing_job_at_worksite_id_swap",
+                    mapping_status="resolved",
+                    mapping_detail=(
+                        "ID-swap into existing Job__c at resolved worksite "
+                        f"(candidates={len(suspicious)}, prev External_Job_ID__c="
+                        f"{prev_ext or '<empty>'!r})"
                     ),
-                    "candidate_practice_value": practice_raw[:200] or None,
-                    "city": city,
-                    "state": state,
-                    "worksite_account_id": w,
-                    "existing_sf_job_ids": [s.get("Id") for s in suspicious],
-                    "existing_practice_values": [
-                        (s.get("Job_Client_Job_Id__c") or "")[:200] for s in suspicious
-                    ],
-                },
-            )
-            return False
+                    run_id=run_id,
+                    schema=schema,
+                )
+                return True
 
     eid_trim = _truncate_external_job_id(jid)
     if eid_trim:
@@ -270,20 +303,43 @@ def _try_create_sf_job_after_no_match(
                 )
                 return True
         if len(ex_hits) > 1:
-            log_job_event(
-                conn,
-                job_id=jid,
-                event_type="mapping_ambiguous",
-                schema=schema,
-                run_id=run_id,
-                payload={
-                    "source": "sf_external_job_id_direct_query",
-                    "external_id": eid_trim,
-                    "hits": len(ex_hits),
-                    "candidate_sf_job_ids": [(r.get("Id") or "").strip() for r in ex_hits],
-                },
-            )
-            return False
+            # >1 SF Job__c with the same External_Job_ID__c is a data-integrity
+            # violation (the field is supposed to be unique). ID-swap into the
+            # most recently modified one and log the duplicates so they can be
+            # cleaned up out-of-band — never block on this.
+            pick = _pick_swap_candidate(ex_hits)
+            sfid = (pick.get("Id") or "").strip() if pick else ""
+            losers = [(r.get("Id") or "").strip() for r in ex_hits if (r.get("Id") or "").strip() != sfid]
+            wid_pick = (pick.get("Job_Worksite_Location_1__c") or "").strip() if pick else ""
+            wid_use = wid_pick or w
+            if sfid:
+                update_sf_ids_for_job(
+                    conn,
+                    job_id=jid,
+                    sf_job_id=sfid,
+                    sf_worksite_account_id=wid_use,
+                    source="sf_external_job_id_duplicate_resolved",
+                    mapping_status="resolved",
+                    mapping_detail=(
+                        f"Multiple SF Job__c share External_Job_ID__c={eid_trim!r}; "
+                        f"picked most-recent ({sfid}). Duplicate ids: {losers}"
+                    ),
+                    run_id=run_id,
+                    schema=schema,
+                )
+                log_job_event(
+                    conn,
+                    job_id=jid,
+                    event_type="mapping_external_id_duplicate_resolved",
+                    schema=schema,
+                    run_id=run_id,
+                    payload={
+                        "external_id": eid_trim,
+                        "winner_sf_job_id": sfid,
+                        "duplicate_sf_job_ids": losers,
+                    },
+                )
+                return True
 
     try:
         from utils.job_sf_enrichment import enrich_cleaned_row_salesforce_fields
@@ -572,19 +628,44 @@ def resolve_sf_ids_for_job_ids(
             updated += 1
             continue
         if len(ext_hits) > 1:
-            log_job_event(
-                conn,
-                job_id=jid,
-                event_type="mapping_ambiguous",
-                schema=schema,
-                run_id=run_id,
-                payload={
-                    "source": "sf_external_job_id_match",
-                    "external_key": ext_key,
-                    "hits": len(ext_hits),
-                    "candidate_sf_job_ids": ext_hits,
-                },
-            )
+            # Data-integrity violation: multiple SF jobs share the same
+            # External_Job_ID__c. ID-swap into the most recently modified one
+            # and log the duplicates for out-of-band cleanup.
+            candidates_full = [sf_by_id[sid] for sid in ext_hits if sid in sf_by_id]
+            pick = _pick_swap_candidate(candidates_full)
+            sfid = (pick.get("Id") or "").strip() if pick else (ext_hits[0] if ext_hits else "")
+            losers = [s for s in ext_hits if s != sfid]
+            wid = (sf_by_id.get(sfid, {}).get("Job_Worksite_Location_1__c") or "").strip() or None
+            j_final = j or sfid
+            w_final = w or wid
+            if sfid:
+                update_sf_ids_for_job(
+                    conn,
+                    job_id=jid,
+                    sf_job_id=j_final or None,
+                    sf_worksite_account_id=w_final or None,
+                    source="sf_external_job_id_duplicate_resolved",
+                    mapping_status="resolved",
+                    mapping_detail=(
+                        f"Multiple SF Job__c share External_Job_ID__c key={ext_key!r}; "
+                        f"picked most-recent ({sfid}). Duplicate ids: {losers}"
+                    ),
+                    run_id=run_id,
+                    schema=schema,
+                )
+                log_job_event(
+                    conn,
+                    job_id=jid,
+                    event_type="mapping_external_id_duplicate_resolved",
+                    schema=schema,
+                    run_id=run_id,
+                    payload={
+                        "external_key": ext_key,
+                        "winner_sf_job_id": sfid,
+                        "duplicate_sf_job_ids": losers,
+                    },
+                )
+                updated += 1
             continue
 
         # ── Practice match (fallback when external id absent / no 1:1 in SF snapshot) ──
@@ -612,20 +693,33 @@ def resolve_sf_ids_for_job_ids(
             continue
 
         if len(hits) > 1:
-            log_job_event(
-                conn,
-                job_id=jid,
-                event_type="mapping_ambiguous",
-                schema=schema,
-                run_id=run_id,
-                payload={
-                    "source": "sf_practice_match",
-                    "practice_key": p or None,
-                    "practice_raw": practice_raw[:500] if practice_raw else None,
-                    "hits": len(hits),
-                    "candidate_sf_job_ids": hits,
-                },
-            )
+            # Multiple SF Job__c records share the same practice key. Per the
+            # "no human-in-the-loop" rule, ID-swap into the most recently
+            # modified one (preferring candidates without an existing
+            # External_Job_ID__c so we don't stomp another Kimedics ↔ SF link).
+            candidates_full = [sf_by_id[sid] for sid in hits if sid in sf_by_id]
+            pick = _pick_swap_candidate(candidates_full)
+            sfid = (pick.get("Id") or "").strip() if pick else (hits[0] if hits else "")
+            losers = [s for s in hits if s != sfid]
+            wid = (sf_by_id.get(sfid, {}).get("Job_Worksite_Location_1__c") or "").strip() or None
+            j_final = j or sfid
+            w_final = w or wid
+            if sfid:
+                update_sf_ids_for_job(
+                    conn,
+                    job_id=jid,
+                    sf_job_id=j_final or None,
+                    sf_worksite_account_id=w_final or None,
+                    source="sf_practice_match_deterministic_pick",
+                    mapping_status="resolved",
+                    mapping_detail=(
+                        f"{len(hits)} SF Job__c share practice_key={p!r}; "
+                        f"picked most-recent ({sfid}). Other candidates: {losers}"
+                    ),
+                    run_id=run_id,
+                    schema=schema,
+                )
+                updated += 1
             continue
 
         # ── AI fallback (only when deterministic matching found 0 hits) ──────

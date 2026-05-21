@@ -645,11 +645,14 @@ def query_count(
 
 
 # Minimal columns for Supabase ↔ Salesforce job id / practice matching (keep SOQL short and valid).
+# LastModifiedDate is included so the resolver's ID-swap candidate picker can break ties
+# deterministically when multiple SF Job__c records are valid swap targets.
 _RESOLVER_JOB_FIELDS: tuple[str, ...] = (
     "Id",
     "Job_Client_Job_Id__c",
     "Job_Worksite_Location_1__c",
     "External_Job_ID__c",
+    "LastModifiedDate",
 )
 
 
