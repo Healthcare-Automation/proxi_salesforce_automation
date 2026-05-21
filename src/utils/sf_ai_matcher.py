@@ -40,7 +40,8 @@ MODEL          = "gpt-4o-mini"
 TIMEOUT_SECS   = 15
 
 # Accepted confidence levels that we'll act on.
-_ACT_ON = {"high", "medium"}
+# Only "high" — "medium" is too risky for automation that runs without review.
+_ACT_ON = {"high"}
 
 
 class AIMatchResult(NamedTuple):
