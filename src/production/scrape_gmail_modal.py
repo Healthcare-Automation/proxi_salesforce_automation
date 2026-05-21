@@ -961,6 +961,7 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
         "scraped_ok":           0,
         "sf_mapped":            0,
         "sf_jobs_created":      0,
+        "worksites_created":    0,
         "field_patches_total":  0,
         "ext_id_swaps":         0,
         "manual_rescrapes":     0,
@@ -1016,6 +1017,7 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
                     COALESCE(SUM(jsonb_array_length(COALESCE(jel.payload->'fields_changed','[]'::jsonb)))
                              FILTER (WHERE jel.event_type = 'sf_scrape_fields_patched'), 0) AS fields_changed,
                     bool_or(jel.event_type = 'job_created_in_salesforce')              AS created_sf_job,
+                    bool_or(jel.event_type = 'worksite_created')                       AS created_sf_worksite,
                     bool_or(
                       jel.event_type = 'sf_scrape_fields_patched'
                       AND jel.payload->'fields_changed' ? 'External_Job_ID__c'
@@ -1076,6 +1078,7 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
                   COALESCE(ev.patch_events, 0)     AS patch_events,
                   COALESCE(ev.fields_changed, 0)   AS fields_changed,
                   COALESCE(ev.created_sf_job, false) AS created_sf_job,
+                  COALESCE(ev.created_sf_worksite, false) AS created_sf_worksite,
                   COALESCE(ev.ext_id_swap, false)  AS ext_id_swap,
                   COALESCE(ev.manual_rescraped, false) AS manual_rescraped,
                   COALESCE(ev.auto_retried, false) AS auto_retried,
@@ -1107,6 +1110,7 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
     stats["scraped_ok"]          = sum(1 for r in rows if r["scrape_ok"])
     stats["sf_mapped"]           = sum(1 for r in rows if r["sf_mapped"])
     stats["sf_jobs_created"]     = sum(1 for r in rows if r["created_sf_job"])
+    stats["worksites_created"]   = sum(1 for r in rows if r["created_sf_worksite"])
     stats["field_patches_total"] = sum(int(r["fields_changed"] or 0) for r in rows)
     stats["ext_id_swaps"]        = sum(1 for r in rows if r["ext_id_swap"])
     stats["manual_rescrapes"]    = sum(1 for r in rows if r["manual_rescraped"])
@@ -1204,6 +1208,7 @@ def _build_weekly_stats(get_conn) -> dict:
                         COALESCE(SUM(jsonb_array_length(COALESCE(jel.payload->'fields_changed','[]'::jsonb)))
                                  FILTER (WHERE jel.event_type = 'sf_scrape_fields_patched'), 0) AS fields_changed,
                         bool_or(jel.event_type = 'job_created_in_salesforce') AS created_sf_job,
+                        bool_or(jel.event_type = 'worksite_created')           AS created_sf_worksite,
                         MIN(jel.created_at) FILTER (WHERE jel.event_type IN ('sf_scrape_fields_patched','job_created_in_salesforce')) AS first_sf_action_at,
                         bool_or(
                           jel.event_type IN ('job_create_failed', 'worksite_create_failed')
@@ -1234,6 +1239,7 @@ def _build_weekly_stats(get_conn) -> dict:
                       jc.job_title, jc.posting_org, jc.practice_value, jc.sf_job_id,
                       COALESCE(ev.fields_changed, 0)    AS fields_changed,
                       COALESCE(ev.created_sf_job, false) AS created_sf_job,
+                      COALESCE(ev.created_sf_worksite, false) AS created_sf_worksite,
                       COALESCE(ev.stuck, false)         AS stuck,
                       ev.first_sf_action_at
                     FROM ev
@@ -1247,6 +1253,7 @@ def _build_weekly_stats(get_conn) -> dict:
         agg["scraped_ok"]          = sum(1 for r in rows if r["scrape_ok"])
         agg["sf_mapped"]           = sum(1 for r in rows if r["sf_mapped"])
         agg["sf_jobs_created"]     = sum(1 for r in rows if r["created_sf_job"])
+        agg["worksites_created"]   = sum(1 for r in rows if r["created_sf_worksite"])
         agg["field_patches_total"] = sum(int(r["fields_changed"] or 0) for r in rows)
         agg["needs_attention"]     = sum(1 for r in rows if r["stuck"])
 
