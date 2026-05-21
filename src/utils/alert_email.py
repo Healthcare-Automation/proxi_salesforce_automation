@@ -423,6 +423,7 @@ def send_daily_summary(stats: dict) -> bool:
       scraped_ok           int   — job_content has title + description
       sf_mapped            int   — job_content has sf_job_id
       sf_jobs_created      int   — new Job__c created in SF during window
+      worksites_created    int   — new Worksite__c (Account) created in SF during window
       field_patches_total  int   — total SF fields patched (across all emails)
       ext_id_swaps         int   — External_Job_ID__c repointed on existing record
       manual_rescrapes     int   — operator hit Rescrape in admin
@@ -438,6 +439,7 @@ def send_daily_summary(stats: dict) -> bool:
     scraped_ok      = g("scraped_ok",           0)
     sf_mapped       = g("sf_mapped",            0)
     sf_jobs_created = g("sf_jobs_created",      0)
+    worksites_created = g("worksites_created",  0)
     patches_total   = g("field_patches_total",  0)
     ext_id_swaps    = g("ext_id_swaps",         0)
     manual_rescr    = g("manual_rescrapes",     0)
@@ -502,7 +504,8 @@ def send_daily_summary(stats: dict) -> bool:
         + _box(emails,          "Emails Received")
         + _box(scraped_ok,      "Scraped OK",       color_ok if scraped_ok == emails else color_amber)
         + _box(sf_mapped,       "SF Job__c Mapped", color_ok if sf_mapped == emails else color_amber)
-        + _box(sf_jobs_created, "New SF Records")
+        + _box(sf_jobs_created, "New SF Job Records", "#0284c7" if sf_jobs_created else "#aaa")
+        + _box(worksites_created, "New SF Worksites", "#0369a1" if worksites_created else "#aaa")
         + _box(patches_total,   "SF Fields Patched")
         + _box(ext_id_swaps,    "ID Swaps",         color_amber if ext_id_swaps else "#aaa")
         + _box(pushes_recovered, "Push Recovered",  color_amber if pushes_recovered else "#aaa")
@@ -726,7 +729,8 @@ def send_daily_summary(stats: dict) -> bool:
     Emails received        : {emails}
     Scraped OK             : {scraped_ok}
     SF Job__c mapped       : {sf_mapped}
-    New SF records         : {sf_jobs_created}
+    New SF job records     : {sf_jobs_created}
+    New SF worksites       : {worksites_created}
     SF fields patched      : {patches_total}
     External_Job_ID swaps  : {ext_id_swaps}
     Auto retries           : {auto_retries}
