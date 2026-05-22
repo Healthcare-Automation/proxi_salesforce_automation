@@ -27,6 +27,11 @@ from utils.address_display_format import (
     looks_like_real_street,
     strip_redundant_city_state_from_shipping_street,
 )
+from utils.address_normalize import (
+    location_key as _normalized_location_key,
+    normalize_city as _normalize_city,
+    normalize_state as _normalize_state,
+)
 from utils.sf_job_rest_minimal import create_account_record, filter_createable_fields, describe_sobject
 from utils.sf_push_defaults import (
     SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID,
@@ -49,6 +54,88 @@ def _account_extra_fields() -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return obj if isinstance(obj, dict) else {}
+
+
+def _soql_quote(s: str) -> str:
+    """SOQL-safe single-quoted literal."""
+    return (s or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _find_existing_worksite_in_sf(
+    *,
+    instance_url: str,
+    access_token: str,
+    city: str,
+    state: str,
+) -> Optional[tuple[str, str]]:
+    """
+    Search Salesforce for an existing Worksite Account under our parent that
+    matches this (city, state) — covers the case where someone created the
+    Account in SF manually (or via a script that didn't write to our local
+    map). Returns ``(account_id, source_tag)`` on hit, or None.
+
+    Source tags surfaced for audit visibility:
+      - ``name_exact``         : exact Name match under our parent
+      - ``city_state_norm``    : Name didn't match, but ShippingCity equals
+                                 the requested city and ShippingState
+                                 normalizes to the requested state
+    """
+    from utils.salesforce import query_all  # local import to avoid cycle
+
+    c = (city or "").strip()
+    st_abbrev = _normalize_state(state)
+    if not c or not st_abbrev:
+        return None
+
+    parent_id = (SF_ACCOUNT_ASPEN_DENTAL_MANAGEMENT_ID or "").strip()
+    if not parent_id:
+        return None
+
+    expected_name = format_worksite_account_name(c, st_abbrev)
+    fields = "Id, Name, ShippingCity, ShippingState, ParentId, LastModifiedDate"
+
+    # Strategy 1: exact name match. Names are deterministic for our format,
+    # so this catches cleanly-cased duplicates with one query.
+    try:
+        soql = (
+            f"SELECT {fields} FROM Account "
+            f"WHERE ParentId = '{_soql_quote(parent_id)}' "
+            f"AND Name = '{_soql_quote(expected_name)}' "
+            f"LIMIT 5"
+        )
+        hits = query_all(instance_url, access_token, soql)
+    except Exception:
+        hits = []
+    for r in hits:
+        sf_id = (r.get("Id") or "").strip()
+        if sf_id:
+            return sf_id, "name_exact"
+
+    # Strategy 2: same parent + city/state match (with state-normalization on
+    # the SF side). We pull a small candidate set keyed on ShippingCity, then
+    # compare normalized state in Python so 'OK' vs 'Oklahoma' isn't a miss.
+    try:
+        soql = (
+            f"SELECT {fields} FROM Account "
+            f"WHERE ParentId = '{_soql_quote(parent_id)}' "
+            f"AND ShippingCity = '{_soql_quote(c)}' "
+            f"LIMIT 20"
+        )
+        hits = query_all(instance_url, access_token, soql)
+    except Exception:
+        hits = []
+
+    requested_city_norm = _normalize_city(c)
+    for r in hits:
+        sf_id = (r.get("Id") or "").strip()
+        if not sf_id:
+            continue
+        sf_state_norm = _normalize_state(r.get("ShippingState"))
+        sf_city_norm = _normalize_city(r.get("ShippingCity"))
+        if sf_state_norm == st_abbrev and sf_city_norm == requested_city_norm:
+            return sf_id, "city_state_norm"
+
+    return None
 
 
 def fetch_or_create_worksite_account_id(
@@ -87,6 +174,61 @@ def fetch_or_create_worksite_account_id(
         existing = fetch_worksite_account_id_for_location(conn, c, st, schema=schema)
         if existing:
             return existing
+
+    # Before creating a brand-new worksite Account, ask Salesforce directly
+    # whether one already exists for this (city, state) under the same parent.
+    # The local sf_worksite_location_map only contains worksites the automation
+    # has interacted with — Accounts created manually in Salesforce (or by an
+    # earlier version of the pipeline) will be absent. Without this probe we
+    # silently created duplicates whenever the cache was cold for a location.
+    #
+    # Match strategy, in order:
+    #   1. Exact Name match under our parent (deterministic format).
+    #   2. Same parent + normalized City + normalized State match.
+    #
+    # On hit, we ALSO backfill the local map so the next lookup is fast.
+    soql_hit = _find_existing_worksite_in_sf(
+        instance_url=instance_url,
+        access_token=access_token,
+        city=c,
+        state=st,
+    )
+    if soql_hit:
+        sf_id, hit_source = soql_hit
+        try:
+            upsert_worksite_account_id_for_location(
+                conn,
+                c,
+                st,
+                salesforce_account_id=sf_id,
+                display_label=format_worksite_account_name(c, st),
+                source=f"sf_account_existing_via_{hit_source}",
+                schema=schema,
+            )
+        except Exception:
+            pass  # backfill is best-effort; the linkage is what matters
+        if job_id_for_log:
+            try:
+                log_job_event(
+                    conn,
+                    job_id=job_id_for_log,
+                    event_type="worksite_relinked",
+                    run_id=run_id,
+                    schema=schema,
+                    payload={
+                        "city": c,
+                        "state": st,
+                        "salesforce_account_id": sf_id,
+                        "source": hit_source,
+                        "detail": (
+                            "Found existing SF Account at this worksite via direct SOQL "
+                            "probe — backfilled local map and skipped duplicate create."
+                        ),
+                    },
+                )
+            except Exception:
+                pass
+        return sf_id
 
     if not proxi_sf_writes_enabled():
         return None

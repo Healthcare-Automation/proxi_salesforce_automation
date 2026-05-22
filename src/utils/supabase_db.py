@@ -269,13 +269,31 @@ def _ensure_sf_mapping_tables(conn, schema: str = "public") -> None:
 
 
 def _normalize_location_key(city: str, state: str) -> str:
-    c = (city or "").strip().lower()
-    s = (state or "").strip().upper()
-    c = " ".join(c.split())
-    s = " ".join(s.split())
-    if not c and not s:
+    """
+    Stable (city, state) key for sf_worksite_location_map. Delegates to
+    utils.address_normalize so the same canonical form is used everywhere
+    ("Oklahoma" and "OK" collapse to the same key, etc.).
+
+    Kept name-compatible with prior callers — returns "" only when both
+    components are empty AFTER normalization. If one normalizes but the
+    other doesn't, we fall back to the legacy concatenation so we don't
+    silently lose lookups that worked before.
+    """
+    from utils.address_normalize import normalize_city, normalize_state
+
+    c = normalize_city(city)
+    s = normalize_state(state)
+    if c and s:
+        return f"{c}|{s}"
+
+    # Legacy fallback — preserve old behavior when one side is missing or
+    # unknown (e.g. partial data during a recovery), so existing rows in
+    # sf_worksite_location_map written under the old key still resolve.
+    legacy_c = " ".join((city or "").strip().lower().split())
+    legacy_s = " ".join((state or "").strip().upper().split())
+    if not legacy_c and not legacy_s:
         return ""
-    return f"{c}|{s}"
+    return f"{legacy_c}|{legacy_s}"
 
 
 def fetch_worksite_account_id_for_location(
