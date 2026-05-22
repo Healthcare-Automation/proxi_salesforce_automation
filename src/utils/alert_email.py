@@ -65,17 +65,33 @@ _BASE_STYLE = """
   .badge-warn { background:#fef3e2; color:#d35400; }
   .badge-info { background:#e8f4fb; color:#2980b9; }
   .badge-ok   { background:#e8f8f0; color:#27ae60; }
-  .stat-row { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:20px; }
-  .stat-box { flex:1; min-width:120px; background:#f8f8f8; border:1px solid #e8e8e8;
-              border-radius:6px; padding:14px 16px; text-align:center; }
-  .stat-box .num { font-size:28px; font-weight:700; color:#1a1a2e; line-height:1; }
-  .stat-box .lbl { font-size:11px; color:#888; margin-top:4px; text-transform:uppercase;
-                   letter-spacing:.5px; }
+  /* Stat grid — uses inline-block (not flex) for broad email-client support.
+     Each box is 25% wide so 4 fit per row; remaining boxes wrap below.
+     Long labels wrap inside the box instead of getting truncated. */
+  .stat-row { font-size:0; margin-bottom:20px; line-height:0; }
+  .stat-box { display:inline-block; vertical-align:top; box-sizing:border-box;
+              width:calc(25% - 8px); margin:0 8px 8px 0;
+              background:#f8f8f8; border:1px solid #e8e8e8; border-radius:6px;
+              padding:14px 12px; text-align:center; font-size:14px; line-height:1.4; }
+  .stat-box .num { font-size:26px; font-weight:700; color:#1a1a2e; line-height:1.1;
+                   display:block; }
+  .stat-box .lbl { font-size:10.5px; color:#888; margin-top:6px; text-transform:uppercase;
+                   letter-spacing:.4px; word-break:break-word; line-height:1.3; display:block; }
   .footer { background:#f5f5f5; padding:14px 28px; font-size:11px; color:#999;
             border-top:1px solid #e8e8e8; }
   code { background:#f0f0f0; border-radius:3px; padding:1px 5px;
          font-family:monospace; font-size:12px; }
   .mono { font-family:monospace; font-size:12px; color:#555; }
+  /* Mobile: stat boxes drop from 4-up to 2-up. Inner padding tightens so the
+     table-rendered body doesn't introduce horizontal scrolling on phones. */
+  @media only screen and (max-width: 600px) {
+    .body { padding:16px !important; }
+    .stat-box { width:calc(50% - 8px) !important; padding:12px 10px !important; }
+    .stat-box .num { font-size:24px !important; }
+    .stat-box .lbl { font-size:10px !important; }
+    table { font-size:12px !important; }
+    th, td { padding:5px 6px !important; }
+  }
 </style>
 """
 
@@ -629,6 +645,9 @@ def send_daily_summary(stats: dict) -> bool:
             if err_unresolved:
                 notes.append(_chip("push error", "red",
                                    "Salesforce field push errored and has not yet been recovered"))
+            if r.get("created_sf_worksite"):
+                notes.append(_chip("new worksite", "cyan",
+                                   "A Salesforce Worksite (Account) record was created for this job's practice/location"))
             if r["ext_id_swap"]:
                 notes.append(_chip("ID swap", "amber",
                                    "External_Job_ID__c was repointed on an existing SF record"))
