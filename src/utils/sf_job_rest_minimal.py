@@ -275,6 +275,30 @@ def is_salesforce_deleted_entity_error(exc: BaseException) -> bool:
     return "entityisdeleted" in compact or "isdeleted" in compact and "deleted" in msg
 
 
+_DUP_VALUE_RE = __import__("re").compile(
+    r"duplicate value found:\s*([A-Za-z0-9_]+)\s+duplicates value on record with id:\s*([A-Za-z0-9]{15,18})",
+    __import__("re").IGNORECASE,
+)
+
+
+def parse_duplicate_value_error(exc: BaseException) -> Optional[tuple[str, str]]:
+    """Parse SF "DUPLICATE_VALUE" PATCH/POST errors.
+
+    Salesforce returns text like::
+
+        Salesforce REST PATCH HTTP 400: duplicate value found:
+        Job_Client_Job_Id__c duplicates value on record with id: a015f00000KxRpaAAF
+
+    when a unique-constrained field on this object collides with another record.
+    Returns ``(field_api_name, conflicting_record_id)`` if the message matches,
+    otherwise ``None``.
+    """
+    m = _DUP_VALUE_RE.search(str(exc))
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
 def filter_updateable_fields(describe: dict, fields: dict) -> dict:
     updateable = {
         f["name"]

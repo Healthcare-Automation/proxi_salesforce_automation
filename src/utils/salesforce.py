@@ -723,6 +723,40 @@ def query_jobs_by_external_id_exact(
     return query_all(instance_url, access_token, soql, api_version)
 
 
+def query_jobs_by_worksite_id_exact(
+    instance_url: str,
+    access_token: str,
+    worksite_account_id: str,
+    *,
+    job_object_name: str = "Job__c",
+    api_version: str = DEFAULT_API_VERSION,
+) -> list[dict]:
+    """
+    Targeted SOQL for ``Job_Worksite_Location_1__c = <Id>``.
+
+    Used as the "one Job__c per worksite" safety net before POSTing a new ``Job__c``.
+    Salesforce's data model treats ``Job_Client_Job_Id__c`` as unique-per-practice, so
+    in practice each worksite Account should already have at most one Job__c — if we
+    find one here, we should re-link instead of creating a duplicate.
+    """
+    import re
+
+    wid = (worksite_account_id or "").strip()
+    if not wid:
+        return []
+    oname = (job_object_name or "Job__c").strip()
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]*$", oname):
+        return []
+    safe = wid.replace("\\", "\\\\").replace("'", "\\'")
+    fields_str = ", ".join(_RESOLVER_JOB_FIELDS)
+    soql = (
+        f"SELECT {fields_str} FROM {oname} "
+        f"WHERE Job_Worksite_Location_1__c = '{safe}' "
+        f"ORDER BY LastModifiedDate DESC"
+    )
+    return query_all(instance_url, access_token, soql, api_version)
+
+
 def pull_all_jobs(
     consumer_key: str,
     consumer_secret: str,
