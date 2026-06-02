@@ -127,7 +127,7 @@ def _try_create_sf_job_after_no_match(
         filter_createable_fields,
         is_salesforce_deleted_entity_error,
     )
-    from utils.salesforce import query_jobs_by_external_id_exact
+    from utils.salesforce import query_jobs_by_external_id_exact, query_jobs_by_worksite_id_exact
     from utils.sf_worksite_create import fetch_or_create_worksite_account_id
 
     jid = (job_id or "").strip()
@@ -304,6 +304,72 @@ def _try_create_sf_job_after_no_match(
                     },
                 )
                 return True
+
+    # ── Worksite-level safety net (the "one Job__c per practice" rule). ──
+    # SF treats Job_Client_Job_Id__c as unique, so each worksite Account is
+    # expected to have at most one Job__c. If we get here it means External_Job_ID
+    # lookup found nothing and the in-memory snapshot's practice-key index missed
+    # too (often because a single bad scrape produced a malformed practice_value
+    # like "Covington, LA" instead of "3077 - Covington, LA"). Before POSTing,
+    # SOQL-probe SF directly for any existing Job__c at this worksite and
+    # re-link to it instead of creating a duplicate.
+    try:
+        worksite_hits = query_jobs_by_worksite_id_exact(
+            instance_url, access_token, w, job_object_name=job_object_name
+        )
+    except Exception:
+        worksite_hits = []
+    if worksite_hits:
+        # Prefer a candidate WITHOUT a conflicting External_Job_ID__c (so we
+        # don't stomp another Kimedics ↔ SF link). Otherwise fall back to the
+        # most recently modified candidate (the SOQL is ORDER BY LastModifiedDate
+        # DESC, so worksite_hits[0] is the most-recent).
+        no_ext = [r for r in worksite_hits if not (r.get("External_Job_ID__c") or "").strip()]
+        pick = (no_ext[0] if no_ext else worksite_hits[0])
+        sfid = (pick.get("Id") or "").strip()
+        existing_ext = (pick.get("External_Job_ID__c") or "").strip() or None
+        other_ids = [
+            (r.get("Id") or "").strip()
+            for r in worksite_hits
+            if (r.get("Id") or "").strip() and (r.get("Id") or "").strip() != sfid
+        ]
+        if sfid:
+            update_sf_ids_for_job(
+                conn,
+                job_id=jid,
+                sf_job_id=sfid,
+                sf_worksite_account_id=w,
+                source="sf_existing_at_worksite",
+                mapping_status="resolved",
+                mapping_detail=(
+                    "Existing Job__c at resolved worksite (re-link; "
+                    "avoids duplicate POST when practice_value scrape is degraded)"
+                ),
+                run_id=run_id,
+                schema=schema,
+            )
+            log_job_event(
+                conn,
+                job_id=jid,
+                event_type="mapping_worksite_existing_job_relinked",
+                schema=schema,
+                run_id=run_id,
+                payload={
+                    "sf_worksite_account_id": w,
+                    "winner_sf_job_id": sfid,
+                    "winner_existing_external_job_id": existing_ext,
+                    "other_sf_job_ids_at_worksite": other_ids,
+                    "practice_raw": practice_raw_guard or None,
+                    "automation_kind": "salesforce_job_relinked_to_worksite",
+                    "summary": (
+                        "Re-linked to an existing Job__c at the resolved worksite instead of "
+                        "creating a duplicate. The kept record may already be linked to another "
+                        "Kimedics job_id via External_Job_ID__c — that's expected and fine; "
+                        "Job__c is one-per-practice in the SF model."
+                    ),
+                },
+            )
+            return True
 
     try:
         from utils.job_sf_enrichment import enrich_cleaned_row_salesforce_fields

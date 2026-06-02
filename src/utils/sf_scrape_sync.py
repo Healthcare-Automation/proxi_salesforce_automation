@@ -32,6 +32,7 @@ from utils.sf_job_rest_minimal import (
     describe_sobject,
     filter_field_names_to_describe,
     is_salesforce_deleted_entity_error,
+    parse_duplicate_value_error,
     rest_json,
     update_account_record,
     update_job_record,
@@ -599,6 +600,82 @@ def sync_missing_scrape_fields_to_salesforce(
             out["patched"] = True
             out["fields"] = sorted(body.keys())
             return out
+
+        # ── Self-heal on unique-constrained field collisions. ──
+        # When SF returns "duplicate value found: FIELD duplicates value on record
+        # with id: X", another Job__c already holds the value we're trying to write
+        # for FIELD (typically Job_Client_Job_Id__c when two SF Job__c records
+        # collide on the practice key). Drop FIELD from the payload, retry, and
+        # log the conflicting record id for later operator audit. Loop in case
+        # SF complains about additional unique fields on subsequent attempts.
+        dup = parse_duplicate_value_error(e)
+        if dup is not None:
+            dropped_fields: list[dict[str, str]] = []
+            retry_body = dict(body)
+            last_exc = e
+            for _ in range(3):
+                bad_field, conflict_id = dup
+                if bad_field not in retry_body:
+                    break
+                retry_body = {k: v for k, v in retry_body.items() if k != bad_field}
+                dropped_fields.append({"field": bad_field, "conflicting_record_id": conflict_id})
+                if not retry_body:
+                    break
+                try:
+                    update_job_record(
+                        instance_url, access_token, job_object_name, sf_job_id, retry_body
+                    )
+                    last_exc = None
+                    break
+                except Exception as e_dup:
+                    last_exc = e_dup
+                    nxt = parse_duplicate_value_error(e_dup)
+                    if nxt is None:
+                        break
+                    dup = nxt
+            if last_exc is None and retry_body:
+                body = retry_body
+                compared = known_audit
+                prev_full, next_full = _scrape_sync_prev_next_full(compared, desired, current, body)
+                _maybe_log(
+                    conn,
+                    jid_log,
+                    "sf_field_dropped_unique_collision",
+                    schema,
+                    {
+                        "sf_job_id": sf_job_id or None,
+                        "dropped_fields": dropped_fields,
+                        "detail": (
+                            "Another SF Job__c already holds the unique-constrained value we "
+                            "tried to write. Dropped the colliding field(s) and patched the rest. "
+                            "Conflicting record ids are listed for operator merge/cleanup."
+                        ),
+                    },
+                    run_id=run_id,
+                )
+                _maybe_log(
+                    conn,
+                    jid_log,
+                    "sf_scrape_fields_patched",
+                    schema,
+                    {
+                        "sf_job_id": sf_job_id or None,
+                        "fields_changed": sorted(body.keys()),
+                        "fields_compared": list(compared),
+                        "prev": prev_full,
+                        "next": next_full,
+                        "retried_after_unique_collision": True,
+                        "dropped_fields": dropped_fields,
+                    },
+                    run_id=run_id,
+                )
+                out["ok"] = True
+                out["patched"] = True
+                out["fields"] = sorted(body.keys())
+                return out
+            # All collision retries exhausted (or retry_body went empty) — fall
+            # through to the generic error log below so the failure is still
+            # surfaced for recovery.
 
         out["error"] = str(e)[:2000]
         _maybe_log(
