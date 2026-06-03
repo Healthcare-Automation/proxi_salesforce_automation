@@ -141,6 +141,7 @@ def scrape_gmail_job():
             print(f"Supabase connection failed: {err_msg}")
         return 0
 
+    run_id = None
     try:
         ensure_tables(conn)
         existing  = get_existing_email_keys(conn, since_hours_ago=SUPABASE_LOOKBACK_HOURS)
@@ -155,9 +156,17 @@ def scrape_gmail_job():
         if not run_id:
             return 0
         email_scrape_ids = log_email_scrapes(conn, run_id, new_rows, csv_fields)
-        log_run_finish(conn, run_id)
         conn.commit()
     finally:
+        # Mark the run as finished even if anything above raised after
+        # log_run_start. See the link_batch block below for the same pattern
+        # and rationale (orphaned scrape_runs rows show as "Failed" in the
+        # dashboard otherwise).
+        if run_id:
+            try:
+                log_run_finish(conn, run_id)
+            except Exception as e_fin:
+                print(f"warn: log_run_finish failed for gmail run_id={run_id}: {e_fin}")
         conn.close()
 
     print(f"Logged {len(new_rows)} new email(s) to Supabase (run_id={run_id})")
@@ -181,14 +190,25 @@ def scrape_gmail_job():
     with get_conn() as conn:
         if conn:
             link_run_id = log_run_start(conn, "link_batch", ["job_post_id", "error"])
-            process_link_scrape_batch(
-                conn,
-                link_run_id=link_run_id,
-                scrape_results=scrape_results,
-                schema="public",
-            )
-            if link_run_id:
-                log_run_finish(conn, link_run_id)
+            try:
+                process_link_scrape_batch(
+                    conn,
+                    link_run_id=link_run_id,
+                    scrape_results=scrape_results,
+                    schema="public",
+                )
+            finally:
+                # Always mark the run as finished, even if process_link_scrape_batch
+                # raised. Without this guarantee, the scrape_runs row stays orphaned
+                # (finished_at = NULL) and the dashboard reports "Failed" even when
+                # the work succeeded up to the exception. Best-effort: if the
+                # log_run_finish write itself fails, swallow it so we still let the
+                # original exception propagate.
+                if link_run_id:
+                    try:
+                        log_run_finish(conn, link_run_id)
+                    except Exception as e_fin:
+                        print(f"warn: log_run_finish failed for link_run_id={link_run_id}: {e_fin}")
 
     # Check for authentication failures and send immediate alert
     auth_failures = [r for r in scrape_results if r.get("authentication_failed")]
@@ -656,21 +676,30 @@ def manual_rescrape_endpoint(payload: dict):
             raise HTTPException(status_code=503, detail="DB connection unavailable")
         link_run_id = log_run_start(conn, "link_batch", ["job_post_id", "error"])
         try:
-            touched = process_link_scrape_batch(
-                conn,
-                link_run_id=link_run_id,
-                scrape_results=scrape_results,
-                schema="public",
-            )
-            if link_run_id:
-                log_run_finish(conn, link_run_id)
-            conn.commit()
-        except Exception as e:
             try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise HTTPException(status_code=500, detail=f"rescrape pipeline failed: {e}")
+                touched = process_link_scrape_batch(
+                    conn,
+                    link_run_id=link_run_id,
+                    scrape_results=scrape_results,
+                    schema="public",
+                )
+                conn.commit()
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise HTTPException(status_code=500, detail=f"rescrape pipeline failed: {e}")
+        finally:
+            # Mark the run as finished regardless of success/failure so the row
+            # doesn't sit orphaned (NULL finished_at → dashboard misclassifies
+            # as "Failed"). log_run_finish runs even after a rollback because
+            # it does its own UPDATE + commit on the scrape_runs row only.
+            if link_run_id:
+                try:
+                    log_run_finish(conn, link_run_id)
+                except Exception as e_fin:
+                    print(f"warn: log_run_finish failed for link_run_id={link_run_id}: {e_fin}")
 
     # Best-effort SF push retry on the just-touched job_ids (mirrors the cron's
     # tail-recovery step) so a freshly written job_content row that hits a
