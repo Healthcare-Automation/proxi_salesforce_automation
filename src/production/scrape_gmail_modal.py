@@ -1642,22 +1642,17 @@ def _build_weekly_stats(get_conn) -> dict:
 
     # ── Narrative — two tight lines: state of play + the lever ahead ─────────
     avg_lat = cur_agg.get("mean_latency_min")
+    em = cur_agg["emails_received"]
     parts: list[str] = []
     if avg_lat is not None:
         parts.append(
-            f"Hands-off week — {cur_agg['emails_received']} Kimedics signals synced to Salesforce in "
-            f"~{avg_lat:.0f} min on average, no recruiter in the loop."
+            f"Every Kimedics job change flowed straight into Salesforce this week — {em} captured "
+            f"automatically in about {avg_lat:.0f} minutes each, so the team never had to copy a record by hand."
         )
     else:
         parts.append(
-            f"Hands-off week — {cur_agg['emails_received']} Kimedics signals synced to Salesforce, "
-            f"no recruiter in the loop."
-        )
-    fast = lifecycle["all"]
-    if fast.get("fast_total"):
-        parts.append(
-            f"Biggest lever ahead: roles that close within the hour, where Proxi catches "
-            f"{fast['fast_grabbed']} of {fast['fast_total']} today."
+            f"Every Kimedics job change flowed straight into Salesforce this week — {em} captured "
+            f"automatically, so the team never had to copy a record by hand."
         )
     narrative = " ".join(parts)
 

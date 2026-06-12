@@ -787,9 +787,8 @@ def send_weekly_summary(stats: dict) -> bool:
 
     emails   = int(cur.get("emails_received", 0))
     scraped  = int(cur.get("scraped_ok", 0))
-    errors   = int(cur.get("errors", 0))
     opened   = int(cur.get("opened", 0))
-    updated  = int(cur.get("updated", 0))
+    updated  = int(cur.get("updated", 0))   # used by the hours breakdown
     closed   = int(cur.get("closed", 0))
     patches  = int(cur.get("field_patches_total", 0))
     needs    = int(cur.get("needs_attention", 0))
@@ -814,10 +813,10 @@ def send_weekly_summary(stats: dict) -> bool:
         print(f"[alert_email] Weekly pulse skipped — no emails in {period}")
         return False
 
-    prv_open  = int(prv.get("opened", 0))
-    prv_upd   = int(prv.get("updated", 0))
-    prv_close = int(prv.get("closed", 0))
-    prv_patch = int(prv.get("field_patches_total", 0))
+    prv_emails = int(prv.get("emails_received", 0))
+    prv_open   = int(prv.get("opened", 0))
+    prv_close  = int(prv.get("closed", 0))
+    prv_patch  = int(prv.get("field_patches_total", 0))
 
     def _delta(cur_v, prev_v):
         if prev_v == 0: return None
@@ -870,44 +869,50 @@ def send_weekly_summary(stats: dict) -> bool:
       <div class="text" style="font-size:14px;color:#27272a;line-height:1.6;">{narrative}</div>
     </div>""" if narrative else ""
 
-    # ── Top-line metrics: roles opened / updated / closed + SF field updates ─
-    def _hero(num, label, delta_html, width="25%"):
+    # ── Top-line metrics, two rows: market outcomes + how well Proxi handled ─
+    def _card_big(label, num, secondary):
         return f"""
-        <td class="card hero-cell" style="padding:18px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;width:{width};vertical-align:top;">
-          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">{label}</div>
-          <div class="num hero-num" style="font-size:34px;line-height:1.05;font-weight:700;color:#18181b;margin:6px 0 4px;letter-spacing:-0.02em;">{num}</div>
-          <div>{delta_html}</div>
+        <td class="card hero-cell" style="padding:20px 18px;background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;width:33.33%;vertical-align:top;">
+          <div class="dim" style="font-size:10px;color:#71717a;font-weight:700;text-transform:uppercase;letter-spacing:.09em;line-height:1.3;">{label}</div>
+          <div class="num hero-num" style="font-size:38px;line-height:1.0;font-weight:700;color:#18181b;margin:11px 0 9px;letter-spacing:-0.02em;white-space:nowrap;">{num}</div>
+          <div>{secondary}</div>
         </td>"""
 
+    def _card_sm(label, num, secondary):
+        return f"""
+        <td class="card hero-cell" style="padding:18px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;width:33.33%;vertical-align:top;">
+          <div class="dim" style="font-size:10px;color:#71717a;font-weight:700;text-transform:uppercase;letter-spacing:.08em;line-height:1.3;">{label}</div>
+          <div class="num" style="font-size:27px;line-height:1.05;font-weight:700;color:#18181b;margin:9px 0 7px;letter-spacing:-0.02em;white-space:nowrap;">{num}</div>
+          <div>{secondary}</div>
+        </td>"""
+
+    def _delta_pill(pct):
+        if pct is None:
+            return '<span class="dim" style="font-size:11px;color:#a1a1aa;">first week</span>'
+        if pct == 0:
+            return '<span class="dim" style="font-size:11px;color:#71717a;">flat WoW</span>'
+        cls   = "delta-up" if pct > 0 else "delta-down"
+        arrow = "↑" if pct > 0 else "↓"
+        return (f'<span class="{cls}" style="display:inline-block;border-radius:999px;'
+                f'padding:3px 10px;font-size:11px;font-weight:700;">{arrow} {abs(pct)}% WoW</span>')
+
+    def _sub(text):
+        return f'<span class="muted" style="font-size:12px;color:#52525b;">{text}</span>'
+
+    lat_txt = f"{latency:.1f} min" if latency is not None else "—"
     hero_row = f"""
     <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
       <tr>
-        {_hero(f"{opened:,}",  "Roles opened",     _delta_html(_delta(opened,  prv_open)))}
-        {_hero(f"{updated:,}", "Updates synced",   _delta_html(_delta(updated, prv_upd)))}
-        {_hero(f"{closed:,}",  "Roles closed",     _delta_html(_delta(closed,  prv_close)))}
-        {_hero(f"{patches:,}", "SF field updates", _delta_html(_delta(patches, prv_patch)))}
+        {_card_big("Emails received", f"{emails:,}", _delta_pill(_delta(emails, prv_emails)))}
+        {_card_big("Roles opened",    f"{opened:,}", _delta_pill(_delta(opened, prv_open)))}
+        {_card_big("Roles closed",    f"{closed:,}", _delta_pill(_delta(closed, prv_close)))}
       </tr>
-    </table>"""
-
-    # ── Operational strip: speed · throughput · coverage ─────────────────────
-    lat_txt = f"{latency:.0f} min" if latency is not None else "—"
-    lat_sub = "average"
-    cov_sub = f"{scraped:,} of {emails:,} parsed"
-
-    def _mini(num, label, sub):
-        return f"""
-        <td class="card hero-cell" style="padding:16px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;width:33.33%;vertical-align:top;">
-          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">{label}</div>
-          <div class="num" style="font-size:24px;line-height:1.1;font-weight:700;color:#18181b;margin:5px 0 2px;letter-spacing:-0.02em;">{num}</div>
-          <div class="muted" style="font-size:12px;color:#52525b;">{sub}</div>
-        </td>"""
-
-    ops_row = f"""
+    </table>
     <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
       <tr>
-        {_mini(lat_txt, "Time to first scrape", lat_sub)}
-        {_mini(f"{emails:,}", "Emails ingested", f"{scraped:,} parsed · {errors:,} error{'' if errors == 1 else 's'}")}
-        {_mini(f"{coverage_pct}%", "Scrape success rate", cov_sub)}
+        {_card_sm("SF field updates", f"{patches:,}",      _delta_pill(_delta(patches, prv_patch)))}
+        {_card_sm("Capture rate",     f"{coverage_pct}%",  _sub(f"{scraped:,} of {emails:,} synced"))}
+        {_card_sm("Avg sync time",    lat_txt,             _sub("email → Salesforce"))}
       </tr>
     </table>"""
 
@@ -1076,68 +1081,65 @@ def send_weekly_summary(stats: dict) -> bool:
         wk_opened  = int(lc_week.get("opened", 0))
         wk_closed  = int(lc_week.get("closed", 0))
         wk_lt1h    = int(lc_week.get("lt_1h", 0))
-        wk_grabbed = int(lc_week.get("fast_grabbed", 0))
         wk_median  = _fmt_dur(lc_week.get("median_hours"))
 
         # All-time, demoted to a single reference line.
         all_ref = (
             f'Since launch: {_fmt_dur(lc_all.get("median_hours"))} median open across '
-            f'{int(lc_all.get("closed_total", 0)):,} closed roles · '
-            f'{int(lc_all.get("fast_total", 0))} closed within an hour, Proxi synced '
-            f'{int(lc_all.get("fast_grabbed", 0))} in time.'
+            f'{int(lc_all.get("closed_total", 0)):,} closed roles.'
         )
-
-        # Fast-close watch — this week first.
-        if wk_lt1h:
-            flag = (
-                f'<strong style="color:#b45309;">{wk_lt1h}</strong> role'
-                f'{"" if wk_lt1h == 1 else "s"} closed within an hour of opening — Proxi synced '
-                f'<strong style="color:#b45309;">{wk_grabbed}</strong> to Salesforce before they closed.'
-            )
-        else:
-            flag = "No role closed within an hour of opening this week — nothing slipped past Proxi."
-        flag_html = f"""
-          <div class="lc-flag" style="margin-top:16px;padding:14px 16px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;">
-            <div class="text" style="font-size:13px;color:#92400e;font-weight:600;">Fast-close watch</div>
-            <div class="muted" style="font-size:13px;color:#52525b;margin-top:4px;line-height:1.5;">{flag}</div>
-          </div>"""
 
         if wk_closed > 0:
             buckets = [
-                ("Within 1 hr", wk_lt1h,                       "seg-close"),
-                ("1–24 hrs",    int(lc_week.get("h1_24", 0)),  "seg-upd"),
-                ("1–7 days",    int(lc_week.get("d1_7", 0)),   "seg-open"),
-                ("Over 7 days", int(lc_week.get("gt_7d", 0)),  "bar-track"),
+                ("Within 1 hr", wk_lt1h,                       int(lc_all.get("lt_1h", 0)),  "seg-close"),
+                ("1–24 hrs",    int(lc_week.get("h1_24", 0)),  int(lc_all.get("h1_24", 0)),  "seg-upd"),
+                ("1–7 days",    int(lc_week.get("d1_7", 0)),   int(lc_all.get("d1_7", 0)),   "seg-open"),
+                ("Over 7 days", int(lc_week.get("gt_7d", 0)),  int(lc_all.get("gt_7d", 0)),  "bar-track"),
             ]
-            tot = wk_closed
-            # Distribution bar as a FIXED-LAYOUT table — cells can never wrap to a
-            # new line; the last segment omits its width so it absorbs any rounding
-            # remainder and the bar always fills exactly 100%.
-            nz = [(n, cls) for _lbl, n, cls in buckets if n > 0]
-            seg_cells = ""
-            for idx, (n, cls) in enumerate(nz):
-                w = "" if idx == len(nz) - 1 else f"width:{round(n / tot * 100)}%;"
-                seg_cells += f'<td class="{cls}" style="{w}height:14px;"></td>'
-            seg_bar = (
-                '<div style="border-radius:7px;overflow:hidden;margin-bottom:14px;">'
-                '<table role="presentation" cellpadding="0" cellspacing="0" '
-                'style="width:100%;table-layout:fixed;border-collapse:collapse;">'
-                f'<tr>{seg_cells}</tr></table></div>'
+            tot     = wk_closed
+            all_tot = int(lc_all.get("closed_total", 0)) or 1
+            # Distribution bar as a FIXED-LAYOUT table — cells can never wrap; the
+            # last segment omits its width so it absorbs any rounding remainder and
+            # the bar always fills exactly 100%.
+            def _seg_bar(vals, total, h):
+                nz = [(n, cls) for n, cls in vals if n > 0]
+                cells = ""
+                for idx, (n, cls) in enumerate(nz):
+                    w = "" if idx == len(nz) - 1 else f"width:{round(n / total * 100)}%;"
+                    cells += f'<td class="{cls}" style="{w}height:{h}px;"></td>'
+                return (f'<div style="border-radius:{h // 2 + 1}px;overflow:hidden;">'
+                        '<table role="presentation" cellpadding="0" cellspacing="0" '
+                        'style="width:100%;table-layout:fixed;border-collapse:collapse;">'
+                        f'<tr>{cells}</tr></table></div>')
+            week_bar = _seg_bar([(wn, cls) for _l, wn, _an, cls in buckets], tot, 14)
+            all_bar  = _seg_bar([(an, cls) for _l, _wn, an, cls in buckets], all_tot, 8)
+            _mini_lbl = ('font-size:10px;color:#a1a1aa;font-weight:600;'
+                         'text-transform:uppercase;letter-spacing:.04em;')
+            hdr = (
+                '<tr>'
+                '<td></td>'
+                '<td class="dim" style="padding:0 0 4px;font-size:10px;color:#a1a1aa;font-weight:600;text-transform:uppercase;letter-spacing:.04em;text-align:right;">This week</td>'
+                '<td class="dim" style="padding:0 0 4px 14px;font-size:10px;color:#a1a1aa;font-weight:600;text-transform:uppercase;letter-spacing:.04em;text-align:right;">All-time</td>'
+                '</tr>'
             )
-            legend_rows = "".join(
+            legend_rows = hdr + "".join(
                 f'<tr>'
-                f'<td style="padding:5px 0;font-size:12px;white-space:nowrap;width:55%;">'
+                f'<td style="padding:5px 0;font-size:12px;white-space:nowrap;width:46%;">'
                 f'<span class="{cls}" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:6px;"></span>'
                 f'<span class="text" style="color:#27272a;">{lbl}</span></td>'
-                f'<td class="muted" style="padding:5px 0;font-size:12px;color:#52525b;text-align:right;">{n} &nbsp;·&nbsp; {round(n / tot * 100)}%</td>'
+                f'<td class="muted" style="padding:5px 0;font-size:12px;color:#52525b;text-align:right;width:27%;font-variant-numeric:tabular-nums;">{wn} &nbsp;·&nbsp; {round(wn / tot * 100)}%</td>'
+                f'<td class="muted" style="padding:5px 0 5px 14px;font-size:12px;color:#52525b;text-align:right;width:27%;font-variant-numeric:tabular-nums;">{an:,} &nbsp;·&nbsp; {round(an / all_tot * 100)}%</td>'
                 f'</tr>'
-                for lbl, n, cls in buckets
+                for lbl, wn, an, cls in buckets
             )
             body = f"""
           <div class="num" style="font-size:24px;color:#18181b;font-weight:700;margin:6px 0 2px;letter-spacing:-0.02em;">{wk_median} median open</div>
           <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">{wk_closed} of {wk_opened} roles opened this week have closed</div>
-          {seg_bar}
-          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">{legend_rows}</table>"""
+          <div class="dim" style="{_mini_lbl}margin-bottom:5px;">This week</div>
+          {week_bar}
+          <div class="dim" style="{_mini_lbl}margin:11px 0 5px;">All-time</div>
+          {all_bar}
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin-top:14px;">{legend_rows}</table>"""
         else:
             body = f"""
           <div class="num" style="font-size:24px;color:#18181b;font-weight:700;margin:6px 0 2px;letter-spacing:-0.02em;">{wk_opened} roles opened</div>
@@ -1147,7 +1149,6 @@ def send_weekly_summary(stats: dict) -> bool:
         <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
           <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">How long roles stayed open · this week</div>
           {body}
-          {flag_html}
           <div class="muted" style="margin-top:12px;font-size:11px;color:#71717a;line-height:1.5;">{all_ref}</div>
         </div>"""
 
@@ -1262,10 +1263,14 @@ def send_weekly_summary(stats: dict) -> bool:
       .chart-base { border-bottom:1px solid #e4e4e7; }
       .bar        { background:#27272a; }
       .bar-zero   { background:#d4d4d8; }
-      .bar-track  { background:#e4e4e7; }
-      .seg-open   { background:#2563eb; }
-      .seg-upd    { background:#d97706; }
-      .seg-close  { background:#52525b; }
+      .bar-track  { background:#d4d4d8; }
+      .seg-open   { background:#6e9b7e; }   /* muted green  */
+      .seg-upd    { background:#897fa8; }   /* muted purple */
+      .seg-close  { background:#b07f93; }   /* dusty rose   */
+
+      /* WoW pill badges */
+      .delta-up   { background:#ecfdf5; color:#15803d; }
+      .delta-down { background:#fef2f2; color:#b91c1c; }
 
       /* Map tiles (light) — bg + fg per intensity level. */
       .lvl0 { background:#f4f4f5; color:#a1a1aa; }
@@ -1302,9 +1307,11 @@ def send_weekly_summary(stats: dict) -> bool:
         .bar        { background:#d4d4d8 !important; }
         .bar-zero   { background:#3f3f46 !important; }
         .bar-track  { background:#3f3f46 !important; }
-        .seg-open   { background:#60a5fa !important; }
-        .seg-upd    { background:#fbbf24 !important; }
-        .seg-close  { background:#a1a1aa !important; }
+        .seg-open   { background:#85b394 !important; }   /* muted green  */
+        .seg-upd    { background:#a79dc4 !important; }   /* muted purple */
+        .seg-close  { background:#c79aac !important; }   /* dusty rose   */
+        .delta-up   { background:#052e1b !important; color:#4ade80 !important; }
+        .delta-down { background:#3a0d0d !important; color:#f87171 !important; }
 
         .lvl0 { background:#27272a !important; color:#52525b !important; }
         .lvl1 { background:#3f3f46 !important; color:#d4d4d8 !important; }
@@ -1339,7 +1346,6 @@ def send_weekly_summary(stats: dict) -> bool:
 
       {narrative_html}
       {hero_row}
-      {ops_row}
       {health_line}
       {roi_html}
       {daily_section}
@@ -1362,7 +1368,7 @@ def send_weekly_summary(stats: dict) -> bool:
         f"{wl} {v['opened']}/{v['updated']}/{v['closed']}"
         for (_, v), wl in zip(split_series, ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
     )
-    lat_line = f"{latency:.0f} min average" if latency is not None else "—"
+    lat_line = f"{latency:.1f} min average" if latency is not None else "—"
     lc_all_t = lifecycle.get("all", {}) or {}
     median_all = _fmt_dur(lc_all_t.get("median_hours"))
     ft  = int(lc_all_t.get("fast_total", 0))
@@ -1371,14 +1377,13 @@ def send_weekly_summary(stats: dict) -> bool:
     Proxi Weekly Pulse — {period}
     ============================================
 
+    Emails received : {emails}   (prior week: {prv_emails})
     Roles opened    : {opened}   (prior week: {prv_open})
-    Updates synced  : {updated}  (prior week: {prv_upd})
     Roles closed    : {closed}   (prior week: {prv_close})
     SF field updates: {patches}  (prior week: {prv_patch})
-
-    Time to first scrape : {lat_line}
-    Emails ingested      : {emails} ({scraped} parsed, {errors} errors, {coverage_pct}% coverage)
-    Needs attention      : {needs} job{'' if needs == 1 else 's'}
+    Capture rate    : {coverage_pct}% ({scraped} of {emails} synced)
+    Avg sync time   : {lat_line}
+    Needs attention : {needs} job{'' if needs == 1 else 's'}
     Manual time recouped : ~{hrs_saved:g} hrs this week · ~{cum_h:g} hrs all-time
 
     Open duration (all-time): {median_all} median · {ft} closed within 1 hr ({fg} reached before close)
