@@ -1640,21 +1640,6 @@ def _build_weekly_stats(get_conn) -> dict:
 
     lifecycle = _lifecycle(get_conn, cur_start_utc, cur_end_utc, cur_end_utc)
 
-    # ── Narrative — two tight lines: state of play + the lever ahead ─────────
-    avg_lat = cur_agg.get("mean_latency_min")
-    em = cur_agg["emails_received"]
-    parts: list[str] = []
-    if avg_lat is not None:
-        parts.append(
-            f"Every Kimedics job change flowed straight into Salesforce this week — {em} captured "
-            f"automatically in about {avg_lat:.0f} minutes each, so the team never had to copy a record by hand."
-        )
-    else:
-        parts.append(
-            f"Every Kimedics job change flowed straight into Salesforce this week — {em} captured "
-            f"automatically, so the team never had to copy a record by hand."
-        )
-    narrative = " ".join(parts)
 
     return {
         "period_label":        period_label,
@@ -1676,7 +1661,6 @@ def _build_weekly_stats(get_conn) -> dict:
         "trend_weekly":        trend,          # last 4 weeks
         "cumulative":          cum,
         "lifecycle":           lifecycle,
-        "narrative":           narrative,
         "daily_series":        [
             (
                 (last_monday + timedelta(days=i)).isoformat(),

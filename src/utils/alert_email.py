@@ -805,7 +805,6 @@ def send_weekly_summary(stats: dict) -> bool:
     trend        = stats.get("trend_weekly", [])
     cumulative   = stats.get("cumulative", {}) or {}
     lifecycle    = stats.get("lifecycle", {}) or {}
-    narrative    = stats.get("narrative", "")
     split_series = stats.get("daily_split_series", [])
     series       = stats.get("daily_series", [])
 
@@ -862,12 +861,6 @@ def send_weekly_summary(stats: dict) -> bool:
         health_fg   = "#b91c1c"
 
     subject = f"Proxi Weekly Pulse · {period} · {opened} opened, {closed} closed, ~{hrs_saved:g} hrs saved"
-
-    # ── Narrative: operational state + where it goes next ────────────────────
-    narrative_html = f"""
-    <div class="card" style="margin:18px 0 0;padding:18px 22px;background:#fafafa;border:1px solid #e4e4e7;border-radius:8px;">
-      <div class="text" style="font-size:14px;color:#27272a;line-height:1.6;">{narrative}</div>
-    </div>""" if narrative else ""
 
     # ── Top-line metrics, two rows: market outcomes + how well Proxi handled ─
     def _card_big(label, num, secondary):
@@ -1127,8 +1120,8 @@ def send_weekly_summary(stats: dict) -> bool:
                 f'<td style="padding:5px 0;font-size:12px;white-space:nowrap;width:46%;">'
                 f'<span class="{cls}" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:6px;"></span>'
                 f'<span class="text" style="color:#27272a;">{lbl}</span></td>'
-                f'<td class="muted" style="padding:5px 0;font-size:12px;color:#52525b;text-align:right;width:27%;font-variant-numeric:tabular-nums;">{wn} &nbsp;·&nbsp; {round(wn / tot * 100)}%</td>'
-                f'<td class="muted" style="padding:5px 0 5px 14px;font-size:12px;color:#52525b;text-align:right;width:27%;font-variant-numeric:tabular-nums;">{an:,} &nbsp;·&nbsp; {round(an / all_tot * 100)}%</td>'
+                f'<td class="muted" style="padding:5px 0;font-size:12px;color:#52525b;text-align:right;width:27%;white-space:nowrap;font-variant-numeric:tabular-nums;">{wn} &nbsp;·&nbsp; {round(wn / tot * 100)}%</td>'
+                f'<td class="muted" style="padding:5px 0 5px 10px;font-size:12px;color:#52525b;text-align:right;width:27%;white-space:nowrap;font-variant-numeric:tabular-nums;">{an:,} &nbsp;·&nbsp; {round(an / all_tot * 100)}%</td>'
                 f'</tr>'
                 for lbl, wn, an, cls in buckets
             )
@@ -1344,7 +1337,6 @@ def send_weekly_summary(stats: dict) -> bool:
         <div class="text" style="margin:6px 0 2px;font-size:24px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{period}</div>
       </div>
 
-      {narrative_html}
       {hero_row}
       {health_line}
       {roi_html}
