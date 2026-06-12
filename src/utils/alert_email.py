@@ -781,41 +781,43 @@ def send_weekly_summary(stats: dict) -> bool:
     Gmail mobile app, Outlook iOS/Android). Skips sending when the week
     had zero email activity.
     """
-    cur  = stats.get("current") or {}
-    prv  = stats.get("previous") or {}
+    cur    = stats.get("current") or {}
+    prv    = stats.get("previous") or {}
     period = stats.get("period_label", "Last week")
 
-    emails    = int(cur.get("emails_received", 0))
-    scraped   = int(cur.get("scraped_ok", 0))
-    new_jobs  = int(cur.get("sf_jobs_created", 0))
-    patches   = int(cur.get("field_patches_total", 0))
-    needs     = int(cur.get("needs_attention", 0))
-    latency   = cur.get("median_latency_min")
-    top_prac  = cur.get("top_practices", [])
-    top_jobs  = cur.get("top_jobs", [])
+    emails   = int(cur.get("emails_received", 0))
+    scraped  = int(cur.get("scraped_ok", 0))
+    errors   = int(cur.get("errors", 0))
+    opened   = int(cur.get("opened", 0))
+    updated  = int(cur.get("updated", 0))
+    closed   = int(cur.get("closed", 0))
+    patches  = int(cur.get("field_patches_total", 0))
+    needs    = int(cur.get("needs_attention", 0))
+    latency  = cur.get("mean_latency_min")  # outlier-trimmed average (headline)
+
     hrs_saved = float(stats.get("hours_saved_estimate", 0.0))
-    dollars_saved  = int(stats.get("dollars_saved_estimate", 0))
-    hourly_rate    = int(stats.get("hourly_rate_usd", 80))
-    manual_min     = int(stats.get("manual_baseline_min", 120))
-    speed_x        = stats.get("speed_multiplier_x")
-    top_states     = stats.get("top_states", [])
-    states_total   = int(stats.get("states_total", 0))
-    peak_day       = stats.get("peak_day")
-    peak_day_count = int(stats.get("peak_day_count", 0))
-    peak_hour      = stats.get("peak_hour")
-    peak_hour_n    = int(stats.get("peak_hour_count", 0))
-    trend          = stats.get("trend_weekly", [])
-    cumulative     = stats.get("cumulative", {}) or {}
-    narrative      = stats.get("narrative", "")
-    series         = stats.get("daily_series", [])
+    hrs_prev  = float(stats.get("hours_saved_prev", 0.0))
+    model     = stats.get("manual_time_model", {}) or {}
+
+    top_states   = stats.get("top_states", [])
+    states_total = int(stats.get("states_total", 0))
+    weekday_hist = stats.get("weekday_hist", [])
+    hour_hist    = stats.get("hour_hist", [])
+    trend        = stats.get("trend_weekly", [])
+    cumulative   = stats.get("cumulative", {}) or {}
+    lifecycle    = stats.get("lifecycle", {}) or {}
+    narrative    = stats.get("narrative", "")
+    split_series = stats.get("daily_split_series", [])
+    series       = stats.get("daily_series", [])
 
     if emails == 0:
         print(f"[alert_email] Weekly pulse skipped — no emails in {period}")
         return False
 
-    prv_emails  = int(prv.get("emails_received", 0))
-    prv_patches = int(prv.get("field_patches_total", 0))
-    prv_new     = int(prv.get("sf_jobs_created", 0))
+    prv_open  = int(prv.get("opened", 0))
+    prv_upd   = int(prv.get("updated", 0))
+    prv_close = int(prv.get("closed", 0))
+    prv_patch = int(prv.get("field_patches_total", 0))
 
     def _delta(cur_v, prev_v):
         if prev_v == 0: return None
@@ -832,6 +834,17 @@ def send_weekly_summary(stats: dict) -> bool:
 
     coverage_pct = round(scraped / emails * 100) if emails else 0
 
+    def _fmt_dur(hours):
+        """Human duration from a float number of hours."""
+        if hours is None:
+            return "—"
+        if hours < 1:
+            return f"{round(hours * 60)} min"
+        if hours < 24:
+            return f"{hours:.0f} hr" if abs(hours - round(hours)) < 0.05 else f"{hours:.1f} hr"
+        days = hours / 24.0
+        return f"{days:.1f} days"
+
     # Health framing — restrained palette.
     if needs == 0:
         health_text = "All systems healthy"
@@ -839,183 +852,304 @@ def send_weekly_summary(stats: dict) -> bool:
         health_bg   = "#ecfdf5"
         health_fg   = "#15803d"
     elif needs <= 2:
-        health_text = f"{needs} item{'s' if needs != 1 else ''} flagged for review"
+        health_text = f"{needs} job{'s' if needs != 1 else ''} flagged for review"
         health_dot  = "#f59e0b"
         health_bg   = "#fffbeb"
         health_fg   = "#b45309"
     else:
-        health_text = f"{needs} items flagged for review"
+        health_text = f"{needs} jobs flagged for review"
         health_dot  = "#dc2626"
         health_bg   = "#fef2f2"
         health_fg   = "#b91c1c"
 
-    subject = f"Proxi Weekly Pulse · {period} · {emails} updates, {patches} SF changes, ~{hrs_saved:g} hrs saved"
+    subject = f"Proxi Weekly Pulse · {period} · {opened} opened, {closed} closed, ~{hrs_saved:g} hrs saved"
 
-    # ── Hero stat cell ───────────────────────────────────────────────────────
-    def _hero(num, label, delta_html):
+    # ── Narrative: operational state + where it goes next ────────────────────
+    narrative_html = f"""
+    <div class="card" style="margin:18px 0 0;padding:18px 22px;background:#fafafa;border:1px solid #e4e4e7;border-radius:8px;">
+      <div class="text" style="font-size:14px;color:#27272a;line-height:1.6;">{narrative}</div>
+    </div>""" if narrative else ""
+
+    # ── Top-line metrics: roles opened / updated / closed + SF field updates ─
+    def _hero(num, label, delta_html, width="25%"):
         return f"""
-        <td class="card hero-cell" style="padding:20px 18px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;width:33.33%;vertical-align:top;">
+        <td class="card hero-cell" style="padding:18px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;width:{width};vertical-align:top;">
           <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">{label}</div>
-          <div class="num hero-num" style="font-size:38px;line-height:1.05;font-weight:700;color:#18181b;margin:6px 0 4px;letter-spacing:-0.02em;">{num}</div>
+          <div class="num hero-num" style="font-size:34px;line-height:1.05;font-weight:700;color:#18181b;margin:6px 0 4px;letter-spacing:-0.02em;">{num}</div>
           <div>{delta_html}</div>
         </td>"""
 
     hero_row = f"""
     <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
       <tr>
-        {_hero(f"{emails:,}",   "Job updates ingested",   _delta_html(_delta(emails,  prv_emails)))}
-        {_hero(f"{patches:,}",  "Salesforce field updates", _delta_html(_delta(patches, prv_patches)))}
-        {_hero(f"{new_jobs:,}", "New roles added to SF",  _delta_html(_delta(new_jobs, prv_new)))}
+        {_hero(f"{opened:,}",  "Roles opened",     _delta_html(_delta(opened,  prv_open)))}
+        {_hero(f"{updated:,}", "Updates synced",   _delta_html(_delta(updated, prv_upd)))}
+        {_hero(f"{closed:,}",  "Roles closed",     _delta_html(_delta(closed,  prv_close)))}
+        {_hero(f"{patches:,}", "SF field updates", _delta_html(_delta(patches, prv_patch)))}
       </tr>
     </table>"""
 
-    # ── Narrative paragraph ─────────────────────────────────────────────────
-    narrative_html = f"""
-    <div class="card" style="margin:18px 0 0;padding:18px 22px;background:#fafafa;border:1px solid #e4e4e7;border-radius:8px;">
-      <div class="text" style="font-size:14px;color:#27272a;line-height:1.55;">{narrative}</div>
-    </div>""" if narrative else ""
+    # ── Operational strip: speed · throughput · coverage ─────────────────────
+    lat_txt = f"{latency:.0f} min" if latency is not None else "—"
+    lat_sub = "average"
+    cov_sub = f"{scraped:,} of {emails:,} parsed"
 
-    # ── ROI — week + cumulative + dollars ───────────────────────────────────
+    def _mini(num, label, sub):
+        return f"""
+        <td class="card hero-cell" style="padding:16px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;width:33.33%;vertical-align:top;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">{label}</div>
+          <div class="num" style="font-size:24px;line-height:1.1;font-weight:700;color:#18181b;margin:5px 0 2px;letter-spacing:-0.02em;">{num}</div>
+          <div class="muted" style="font-size:12px;color:#52525b;">{sub}</div>
+        </td>"""
+
+    ops_row = f"""
+    <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
+      <tr>
+        {_mini(lat_txt, "Time to first scrape", lat_sub)}
+        {_mini(f"{emails:,}", "Emails ingested", f"{scraped:,} parsed · {errors:,} error{'' if errors == 1 else 's'}")}
+        {_mini(f"{coverage_pct}%", "Scrape success rate", cov_sub)}
+      </tr>
+    </table>"""
+
+    # ── Health line: distinct jobs needing a human (separate from coverage) ──
+    health_line = f"""
+    <div style="margin:8px 0 0;padding:10px 14px;background:{health_bg};border-radius:8px;">
+      <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:{health_dot};margin-right:8px;vertical-align:middle;"></span>
+      <span style="font-size:13px;color:{health_fg};font-weight:600;vertical-align:middle;">{health_text}</span>
+    </div>"""
+
+    # ── Hours recouped (week + all-time; no dollars) ─────────────────────────
     cum_h     = float(cumulative.get("hours_saved", 0) or 0)
-    cum_d     = int(cumulative.get("dollars_saved", 0) or 0)
     launch    = cumulative.get("launch_iso") or ""
     cum_eml   = int(cumulative.get("emails", 0) or 0)
-    cum_pat   = int(cumulative.get("patches", 0) or 0)
     cum_field = int(cumulative.get("fields", 0) or 0)
     cum_new   = int(cumulative.get("new_jobs", 0) or 0)
+    hrs_delta = _delta_html(_delta(round(hrs_saved), round(hrs_prev)))
+    mpo  = model.get("min_per_open", 8)
+    mpot = model.get("min_per_other", 1.5)
+    mps  = model.get("min_per_switch", 2)
+    hands_on_h = (opened * mpo + (updated + closed) * mpot) / 60.0
+    switch_h   = (emails * mps) / 60.0
     roi_html = ""
     if hrs_saved >= 1 or cum_h >= 1:
         roi_html = f"""
         <div class="roi" style="margin:18px 0 0;padding:22px 24px;background:#18181b;border-radius:8px;">
-          <div style="color:#a1a1aa;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;">Time recouped this week</div>
+          <div style="color:#a1a1aa;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;">Manual time recouped</div>
           <table role="presentation" cellpadding="0" cellspacing="0" class="duo-stack" style="width:100%;margin-top:6px;">
             <tr>
               <td style="vertical-align:top;width:50%;">
                 <div style="color:#ffffff;font-size:40px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;">~{hrs_saved:g} hrs</div>
-                <div style="color:#a1a1aa;font-size:13px;margin-top:6px;">of manual Kimedics → Salesforce entry</div>
+                <div style="color:#a1a1aa;font-size:13px;margin-top:6px;">this week &nbsp;{hrs_delta}</div>
               </td>
               <td style="vertical-align:top;width:50%;padding-left:20px;">
-                <div style="color:#ffffff;font-size:28px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;">${dollars_saved:,}</div>
-                <div style="color:#a1a1aa;font-size:13px;margin-top:6px;">recruiter capacity returned at ${hourly_rate}/hr</div>
+                <div style="color:#ffffff;font-size:40px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;">~{cum_h:g} hrs</div>
+                <div style="color:#a1a1aa;font-size:13px;margin-top:6px;">all-time{f' since {launch}' if launch else ''}</div>
               </td>
             </tr>
           </table>
-        </div>"""
-
-    # ── Speed advantage ─────────────────────────────────────────────────────
-    speed_html = ""
-    if latency is not None and speed_x:
-        bar_max = max(manual_min, latency, 1)
-        ours_pct   = max(2, int(latency / bar_max * 100))
-        manual_pct = int(manual_min / bar_max * 100)
-        speed_html = f"""
-        <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Speed advantage</div>
-          <div class="num" style="font-size:24px;font-weight:700;color:#18181b;margin:6px 0 4px;letter-spacing:-0.02em;">{speed_x}× faster than manual</div>
-          <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">
-            Median time from Kimedics email to Salesforce: <strong style="color:#18181b;">{latency:.0f} min</strong>. Manual baseline: <strong style="color:#18181b;">~{manual_min} min</strong>.
+          <div style="color:#71717a;font-size:12px;margin-top:14px;padding-top:12px;border-top:1px solid #27272a;line-height:1.5;">
+            ~{hands_on_h:.1f} hrs hands-on entry &nbsp;+&nbsp; ~{switch_h:.1f} hrs not stopping to check {emails} emails
           </div>
-          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">
-            <tr>
-              <td style="width:64px;font-size:12px;color:#52525b;font-weight:600;padding:4px 0;">Proxi</td>
-              <td style="padding:4px 0;">
-                <div style="height:12px;background:#f4f4f5;border-radius:6px;">
-                  <div style="height:12px;width:{ours_pct}%;background:#27272a;border-radius:6px;"></div>
-                </div>
-              </td>
-              <td style="width:84px;text-align:right;font-size:13px;color:#18181b;font-weight:700;padding:4px 0 4px 10px;">{latency:.0f} min</td>
-            </tr>
-            <tr>
-              <td style="width:64px;font-size:12px;color:#52525b;font-weight:600;padding:4px 0;">Manual</td>
-              <td style="padding:4px 0;">
-                <div style="height:12px;background:#f4f4f5;border-radius:6px;">
-                  <div style="height:12px;width:{manual_pct}%;background:#a1a1aa;border-radius:6px;"></div>
-                </div>
-              </td>
-              <td style="width:84px;text-align:right;font-size:13px;color:#52525b;font-weight:700;padding:4px 0 4px 10px;">~{manual_min} min</td>
-            </tr>
-          </table>
         </div>"""
 
-    # ── Editorial bar chart helper ──────────────────────────────────────────
-    # Three-row table: [count] / [bar in fixed-height cell with hairline
-    # baseline] / [label]. Monochrome zinc-800 fill — restrained, NYT-like.
-    BAR_COLOR     = "#27272a"
-    BAR_COLOR_DIM = "#d4d4d8"
-    NUM_COLOR     = "#18181b"
-    NUM_DIM       = "#a1a1aa"
-    LABEL_COLOR   = "#71717a"
-    BASELINE      = "#e4e4e7"
-
-    def _bar_chart(items, bar_h: int = 92, bar_w: int = 36) -> str:
+    # ── Chart helpers ────────────────────────────────────────────────────────
+    # Bars/labels are class-driven so they invert correctly in dark mode.
+    def _hist(items, bar_h=64, show_counts=True, label_keep=None, num_fs=11, show_zeros=True) -> str:
+        # Value label sits INSIDE each bar's cell, bottom-aligned above the bar,
+        # so it floats with the bar height. `reserve` caps the tallest bar so
+        # bar + label always fits inside the cell — the chart can't overflow.
         max_v = max((c for _, c in items), default=0) or 1
-        num_cells, bar_cells, lbl_cells = [], [], []
-        for label, count in items:
-            fill = max(3, int((count / max_v) * (bar_h - 8))) if count > 0 else 0
-            num_cells.append(
-                f'<td style="text-align:center;padding:0 4px 6px;font-size:13px;font-weight:600;'
-                f'color:{NUM_COLOR if count > 0 else NUM_DIM};letter-spacing:-0.01em;font-variant-numeric:tabular-nums;">{count}</td>'
-            )
-            if count > 0:
-                bar_inner = (
-                    f'<div style="width:{bar_w}px;height:{fill}px;background:{BAR_COLOR};'
-                    f'border-radius:3px 3px 0 0;margin:0 auto;"></div>'
+        reserve = (num_fs + 6) if show_counts else 2
+        bar_cells, lbl_cells = [], []
+        for i, (label, count) in enumerate(items):
+            fill = max(2, int(round((count / max_v) * (bar_h - reserve)))) if count > 0 else 2
+            num_html = ""
+            if show_counts and (count > 0 or show_zeros):
+                num_html = (
+                    f'<div class="chart-num" style="font-size:{num_fs}px;line-height:{num_fs + 3}px;'
+                    f'height:{num_fs + 3}px;font-weight:600;font-variant-numeric:tabular-nums;">{count}</div>'
                 )
-            else:
-                bar_inner = (
-                    f'<div style="width:{bar_w}px;height:2px;background:{BAR_COLOR_DIM};'
-                    f'margin:0 auto;"></div>'
-                )
+            bar_cls = "bar" if count > 0 else "bar-zero"
+            radius  = "border-radius:2px 2px 0 0;" if count > 0 else ""
             bar_cells.append(
-                f'<td style="text-align:center;vertical-align:bottom;padding:0 4px;'
-                f'height:{bar_h}px;border-bottom:1px solid {BASELINE};">{bar_inner}</td>'
+                f'<td class="chart-base" style="text-align:center;vertical-align:bottom;padding:0 1px;height:{bar_h}px;">'
+                f'{num_html}<div class="{bar_cls}" style="width:62%;height:{fill}px;margin:0 auto;{radius}"></div></td>'
             )
+            keep = (label_keep is None) or (i in label_keep)
             lbl_cells.append(
-                f'<td style="text-align:center;padding:8px 4px 0;font-size:11px;'
-                f'color:{LABEL_COLOR};font-weight:500;letter-spacing:.02em;">{label}</td>'
+                f'<td class="chart-lbl" style="text-align:center;padding:6px 1px 0;font-size:10px;font-weight:500;">{label if keep else ""}</td>'
             )
-        return (
-            '<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">'
-            f'<tr>{"".join(num_cells)}</tr>'
-            f'<tr>{"".join(bar_cells)}</tr>'
-            f'<tr>{"".join(lbl_cells)}</tr>'
-            '</table>'
-        )
+        return (f'<table role="presentation" cellpadding="0" cellspacing="0" '
+                f'style="width:100%;border-collapse:collapse;table-layout:fixed;">'
+                f'<tr>{"".join(bar_cells)}</tr><tr>{"".join(lbl_cells)}</tr></table>')
 
-    # ── Daily activity ──────────────────────────────────────────────────────
-    weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    daily_items = [(wl, c) for (_d_iso, c), wl in zip(series, weekday_labels)]
+    def _stacked(series_split, bar_h=120) -> str:
+        labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        totals = [v["opened"] + v["updated"] + v["closed"] for _, v in series_split]
+        max_v  = max(totals) if totals else 0
+        max_v  = max_v or 1
+        reserve = 18  # headroom for the floating total above the tallest column
+        bar_cells, lbl_cells = [], []
+        for i, (_d, v) in enumerate(series_split):
+            tot = v["opened"] + v["updated"] + v["closed"]
+            if tot > 0:
+                col_h = max(3, int(round((tot / max_v) * (bar_h - reserve))))
+                o = int(round(v["opened"]  / tot * col_h))
+                u = int(round(v["updated"] / tot * col_h))
+                c = max(0, col_h - o - u)
+                stack = f'<div style="width:64%;margin:0 auto;height:{col_h}px;border-radius:3px 3px 0 0;overflow:hidden;">'
+                if o: stack += f'<div class="seg-open"  style="height:{o}px;"></div>'
+                if u: stack += f'<div class="seg-upd"   style="height:{u}px;"></div>'
+                if c: stack += f'<div class="seg-close" style="height:{c}px;"></div>'
+                stack += "</div>"
+            else:
+                stack = '<div class="bar-zero" style="width:64%;height:2px;margin:0 auto;"></div>'
+            num = (
+                f'<div class="chart-num" style="font-size:11px;line-height:14px;height:14px;'
+                f'font-weight:600;font-variant-numeric:tabular-nums;">{tot}</div>'
+            )
+            bar_cells.append(
+                f'<td class="chart-base" style="text-align:center;vertical-align:bottom;padding:0 3px;height:{bar_h}px;">{num}{stack}</td>'
+            )
+            lbl = labels[i] if i < len(labels) else ""
+            lbl_cells.append(
+                f'<td class="chart-lbl" style="text-align:center;padding:6px 3px 0;font-size:10px;font-weight:500;">{lbl}</td>'
+            )
+        return (f'<table role="presentation" cellpadding="0" cellspacing="0" '
+                f'style="width:100%;border-collapse:collapse;table-layout:fixed;">'
+                f'<tr>{"".join(bar_cells)}</tr><tr>{"".join(lbl_cells)}</tr></table>')
+
+    _legend_dot = (
+        '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;'
+        'vertical-align:middle;margin-right:5px;"></span>'
+    )
+    daily_legend = (
+        f'<span style="font-size:11px;color:#52525b;margin-right:14px;">'
+        f'<span class="seg-open"  style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Opened</span>'
+        f'<span style="font-size:11px;color:#52525b;margin-right:14px;">'
+        f'<span class="seg-upd"   style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Updated</span>'
+        f'<span style="font-size:11px;color:#52525b;">'
+        f'<span class="seg-close" style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Closed</span>'
+    )
+
+    # ── Daily activity (stacked: opened / updated / closed) ──────────────────
     daily_section = f"""
     <div class="card" style="margin:18px 0 0;padding:20px 22px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-      <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:16px;">Daily activity</div>
-      {_bar_chart(daily_items, bar_h=92, bar_w=34)}
+      <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;margin-bottom:14px;"><tr>
+        <td class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Daily activity</td>
+        <td style="text-align:right;white-space:nowrap;">{daily_legend}</td>
+      </tr></table>
+      {_stacked(split_series)}
     </div>"""
 
-    # ── 4-week trend ─────────────────────────────────────────────────────────
+    # ── 4-week throughput trend ──────────────────────────────────────────────
     trend_html = ""
     if trend:
-        trend_chart = _bar_chart(list(trend), bar_h=80, bar_w=52)
         trend_html = f"""
         <div class="card" style="margin:18px 0 0;padding:20px 22px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:16px;">4-week trend · job updates per week</div>
-          {trend_chart}
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:16px;">Weekly throughput</div>
+          {_hist(list(trend), bar_h=72)}
         </div>"""
 
-    # ── Reliability single line (not its own card) ───────────────────────────
-    sla_bits = [f"<strong style='color:#18181b;'>{coverage_pct}%</strong> coverage"]
-    if latency is not None:
-        sla_bits.append(f"<strong style='color:#18181b;'>{latency:.0f} min</strong> median email→SF")
-    sla_bits.append(
-        f"<strong style='color:#18181b;'>{needs}</strong> needs attention" if needs
-        else "<strong style='color:#18181b;'>0</strong> manual interventions"
-    )
-    reliability = f"""
-    <div style="margin:18px 0 0;padding:14px 18px;background:{health_bg};border-radius:8px;display:block;">
-      <div style="font-size:13px;color:{health_fg};font-weight:600;">
-        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:{health_dot};margin-right:8px;vertical-align:middle;"></span>{health_text}
-      </div>
-      <div class="muted" style="font-size:13px;color:#52525b;margin-top:4px;">{' · '.join(sla_bits)}</div>
-    </div>"""
+    # ── Cadence: day-of-week + hour-of-day distributions ─────────────────────
+    cadence_html = ""
+    if weekday_hist or hour_hist:
+        hour_labels = []
+        for h, c in hour_hist:
+            ampm = "a" if h < 12 else "p"
+            h12 = h % 12 or 12
+            hour_labels.append((f"{h12}{ampm}", c))
+        keep_hours = {i for i, (h, _c) in enumerate(hour_hist) if h in (0, 6, 12, 18)}
+        cadence_html = f"""
+        <div class="card" style="margin:18px 0 0;padding:20px 22px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:14px;">By day of week</div>
+          {_hist(list(weekday_hist), bar_h=64)}
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin:20px 0 14px;">By hour (ET)</div>
+          {_hist(hour_labels, bar_h=64, show_counts=True, label_keep=keep_hours, num_fs=9, show_zeros=False)}
+        </div>"""
+
+    # ── Lifecycle: this-week open duration + fast-close watch ────────────────
+    lc_week = lifecycle.get("week", {}) or {}
+    lc_all  = lifecycle.get("all", {}) or {}
+    lifecycle_html = ""
+    if lc_all.get("closed_total"):
+        wk_opened  = int(lc_week.get("opened", 0))
+        wk_closed  = int(lc_week.get("closed", 0))
+        wk_lt1h    = int(lc_week.get("lt_1h", 0))
+        wk_grabbed = int(lc_week.get("fast_grabbed", 0))
+        wk_median  = _fmt_dur(lc_week.get("median_hours"))
+
+        # All-time, demoted to a single reference line.
+        all_ref = (
+            f'Since launch: {_fmt_dur(lc_all.get("median_hours"))} median open across '
+            f'{int(lc_all.get("closed_total", 0)):,} closed roles · '
+            f'{int(lc_all.get("fast_total", 0))} closed within an hour, Proxi synced '
+            f'{int(lc_all.get("fast_grabbed", 0))} in time.'
+        )
+
+        # Fast-close watch — this week first.
+        if wk_lt1h:
+            flag = (
+                f'<strong style="color:#b45309;">{wk_lt1h}</strong> role'
+                f'{"" if wk_lt1h == 1 else "s"} closed within an hour of opening — Proxi synced '
+                f'<strong style="color:#b45309;">{wk_grabbed}</strong> to Salesforce before they closed.'
+            )
+        else:
+            flag = "No role closed within an hour of opening this week — nothing slipped past Proxi."
+        flag_html = f"""
+          <div class="lc-flag" style="margin-top:16px;padding:14px 16px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;">
+            <div class="text" style="font-size:13px;color:#92400e;font-weight:600;">Fast-close watch</div>
+            <div class="muted" style="font-size:13px;color:#52525b;margin-top:4px;line-height:1.5;">{flag}</div>
+          </div>"""
+
+        if wk_closed > 0:
+            buckets = [
+                ("Within 1 hr", wk_lt1h,                       "seg-close"),
+                ("1–24 hrs",    int(lc_week.get("h1_24", 0)),  "seg-upd"),
+                ("1–7 days",    int(lc_week.get("d1_7", 0)),   "seg-open"),
+                ("Over 7 days", int(lc_week.get("gt_7d", 0)),  "bar-track"),
+            ]
+            tot = wk_closed
+            # Distribution bar as a FIXED-LAYOUT table — cells can never wrap to a
+            # new line; the last segment omits its width so it absorbs any rounding
+            # remainder and the bar always fills exactly 100%.
+            nz = [(n, cls) for _lbl, n, cls in buckets if n > 0]
+            seg_cells = ""
+            for idx, (n, cls) in enumerate(nz):
+                w = "" if idx == len(nz) - 1 else f"width:{round(n / tot * 100)}%;"
+                seg_cells += f'<td class="{cls}" style="{w}height:14px;"></td>'
+            seg_bar = (
+                '<div style="border-radius:7px;overflow:hidden;margin-bottom:14px;">'
+                '<table role="presentation" cellpadding="0" cellspacing="0" '
+                'style="width:100%;table-layout:fixed;border-collapse:collapse;">'
+                f'<tr>{seg_cells}</tr></table></div>'
+            )
+            legend_rows = "".join(
+                f'<tr>'
+                f'<td style="padding:5px 0;font-size:12px;white-space:nowrap;width:55%;">'
+                f'<span class="{cls}" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:6px;"></span>'
+                f'<span class="text" style="color:#27272a;">{lbl}</span></td>'
+                f'<td class="muted" style="padding:5px 0;font-size:12px;color:#52525b;text-align:right;">{n} &nbsp;·&nbsp; {round(n / tot * 100)}%</td>'
+                f'</tr>'
+                for lbl, n, cls in buckets
+            )
+            body = f"""
+          <div class="num" style="font-size:24px;color:#18181b;font-weight:700;margin:6px 0 2px;letter-spacing:-0.02em;">{wk_median} median open</div>
+          <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">{wk_closed} of {wk_opened} roles opened this week have closed</div>
+          {seg_bar}
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">{legend_rows}</table>"""
+        else:
+            body = f"""
+          <div class="num" style="font-size:24px;color:#18181b;font-weight:700;margin:6px 0 2px;letter-spacing:-0.02em;">{wk_opened} roles opened</div>
+          <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:6px;">none have closed yet this week</div>"""
+
+        lifecycle_html = f"""
+        <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">How long roles stayed open · this week</div>
+          {body}
+          {flag_html}
+          <div class="muted" style="margin-top:12px;font-size:11px;color:#71717a;line-height:1.5;">{all_ref}</div>
+        </div>"""
 
     # ── US tile-map ──────────────────────────────────────────────────────────
     _US_TILES = [
@@ -1040,19 +1174,15 @@ def send_weekly_summary(stats: dict) -> bool:
     state_counts = {st: c for st, c in top_states}
     max_state = max(state_counts.values()) if state_counts else 1
 
-    def _state_color(c: int) -> tuple[str, str]:
-        """Monochrome zinc ramp — editorial, matches the bar charts."""
-        if c == 0:
-            return ("#fafafa", "#a1a1aa")
+    def _state_level(c: int) -> int:
+        """Intensity bucket 0–4; bg/fg per level are class-driven (dark-safe)."""
+        if c <= 0:
+            return 0
         ratio = c / max_state
-        if ratio <= 0.25:
-            return ("#e4e4e7", "#3f3f46")
-        elif ratio <= 0.50:
-            return ("#a1a1aa", "#18181b")
-        elif ratio <= 0.75:
-            return ("#52525b", "#ffffff")
-        else:
-            return ("#18181b", "#ffffff")
+        if ratio <= 0.25: return 1
+        if ratio <= 0.50: return 2
+        if ratio <= 0.75: return 3
+        return 4
 
     grid = [[None] * 12 for _ in range(9)]
     for r, c, code in _US_TILES:
@@ -1065,45 +1195,42 @@ def send_weekly_summary(stats: dict) -> bool:
         for cell_code in row:
             if cell_code is None:
                 cells.append(f'<td class="map-cell" style="width:{cell}px;height:{cell}px;padding:2px;"></td>')
-            else:
-                c = state_counts.get(cell_code, 0)
-                bg, fg = _state_color(c)
-                # On hover: numeric label via title attribute (most clients show on hover).
-                title = f"{cell_code}: {c} update{'s' if c != 1 else ''}"
-                # Show count only when ≥ 1; otherwise just the abbreviation in muted.
+                continue
+            c = state_counts.get(cell_code, 0)
+            lvl = _state_level(c)
+            title = f"{cell_code}: {c} signal{'' if c == 1 else 's'}"
+            if c > 0:
+                # Abbreviation over count, two fixed-height lines — never wraps.
                 inner = (
-                    f'<div style="background:{bg};color:{fg};border-radius:4px;'
-                    f'height:{cell}px;line-height:{cell}px;text-align:center;'
-                    f'font-size:11px;font-weight:700;letter-spacing:.02em;">'
-                    f'{cell_code}'
-                    + (f' <span style="font-weight:600;opacity:.85;">{c}</span>' if c > 0 else "")
-                    + '</div>'
+                    f'<div class="map-tile lvl{lvl}" style="height:{cell}px;border-radius:4px;text-align:center;overflow:hidden;">'
+                    f'<div class="map-ab" style="font-size:8px;line-height:11px;font-weight:700;letter-spacing:.02em;padding-top:4px;">{cell_code}</div>'
+                    f'<div class="map-ct" style="font-size:12px;line-height:13px;font-weight:700;">{c}</div>'
+                    f'</div>'
                 )
-                cells.append(
-                    f'<td class="map-cell" title="{title}" style="width:{cell}px;height:{cell}px;padding:2px;">{inner}</td>'
+            else:
+                inner = (
+                    f'<div class="map-tile lvl0" style="height:{cell}px;line-height:{cell}px;border-radius:4px;'
+                    f'text-align:center;font-size:9px;font-weight:700;letter-spacing:.02em;">{cell_code}</div>'
                 )
+            cells.append(
+                f'<td class="map-cell" title="{title}" style="width:{cell}px;height:{cell}px;padding:2px;">{inner}</td>'
+            )
         rows_html.append(f"<tr>{''.join(cells)}</tr>")
 
-    legend_steps = [
-        ("#fafafa", "0"),
-        ("#e4e4e7", "1–25%"),
-        ("#a1a1aa", "26–50%"),
-        ("#52525b", "51–75%"),
-        ("#18181b", "76–100%"),
-    ]
+    legend_steps = [("lvl0", "0"), ("lvl1", "1–25%"), ("lvl2", "26–50%"), ("lvl3", "51–75%"), ("lvl4", "76–100%")]
     legend_cells = "".join(
-        f'<td style="padding:0 6px;font-size:10px;color:#71717a;vertical-align:middle;">'
-        f'<span style="display:inline-block;width:12px;height:12px;background:{bg};border-radius:2px;vertical-align:middle;margin-right:4px;"></span>{label}'
-        f'</td>'
-        for bg, label in legend_steps
+        f'<td style="padding:0 6px;font-size:10px;vertical-align:middle;">'
+        f'<span class="{cls}" style="display:inline-block;width:12px;height:12px;border-radius:2px;vertical-align:middle;margin-right:4px;"></span>'
+        f'<span class="dim" style="color:#71717a;">{label}</span></td>'
+        for cls, label in legend_steps
     )
 
     map_html = f"""
     <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
       <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">National footprint</div>
       <div class="num" style="font-size:24px;color:#18181b;font-weight:700;margin:6px 0 4px;letter-spacing:-0.02em;">{states_total} state{'s' if states_total != 1 else ''} active</div>
-      <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">Cell intensity scales with job-update volume; cell number is the count.</div>
-      <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:0 auto;">
+      <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">This week's signals by state.</div>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:0 auto;table-layout:fixed;">
         {''.join(rows_html)}
       </table>
       <table role="presentation" cellpadding="0" cellspacing="0" style="margin:14px auto 0;border-collapse:collapse;">
@@ -1111,96 +1238,16 @@ def send_weekly_summary(stats: dict) -> bool:
       </table>
     </div>"""
 
-    # ── Cadence: peak day + peak hour ────────────────────────────────────────
-    cadence_html = ""
-    if peak_day or peak_hour is not None:
-        peak_hour_label = ""
-        if peak_hour is not None:
-            h12 = peak_hour % 12 or 12
-            ampm = "AM" if peak_hour < 12 else "PM"
-            peak_hour_label = f"{h12} {ampm} ET"
-        cadence_html = f"""
-        <table role="presentation" cellpadding="0" cellspacing="8" class="duo-stack" style="width:100%;border-collapse:separate;margin-top:10px;">
-          <tr>
-            <td class="card" style="padding:18px 20px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;width:50%;vertical-align:top;">
-              <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Peak day</div>
-              <div class="num" style="font-size:22px;color:#18181b;font-weight:700;margin-top:4px;letter-spacing:-0.02em;">{peak_day or '—'}</div>
-              <div class="muted" style="font-size:13px;color:#52525b;margin-top:2px;">{peak_day_count} update{'s' if peak_day_count != 1 else ''} received</div>
-            </td>
-            <td class="card" style="padding:18px 20px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;width:50%;vertical-align:top;">
-              <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Peak hour</div>
-              <div class="num" style="font-size:22px;color:#18181b;font-weight:700;margin-top:4px;letter-spacing:-0.02em;">{peak_hour_label or '—'}</div>
-              <div class="muted" style="font-size:13px;color:#52525b;margin-top:2px;">{peak_hour_n} update{'s' if peak_hour_n != 1 else ''} in that window</div>
-            </td>
-          </tr>
-        </table>"""
-
-    # ── Top practices (numbers prominent) ────────────────────────────────────
-    top_prac_html = ""
-    if top_prac:
-        max_p = max(c for _, c in top_prac) or 1
-        rows = []
-        for name, count in top_prac:
-            pct = int(count / max_p * 100)
-            rows.append(
-                f"""<tr>
-                  <td style="padding:8px 0;font-size:13px;color:#18181b;width:55%;">{name}</td>
-                  <td style="padding:8px 0;width:30%;">
-                    <div style="height:8px;background:#f4f4f5;border-radius:4px;">
-                      <div style="height:8px;width:{pct}%;background:#27272a;border-radius:4px;"></div>
-                    </div>
-                  </td>
-                  <td style="padding:8px 0 8px 12px;font-size:13px;color:#18181b;font-weight:700;text-align:right;width:15%;">{count}</td>
-                </tr>"""
-            )
-        top_prac_html = f"""
-        <div class="card" style="margin:18px 0 0;padding:18px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;">Most active practices</div>
-          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">
-            {''.join(rows)}
-          </table>
-        </div>"""
-
-    # ── Top job records ──────────────────────────────────────────────────────
-    top_jobs_html = ""
-    if top_jobs:
-        rows = []
-        for j in top_jobs:
-            sfid = j.get("sf_job_id") or ""
-            sf_link = (
-                f'<a href="https://proxi.lightning.force.com/lightning/r/Job__c/{sfid}/view" '
-                f'style="color:#3f3f46;text-decoration:none;font-weight:600;border-bottom:1px solid #d4d4d8;">Open in Salesforce ↗</a>'
-                if sfid else ""
-            )
-            title_org = (j.get("title") or "—") + (f' · <span class="muted" style="color:#52525b;">{j["org"]}</span>' if j.get("org") else "")
-            rows.append(
-                f"""<tr>
-                  <td style="padding:10px 0;vertical-align:top;font-size:13px;width:16%;">
-                    <a href="https://portal.kimedics.com/app/workspace/job-posts/{j['job_id']}" style="color:#18181b;text-decoration:none;font-weight:700;">#{j['job_id']}</a>
-                  </td>
-                  <td style="padding:10px 0;vertical-align:top;font-size:13px;color:#18181b;width:52%;">{title_org}</td>
-                  <td style="padding:10px 0;vertical-align:top;font-size:13px;color:#18181b;font-weight:700;width:14%;text-align:right;">{j['patches']} fields</td>
-                  <td style="padding:10px 0;vertical-align:top;font-size:12px;width:18%;text-align:right;">{sf_link}</td>
-                </tr>"""
-            )
-        top_jobs_html = f"""
-        <div class="card" style="margin:18px 0 0;padding:18px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;">Most updated job records</div>
-          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">
-            {''.join(rows)}
-          </table>
-        </div>"""
-
-    # ── All-time stats (small footer line) ───────────────────────────────────
+    # ── All-time stats (small footer line; no dollars) ───────────────────────
     all_time_html = ""
     if launch and (cum_eml or cum_field):
         all_time_html = f"""
         <div class="muted" style="margin:18px 0 0;padding:14px 4px 0;border-top:1px solid #e4e4e7;font-size:11px;color:#71717a;line-height:1.6;">
           <span style="font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#52525b;">All-time since {launch}</span> ·
-          {cum_eml:,} emails processed ·
-          {cum_field:,} SF field updates ·
-          {cum_new:,} roles added to SF ·
-          ~{cum_h:g} hrs returned (~${cum_d:,})
+          {cum_eml:,} signals ·
+          {cum_field:,} field updates ·
+          {cum_new:,} roles created ·
+          ~{cum_h:g} hrs returned
         </div>"""
 
     # ── Assemble full document ───────────────────────────────────────────────
@@ -1208,18 +1255,39 @@ def send_weekly_summary(stats: dict) -> bool:
     <style>
       body { margin:0; padding:0; }
       a { color:#3f3f46; }
-      /* Mobile: stack hero/duo cards, shrink chart cells. */
+
+      /* Charts (light) — class-driven so dark mode can invert them. */
+      .chart-num  { color:#18181b; }
+      .chart-lbl  { color:#71717a; }
+      .chart-base { border-bottom:1px solid #e4e4e7; }
+      .bar        { background:#27272a; }
+      .bar-zero   { background:#d4d4d8; }
+      .bar-track  { background:#e4e4e7; }
+      .seg-open   { background:#2563eb; }
+      .seg-upd    { background:#d97706; }
+      .seg-close  { background:#52525b; }
+
+      /* Map tiles (light) — bg + fg per intensity level. */
+      .lvl0 { background:#f4f4f5; color:#a1a1aa; }
+      .lvl1 { background:#e4e4e7; color:#3f3f46; }
+      .lvl2 { background:#a1a1aa; color:#18181b; }
+      .lvl3 { background:#52525b; color:#ffffff; }
+      .lvl4 { background:#18181b; color:#ffffff; }
+
+      /* Mobile: stack hero cards, shrink map tiles. */
       @media only screen and (max-width: 600px) {
         .hero-stack > tbody > tr, .duo-stack > tbody > tr { display:block !important; }
         .hero-stack td, .duo-stack td { display:block !important; width:100% !important; box-sizing:border-box; }
         .hero-num { font-size:32px !important; }
         .map-cell { width:26px !important; height:26px !important; padding:1px !important; }
-        .map-cell > div { height:26px !important; line-height:26px !important; font-size:10px !important; }
-        .padded { padding:14px 16px !important; }
+        .map-tile { height:26px !important; }
+        .map-tile.lvl0 { line-height:26px !important; }
+        .map-ab { font-size:7px !important; line-height:9px !important; padding-top:3px !important; }
+        .map-ct { font-size:10px !important; line-height:11px !important; }
       }
-      /* Dark mode: invert backgrounds and lift text.
-         Inline ``background`` / ``color`` declarations need !important here
-         so they win against the inline style attribute. */
+
+      /* Dark mode: invert backgrounds, charts, and map ramp.
+         Inline declarations need !important to win over the style attribute. */
       @media (prefers-color-scheme: dark) {
         body, .wrap-bg { background:#09090b !important; }
         .card { background:#18181b !important; border-color:#27272a !important; }
@@ -1228,6 +1296,24 @@ def send_weekly_summary(stats: dict) -> bool:
         .dim   { color:#71717a !important; }
         a { color:#d4d4d8 !important; }
         .roi  { background:#0a0a0c !important; border:1px solid #27272a; }
+
+        .chart-num  { color:#fafafa !important; }
+        .chart-base { border-bottom-color:#3f3f46 !important; }
+        .bar        { background:#d4d4d8 !important; }
+        .bar-zero   { background:#3f3f46 !important; }
+        .bar-track  { background:#3f3f46 !important; }
+        .seg-open   { background:#60a5fa !important; }
+        .seg-upd    { background:#fbbf24 !important; }
+        .seg-close  { background:#a1a1aa !important; }
+
+        .lvl0 { background:#27272a !important; color:#52525b !important; }
+        .lvl1 { background:#3f3f46 !important; color:#d4d4d8 !important; }
+        .lvl2 { background:#52525b !important; color:#fafafa !important; }
+        .lvl3 { background:#a1a1aa !important; color:#18181b !important; }
+        .lvl4 { background:#fafafa !important; color:#18181b !important; }
+
+        .lc-flag { background:#1c1917 !important; border-color:#78350f !important; }
+        .lc-flag strong { color:#fbbf24 !important; }
       }
     </style>
     """
@@ -1253,15 +1339,14 @@ def send_weekly_summary(stats: dict) -> bool:
 
       {narrative_html}
       {hero_row}
+      {ops_row}
+      {health_line}
       {roi_html}
-      {speed_html}
       {daily_section}
       {trend_html}
-      {reliability}
-      {map_html}
       {cadence_html}
-      {top_prac_html}
-      {top_jobs_html}
+      {lifecycle_html}
+      {map_html}
       {all_time_html}
 
       <div class="muted" style="margin:24px 0 0;padding:12px 4px 0;font-size:11px;color:#a1a1aa;line-height:1.6;">
@@ -1272,31 +1357,36 @@ def send_weekly_summary(stats: dict) -> bool:
 </body>
 </html>"""
 
-    # Plain-text fallback (concise; full table renders in HTML).
-    daily_txt = "  " + "  ".join(f"{wl}:{c}" for (_, c), wl in zip(series, ["M","T","W","T","F","S","S"]))
+    # Plain-text fallback (concise; full charts render in HTML).
+    daily_txt = "  " + "  ".join(
+        f"{wl} {v['opened']}/{v['updated']}/{v['closed']}"
+        for (_, v), wl in zip(split_series, ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+    )
+    lat_line = f"{latency:.0f} min average" if latency is not None else "—"
+    lc_all_t = lifecycle.get("all", {}) or {}
+    median_all = _fmt_dur(lc_all_t.get("median_hours"))
+    ft  = int(lc_all_t.get("fast_total", 0))
+    fg  = int(lc_all_t.get("fast_grabbed", 0))
     text = textwrap.dedent(f"""
     Proxi Weekly Pulse — {period}
     ============================================
 
-    Job updates ingested    : {emails}    (prior week: {prv_emails})
-    Salesforce field updates: {patches}   (prior week: {prv_patches})
-    New roles added to SF   : {new_jobs}  (prior week: {prv_new})
+    Roles opened    : {opened}   (prior week: {prv_open})
+    Updates synced  : {updated}  (prior week: {prv_upd})
+    Roles closed    : {closed}   (prior week: {prv_close})
+    SF field updates: {patches}  (prior week: {prv_patch})
 
-    Time recouped this week : ~{hrs_saved:g} hours (~${dollars_saved:,} at ${hourly_rate}/hr)
-    {f"All-time since {launch}: {cum_eml:,} emails · {cum_field:,} field updates · ~{cum_h:g} hrs returned (~${cum_d:,})" if launch else ""}
+    Time to first scrape : {lat_line}
+    Emails ingested      : {emails} ({scraped} parsed, {errors} errors, {coverage_pct}% coverage)
+    Needs attention      : {needs} job{'' if needs == 1 else 's'}
+    Manual time recouped : ~{hrs_saved:g} hrs this week · ~{cum_h:g} hrs all-time
 
-    Reliability             : {coverage_pct}% coverage{f" · median {latency:.0f} min email→SF" if latency is not None else ""} · {needs} need attention
-    Speed                   : {f"{speed_x}× faster than manual" if speed_x else "—"}
+    Open duration (all-time): {median_all} median · {ft} closed within 1 hr ({fg} reached before close)
 
-    Daily activity:
+    Daily activity (opened/updated/closed):
     {daily_txt}
 
     States active: {states_total}
-    Peak day    : {peak_day or '—'} ({peak_day_count})
-    Peak hour   : {(peak_hour % 12 or 12) if peak_hour is not None else '—'} {'AM' if (peak_hour is not None and peak_hour < 12) else 'PM' if peak_hour is not None else ''} ET
-
-    Most updated jobs:
-    {chr(10).join(f"  · #{j['job_id']}  {j['title']}  ({j['patches']} field updates)" for j in top_jobs) or "  (none)"}
 
     Proxi · Kimedics → Salesforce automation
     """).strip()
