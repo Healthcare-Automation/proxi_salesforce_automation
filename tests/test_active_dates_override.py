@@ -43,6 +43,24 @@ def _clear_cache():
     tpl._ACTIVE_DATES_OVERRIDE_CACHE.clear()
 
 
+@pytest.fixture
+def live_ai(monkeypatch):
+    """Opt back into the real OpenAI call for live-prompt checks: load the key from
+    .env (the autouse conftest fixture removes it for determinism). Skips if absent."""
+    from pathlib import Path
+
+    env = Path(__file__).resolve().parent.parent / ".env"
+    key = ""
+    if env.exists():
+        for line in env.read_text().splitlines():
+            if line.strip().startswith("OPENAI_API_KEY="):
+                key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    if not key:
+        pytest.skip("no OPENAI_API_KEY in .env")
+    monkeypatch.setenv("OPENAI_API_KEY", key)
+
+
 # ── gate ─────────────────────────────────────────────────────────────────────
 def test_gate_triggers_on_date_top_line():
     assert ai._has_top_line_date_signal(DESC_DATES_ADDED)
@@ -115,12 +133,12 @@ def test_ai_returns_none_when_gate_fails(monkeypatch):
 
 # ── active_dates_override + effective_dates_needed wiring ─────────────────────
 def test_override_passthrough_when_ai_succeeds(monkeypatch):
-    monkeypatch.setattr(ai, "ai_active_dates_override", lambda t: ADDED_DATES)
+    monkeypatch.setattr(ai, "ai_active_dates_override", lambda t, s=None: ADDED_DATES)
     assert tpl.active_dates_override(DESC_DATES_ADDED) == ADDED_DATES
 
 
 def test_falls_back_to_regex_when_ai_unavailable(monkeypatch):
-    def _boom(_t):
+    def _boom(_t, _s=None):
         raise RuntimeError("no AI")
 
     monkeypatch.setattr(ai, "ai_active_dates_override", _boom)
@@ -129,40 +147,45 @@ def test_falls_back_to_regex_when_ai_unavailable(monkeypatch):
 
 
 def test_effective_dates_needed_prefers_override(monkeypatch):
-    monkeypatch.setattr(ai, "ai_active_dates_override", lambda t: ADDED_DATES)
+    monkeypatch.setattr(ai, "ai_active_dates_override", lambda t, s=None: ADDED_DATES)
     row = {"description_full_text": DESC_DATES_ADDED, "dates_needed": "June 8-9, 17-19, 26, 29-30, July 1-2"}
     assert tpl.effective_dates_needed(row) == ADDED_DATES
 
 
 def test_effective_dates_needed_uses_structured_when_no_override(monkeypatch):
-    monkeypatch.setattr(ai, "ai_active_dates_override", lambda t: None)
+    monkeypatch.setattr(ai, "ai_active_dates_override", lambda t, s=None: None)
     row = {"description_full_text": DESC_NO_OVERRIDE, "dates_needed": "June 8-9, 17-19, 26"}
     assert tpl.effective_dates_needed(row) == "June 8-9, 17-19, 26"
 
 
-def test_cancellation_is_not_an_override_when_ai_says_false(monkeypatch):
-    # Pure-cancellation line ("cancelled the need for June 11/12") must NOT set those
-    # dates as the need — the model returns override=false, so we fall through.
-    monkeypatch.setattr(ai, "ai_active_dates_override", lambda t: None)
-    txt = "6/10 the office has cancelled the need for June 11/12\nDates: June 1-2, 11-12, 15-19, 22."
-    assert tpl.active_dates_override(txt) is None
+def test_validate_allows_cancellation_subtraction():
+    # Subtraction result is not a single substring, but every piece is in the source.
+    raw = '{"override": true, "dates": "June 1-2, 15-19, 22"}'
+    structured = "June 1-2, 11-12, 15-19, 22."
+    desc = "6/10 the office cancelled the need for June 11/12"
+    assert ai._validate_ai_dates(raw, desc, structured) == "June 1-2, 15-19, 22"
+
+
+def test_cancellation_passes_through_when_ai_subtracts(monkeypatch):
+    # AI removes the cancelled dates → effective_dates_needed returns the trimmed list.
+    monkeypatch.setattr(ai, "ai_active_dates_override", lambda t, s=None: "June 1-2, 15-19, 22")
+    row = {"description_full_text": "6/10 office cancelled June 11/12",
+           "dates_needed": "June 1-2, 11-12, 15-19, 22."}
+    assert tpl.effective_dates_needed(row) == "June 1-2, 15-19, 22"
 
 
 # ── Live prompt checks (skipped in CI; run when OPENAI_API_KEY is present) ────
-@pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="needs live OpenAI")
-def test_live_dates_added_overrides():
+def test_live_dates_added_overrides(live_ai):
     txt = ("6/12 Dates added: June 29-30, July 1-2, 6-10, 13-17, 20-21.\n"
            "Dates: June 8-9, 17-19, 26, 29-30, July 1-2, 6-10, 13-17, 20-21.")
-    assert ai.ai_active_dates_override(txt) == ADDED_DATES
+    assert ai.ai_active_dates_override(txt, "June 8-9, 17-19, 26, 29-30, July 1-2, 6-10, 13-17, 20-21") == ADDED_DATES
 
 
-@pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="needs live OpenAI")
-def test_live_pure_cancellation_does_not_override():
+def test_live_cancellation_subtracts_cancelled_dates(live_ai):
     txt = "6/10 the office has cancelled the need for June 11/12\nDates: June 1-2, 11-12, 15-19, 22."
-    assert ai.ai_active_dates_override(txt) is None
+    assert ai.ai_active_dates_override(txt, "June 1-2, 11-12, 15-19, 22") == "June 1-2, 15-19, 22"
 
 
-@pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="needs live OpenAI")
-def test_live_cancellation_with_restated_need_uses_need():
+def test_live_cancellation_with_restated_need_uses_need(live_ai):
     txt = "6/5 update. June 8-9 have been cancelled. Partial fill. Active need is June 26\nDates: June 8-9, 17-19, 26"
-    assert ai.ai_active_dates_override(txt) == "June 26"
+    assert ai.ai_active_dates_override(txt, "June 8-9, 17-19, 26") == "June 26"

@@ -57,11 +57,15 @@ def _norm_for_match(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
-def _validate_ai_dates(raw_text: str, description_full_text: str) -> Optional[str]:
-    """Parse the model's JSON and return the override dates only when they are a
-    verbatim substring of the post. Raises ``ValueError`` on anything unusable
-    (unparseable / hallucinated) so the caller falls back to the regex extractor.
-    Returns ``None`` when the model confidently reports *no* override."""
+def _validate_ai_dates(
+    raw_text: str, description_full_text: str, structured_dates: str = ""
+) -> Optional[str]:
+    """Parse the model's JSON and return the resolved active dates. Anti-hallucination
+    guard is token-level: every comma-separated date piece in the result must appear
+    in the post (or the structured Dates list) — this allows cancellation results
+    (full list minus removed dates), which are not a single verbatim substring, while
+    still rejecting invented dates. Raises ``ValueError`` on anything unusable so the
+    caller falls back to the regex extractor; returns ``None`` for "no change"."""
     import json
 
     t = (raw_text or "").strip()
@@ -78,21 +82,27 @@ def _validate_ai_dates(raw_text: str, description_full_text: str) -> Optional[st
     dates = str(obj.get("dates") or "").strip().rstrip(".").strip()
     if not dates:
         return None
-    if _norm_for_match(dates) not in _norm_for_match(description_full_text):
-        # Model invented dates not present in the post — do not trust it.
-        raise ValueError(f"AI date override not found verbatim in post: {dates!r}")
+    haystack = _norm_for_match(f"{description_full_text} {structured_dates or ''}")
+    for piece in dates.split(","):
+        p = _norm_for_match(piece)
+        if p and p not in haystack:
+            raise ValueError(f"AI date piece not present in post: {piece!r}")
     return dates
 
 
 def ai_active_dates_override(
     description_full_text: str,
+    structured_dates: Optional[str] = None,
     *,
     model: Optional[str] = None,
     timeout_s: float = 15.0,
 ) -> Optional[str]:
-    """Return the currently-active dates stated in the post's top line, or ``None``
-    when the model judges there is no override. Raises when the AI cannot run
-    (no key / package / network / bad output) so callers fall back to regex."""
+    """Resolve the currently-active dates from a post's top line, applying any
+    override (active need / dates added) OR cancellation (full list minus removed
+    dates). Returns the resolved date string, or ``None`` when the top line does not
+    change the dates. Raises when the AI cannot run (no key / package / network /
+    bad output) so callers fall back to regex. ``structured_dates`` is the parsed
+    full "Dates:" list, used as the base for cancellation subtraction."""
     t = (description_full_text or "").strip()
     if not t or not _has_top_line_date_signal(t):
         return None
@@ -107,24 +117,34 @@ def ai_active_dates_override(
 
     target_model = (model or os.environ.get("PROXI_OPENAI_MODEL") or "gpt-4.1-mini").strip()
     top = "\n".join(t.splitlines()[:8])
+    structured = (structured_dates or "").strip()
 
     prompt = f"""
-You extract the CURRENTLY ACTIVE dates from a dental staffing job post.
+You determine the CURRENTLY ACTIVE dates needed for a dental staffing job post.
 
-Background: every post has a structured "Dates:" line that lists ALL dates ever associated with the job. Separately, the TOP of a post sometimes states a NARROWER, currently-active set of dates — for example dates that were just added, or the remaining need after cancellations or a partial fill. The wording varies and changes over time (examples only, not an exhaustive list: "Active need is ...", "Active needs are ...", "6/12 Dates added: ...", "Updated dates: ...", "Remaining need: ...").
+Every post has a structured full "Dates:" list (every date ever associated with the job). The TOP of the post sometimes CHANGES which dates are currently needed. Apply any such change and return the resulting active dates. Set "override" to true whenever the top changes the dates (override OR cancellation), false only when it does not.
 
-Your task: decide whether the TOP of THIS post states a specific set of currently-active/needed dates that should REPLACE the full "Dates:" list.
-- If YES: return those dates EXACTLY as written in the post — only the date portion. Exclude any leading date stamp (e.g. "6/12"), labels, and trailing notes/sentences.
-- If NO (the top is only context, requirements, a location, or just the full "Dates:" line): say override is false.
+1. OVERRIDE — top states the active need or newly-added dates (e.g. "Active need is ...", "6/12 Dates added: ...", "Updated dates: ...") → return THOSE dates exactly as written, KEEPING any weekday/day-of-week qualifiers that are part of them (e.g. "Fridays June 5, 12"). Drop only the leading date stamp (e.g. "6/12"), unrelated labels, and trailing sentences.
+2. CANCELLATION — top says certain dates were cancelled, dropped, removed, no longer needed, or already filled (e.g. "the office cancelled the need for June 11/12", "June 8-9 have been cancelled") → return the structured "Dates:" list with EXACTLY those dates removed, keeping the rest in order. This IS a change → override=true.
+3. NO CHANGE — top is only context, requirements, a location, or just restates the full list → override=false.
 
-CRITICAL — cancellations are the OPPOSITE of a need: a line that says certain dates were cancelled, dropped, removed, no longer needed, or already filled (e.g. "the office cancelled the need for June 11/12", "June 8-9 have been cancelled", "no longer need July 4") is REMOVING those dates. NEVER return cancelled/removed/filled dates as the active need. Only return dates that are explicitly stated as the current/remaining ACTIVE need. If the top line is only a cancellation/removal and does NOT separately state the remaining active need, set override to false.
+Never invent dates: every date you return must appear in the post or the structured list.
 
-Respond with STRICT JSON and nothing else: {{"override": true or false, "dates": "<verbatim dates, or empty string>"}}
+Examples (structured | top → output):
+- "June 8-9, 17-19, 26, 29-30, July 1-2" | "6/12 Dates added: June 29-30, July 1-2" → {{"override": true, "dates": "June 29-30, July 1-2"}}
+- "Monday only" | "4/8 Active needs are Fridays June 5, 12" → {{"override": true, "dates": "Fridays June 5, 12"}}
+- "June 1-2, 11-12, 15-19, 22" | "6/10 the office cancelled the need for June 11/12" → {{"override": true, "dates": "June 1-2, 15-19, 22"}}
+- "June 8-9, 17-19, 26" | "6/5 June 8-9 have been cancelled. Active need is June 26" → {{"override": true, "dates": "June 26"}}
+- "June 8-9, 17-19, 26" | "**Aspen exp preferred" → {{"override": false, "dates": ""}}
+
+Structured "Dates:" list: {structured or "(none provided)"}
 
 POST (top portion):
 <<<
 {top}
 >>>
+
+Respond with STRICT JSON and nothing else: {{"override": true or false, "dates": "<resulting active dates, or empty string>"}}
 """.strip()
 
     client = OpenAI(api_key=api_key, timeout=timeout_s)
@@ -133,7 +153,7 @@ POST (top portion):
         temperature=0,
         input=[{"role": "user", "content": prompt}],
     )
-    return _validate_ai_dates((resp.output_text or "").strip(), t)
+    return _validate_ai_dates((resp.output_text or "").strip(), t, structured)
 
 
 def _collapse_ws(s: str) -> str:

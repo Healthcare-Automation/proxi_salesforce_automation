@@ -379,10 +379,6 @@ def _fill_from_description_blocks(out: dict) -> None:
     desc = _split_chained_desc_labels_into_lines(desc)
     lines = desc.splitlines()
 
-    active_dates = active_dates_override(desc)
-    if active_dates:
-        out["dates_needed"] = active_dates
-
     if not (out.get("required_procedures") or "").strip():
         block = _section_after_heading(
             lines,
@@ -413,6 +409,13 @@ def _fill_from_description_blocks(out: dict) -> None:
         block = _section_after_heading(lines, ("dates needed", "dates required", "coverage dates"))
         if block:
             out["dates_needed"] = block
+
+    # Resolve any top-line override / cancellation against the structured dates,
+    # now that the full "Dates:" list has been parsed (so a cancellation can be
+    # subtracted from it). Override/active-need cases replace it outright.
+    resolved_dates = active_dates_override(desc, out.get("dates_needed"))
+    if resolved_dates:
+        out["dates_needed"] = resolved_dates
 
     if not (out.get("standard_schedule") or "").strip():
         # Avoid bare "schedule" — it often grabs the next non-label line (e.g. a person's name).
