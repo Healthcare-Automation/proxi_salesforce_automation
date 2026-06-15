@@ -559,6 +559,30 @@ def weekly_summary_job():
     return ok
 
 
+# ── Monthly client-facing pulse (1st of month, 9 AM ET = 13:00 UTC) ──────────
+
+@app.function(
+    image=_light_image,
+    schedule=modal.Cron("0 13 1 * *"),  # 1st of month 13:00 UTC ≈ 9 AM ET
+    secrets=[modal.Secret.from_name("salesforce-automation")],
+    timeout=180,
+)
+def monthly_summary_job():
+    """
+    Build and send the comprehensive monthly pulse: the prior calendar month's
+    activity with month-over-month deltas and the full chart set.
+    """
+    sys.path.insert(0, "/root")
+    from utils.supabase_db import get_conn
+    from utils.alert_email import send_monthly_summary
+
+    print("monthly_summary_job: starting...")
+    stats = _build_monthly_stats(get_conn)
+    ok = send_monthly_summary(stats)
+    print(f"monthly_summary_job: email sent={ok}, emails={stats.get('current', {}).get('emails_received')}")
+    return ok
+
+
 # ── Admin-triggered rescrape web endpoint (called by automation-hub) ──────────
 #
 # Re-runs the Kimedics scrape for an explicit list of job_ids — used when a
@@ -1160,48 +1184,47 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
     return stats
 
 
-def _build_weekly_stats(get_conn) -> dict:
-    """
-    Build the C-level weekly pulse dataset for ``send_weekly_summary``.
-    Reports on the previous calendar week (Mon 00:00 → Sun 23:59:59 ET), with
-    week-over-week deltas computed against the week before that.
-    """
-    import psycopg2.extras
-    from datetime import datetime, time, timezone, timedelta
+# Operational buckets shared across pulse periods. `status: Active` is treated
+# as an open (role went live / came back on the market); `updated` is a content
+# edit; `status: Closed` is a close.
+def _pulse_bucket(action: str) -> str:
+    a = (action or "").strip().lower()
+    if a in ("new", "status: active"):
+        return "opened"
+    if a == "status: closed":
+        return "closed"
+    return "updated"
+
+
+def _pulse_et():
+    from datetime import timezone, timedelta
     try:
         from zoneinfo import ZoneInfo
-        ET = ZoneInfo("America/New_York")
+        return ZoneInfo("America/New_York")
     except Exception:
-        ET = timezone(timedelta(hours=-5))
+        return timezone(timedelta(hours=-5))
 
-    now_et = datetime.now(ET)
-    # Previous calendar week (Mon-Sun in ET).
-    weekday_today = now_et.weekday()  # Mon=0
-    last_sunday   = (now_et - timedelta(days=weekday_today + 1)).date()
-    last_monday   = last_sunday - timedelta(days=6)
-    prior_sunday  = last_monday - timedelta(days=1)
-    prior_monday  = prior_sunday - timedelta(days=6)
 
-    def window_utc(d_start, d_end):
-        s = datetime.combine(d_start, time(0, 0, 0), tzinfo=ET).astimezone(timezone.utc)
-        e = datetime.combine(d_end,   time(23, 59, 59), tzinfo=ET).astimezone(timezone.utc)
-        return s, e
+def _pulse_window_utc(d_start, d_end, ET):
+    from datetime import datetime, time, timezone
+    s = datetime.combine(d_start, time(0, 0, 0), tzinfo=ET).astimezone(timezone.utc)
+    e = datetime.combine(d_end,   time(23, 59, 59), tzinfo=ET).astimezone(timezone.utc)
+    return s, e
 
-    cur_start_utc, cur_end_utc = window_utc(last_monday,  last_sunday)
-    prv_start_utc, prv_end_utc = window_utc(prior_monday, prior_sunday)
 
-    period_label = f"{last_monday.strftime('%b %-d')} – {last_sunday.strftime('%b %-d, %Y')}"
+def _build_period_stats(get_conn, cur_start_utc, cur_end_utc,
+                        prv_start_utc, prv_end_utc, period_label, ET) -> dict:
+    """
+    Shared pulse aggregation for an arbitrary reporting window. Used by both the
+    weekly and monthly summaries; the caller supplies the window bounds + label
+    and adds any period-specific trend/series afterward. Returns the core
+    dataset: current/previous aggregates, hours saved, states, cadence
+    histograms, cumulative-since-launch, and lifecycle.
+    """
+    import psycopg2.extras
+    from datetime import datetime
 
-    # Operational buckets. `status: Active` is treated as an open (the role went
-    # live / came back on the market); `updated` is a content edit; everything
-    # under `status: Closed` is a close.
-    def _bucket(action: str) -> str:
-        a = (action or "").strip().lower()
-        if a in ("new", "status: active"):
-            return "opened"
-        if a == "status: closed":
-            return "closed"
-        return "updated"
+    _bucket = _pulse_bucket
 
     def _aggregate(get_conn, start_utc, end_utc):
         agg = {
@@ -1212,6 +1235,8 @@ def _build_weekly_stats(get_conn) -> dict:
             "updated":              0,
             "closed":               0,
             "errors":               0,    # emails that did not parse to usable content
+            "content_emails":       0,    # job-post emails that carry content (new/updated; not status pings)
+            "content_ok":           0,    # of those, parsed to a usable title + description
             "field_patches_total":  0,
             "median_latency_min":      None,
             "mean_latency_min":        None,   # outlier-trimmed average (headline)
@@ -1300,8 +1325,10 @@ def _build_weekly_stats(get_conn) -> dict:
         agg["field_patches_total"] = sum(int(r["fields_changed"] or 0) for r in rows)
         # Distinct jobs needing a human — not email rows (one stuck job often
         # spans several emails, which would otherwise inflate the count).
-        agg["needs_attention"]     = len({r["job_post_id"] for r in rows if r["stuck"] and r.get("job_post_id")})
-        agg["errors"]              = agg["emails_received"] - agg["scraped_ok"]
+        stuck_jobs = sorted({r["job_post_id"] for r in rows if r["stuck"] and r.get("job_post_id")})
+        agg["needs_attention"]      = len(stuck_jobs)
+        agg["needs_attention_jobs"] = stuck_jobs
+        agg["errors"]               = agg["emails_received"] - agg["scraped_ok"]
 
         # Operational buckets + per-day split (ET date).
         for r in rows:
@@ -1311,6 +1338,12 @@ def _build_weekly_stats(get_conn) -> dict:
             agg["daily_counts"][d] = agg["daily_counts"].get(d, 0) + 1
             slot = agg["daily_split"].setdefault(d, {"opened": 0, "updated": 0, "closed": 0})
             slot[b] += 1
+            # Capture rate is measured only over content-bearing job-post emails
+            # (new / updated). Status-change pings carry no content to capture.
+            if not (r.get("action_or_change") or "").strip().lower().startswith("status"):
+                agg["content_emails"] += 1
+                if r["scrape_ok"]:
+                    agg["content_ok"] += 1
 
         # Note: time-to-first-scrape is computed separately, per newly-opened
         # role, in ``_role_latency`` — not per email — so updates/closes don't
@@ -1435,46 +1468,42 @@ def _build_weekly_stats(get_conn) -> dict:
     weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     weekday_hist = [(weekday_labels[i], weekday_totals[i]) for i in range(7)]
 
-    # Hour-of-day histogram (all 24 ET hours).
+    # Weekday split by opened/updated/closed (Mon–Fri only — Aspen HR is closed
+    # on weekends, so Sat/Sun add nothing but empty bars).
+    weekday_split_totals = {i: {"opened": 0, "updated": 0, "closed": 0} for i in range(7)}
+    for d_iso, parts in cur_agg["daily_split"].items():
+        try:
+            wd = datetime.strptime(d_iso, "%Y-%m-%d").date().weekday()
+        except Exception:
+            continue
+        for k in ("opened", "updated", "closed"):
+            weekday_split_totals[wd][k] += int(parts.get(k, 0))
+    weekday_split = [(weekday_labels[i], weekday_split_totals[i]) for i in range(5)]  # Mon–Fri
+
+    # Hour-of-day histogram (all 24 ET hours), split by opened/updated/closed.
     hour_counts = {h: 0 for h in range(24)}
+    hour_split_totals = {h: {"opened": 0, "updated": 0, "closed": 0} for h in range(24)}
     with get_conn() as conn:
         if conn is not None:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     SELECT EXTRACT(HOUR FROM (COALESCE("date", created_at) AT TIME ZONE 'America/New_York'))::int AS hr,
-                           count(*)::int AS n
+                           action_or_change, count(*)::int AS n
                     FROM email_scrapes
                     WHERE COALESCE("date", created_at) >= %s AND COALESCE("date", created_at) <= %s
                       AND job_post_id IS NOT NULL AND job_post_id <> ''
-                    GROUP BY hr
+                    GROUP BY hr, action_or_change
                     """,
                     (cur_start_utc, cur_end_utc),
                 )
-                for row in cur.fetchall():
-                    hour_counts[int(row[0])] = int(row[1])
+                for hr, action, n in cur.fetchall():
+                    hr = int(hr); n = int(n or 0)
+                    hour_counts[hr] += n
+                    hour_split_totals[hr][_bucket(action)] += n
     hour_hist = [(h, hour_counts[h]) for h in range(24)]
+    hour_split = [(h, hour_split_totals[h]) for h in range(24)]
 
-    # ── 4-week throughput trend (emails per week, ending current week) ──────
-    trend: list[tuple[str, int]] = []
-    with get_conn() as conn:
-        if conn is not None:
-            with conn.cursor() as cur:
-                for back in range(3, -1, -1):
-                    wk_end_date = last_sunday - timedelta(days=back * 7)
-                    wk_start_date = wk_end_date - timedelta(days=6)
-                    ws, we = window_utc(wk_start_date, wk_end_date)
-                    cur.execute(
-                        """
-                        SELECT count(*)::int FROM email_scrapes
-                        WHERE COALESCE("date", created_at) >= %s
-                          AND COALESCE("date", created_at) <= %s
-                          AND job_post_id IS NOT NULL AND job_post_id <> ''
-                        """,
-                        (ws, we),
-                    )
-                    n = int(cur.fetchone()[0])
-                    trend.append((wk_end_date.strftime("%b %-d"), n))
 
     # ── Cumulative since launch ─────────────────────────────────────────────
     cum = {
@@ -1656,29 +1685,286 @@ def _build_weekly_stats(get_conn) -> dict:
         },
         "top_states":          top_states,   # all active states, for the tile map
         "states_total":        states_total,
-        "weekday_hist":        weekday_hist,   # [(label, count) × 7]
-        "hour_hist":           hour_hist,      # [(hour, count) × 24]
-        "trend_weekly":        trend,          # last 4 weeks
+        "weekday_hist":        weekday_hist,    # [(label, count) × 7]
+        "weekday_split":       weekday_split,   # [(label, {opened,updated,closed}) × Mon–Fri]
+        "hour_hist":           hour_hist,       # [(hour, count) × 24]
+        "hour_split":          hour_split,      # [(hour, {opened,updated,closed}) × 24]
         "cumulative":          cum,
         "lifecycle":           lifecycle,
-        "daily_series":        [
-            (
-                (last_monday + timedelta(days=i)).isoformat(),
-                cur_agg["daily_counts"].get((last_monday + timedelta(days=i)).isoformat(), 0),
-            )
-            for i in range(7)
-        ],
-        "daily_split_series":  [
-            (
-                (last_monday + timedelta(days=i)).isoformat(),
-                cur_agg["daily_split"].get(
-                    (last_monday + timedelta(days=i)).isoformat(),
-                    {"opened": 0, "updated": 0, "closed": 0},
-                ),
-            )
-            for i in range(7)
-        ],
     }
+
+
+def _build_weekly_stats(get_conn) -> dict:
+    """
+    Weekly pulse dataset for ``send_weekly_summary`` — previous calendar week
+    (Mon 00:00 → Sun 23:59:59 ET), WoW deltas vs the week before.
+    """
+    from datetime import datetime, timedelta
+    ET = _pulse_et()
+    now_et = datetime.now(ET)
+    last_sunday  = (now_et - timedelta(days=now_et.weekday() + 1)).date()
+    last_monday  = last_sunday - timedelta(days=6)
+    prior_sunday = last_monday - timedelta(days=1)
+    prior_monday = prior_sunday - timedelta(days=6)
+    cur_start_utc, cur_end_utc = _pulse_window_utc(last_monday,  last_sunday,  ET)
+    prv_start_utc, prv_end_utc = _pulse_window_utc(prior_monday, prior_sunday, ET)
+    period_label = f"{last_monday.strftime('%b %-d')} – {last_sunday.strftime('%b %-d, %Y')}"
+
+    stats = _build_period_stats(get_conn, cur_start_utc, cur_end_utc,
+                                prv_start_utc, prv_end_utc, period_label, ET)
+
+    # 4-week throughput trend ending the reported week.
+    stats["trend_weekly"] = _pulse_weekly_trend(get_conn, last_sunday, 4, ET)
+    stats["hours_trend"]  = _pulse_weekly_hours_trend(get_conn, last_sunday, 8, ET)
+    daily_counts = stats["current"]["daily_counts"]
+    daily_split  = stats["current"]["daily_split"]
+    stats["daily_series"] = [
+        ((last_monday + timedelta(days=i)).isoformat(),
+         daily_counts.get((last_monday + timedelta(days=i)).isoformat(), 0))
+        for i in range(7)
+    ]
+    stats["daily_split_series"] = [
+        ((last_monday + timedelta(days=i)).isoformat(),
+         daily_split.get((last_monday + timedelta(days=i)).isoformat(),
+                         {"opened": 0, "updated": 0, "closed": 0}))
+        for i in range(7)
+    ]
+    return stats
+
+
+def _pulse_weekly_trend(get_conn, end_sunday, weeks, ET):
+    """Emails per week for the trailing ``weeks`` weeks ending ``end_sunday``."""
+    from datetime import timedelta
+    trend: list = []
+    with get_conn() as conn:
+        if conn is None:
+            return trend
+        with conn.cursor() as cur:
+            for back in range(weeks - 1, -1, -1):
+                wk_end = end_sunday - timedelta(days=back * 7)
+                wk_start = wk_end - timedelta(days=6)
+                ws, we = _pulse_window_utc(wk_start, wk_end, ET)
+                cur.execute(
+                    """
+                    SELECT count(*)::int FROM email_scrapes
+                    WHERE COALESCE("date", created_at) >= %s
+                      AND COALESCE("date", created_at) <= %s
+                      AND job_post_id IS NOT NULL AND job_post_id <> ''
+                    """,
+                    (ws, we),
+                )
+                trend.append((wk_end.strftime("%b %-d"), int(cur.fetchone()[0])))
+    return trend
+
+
+def _pulse_period_hours(cur, start_utc, end_utc):
+    """Hours saved in a window (same model as _hours_saved: 8/open, 1.5/other, 2/email)."""
+    cur.execute(
+        """
+        SELECT action_or_change, count(*)::int FROM email_scrapes
+        WHERE COALESCE("date", created_at) >= %s AND COALESCE("date", created_at) <= %s
+          AND job_post_id IS NOT NULL AND job_post_id <> ''
+        GROUP BY action_or_change
+        """,
+        (start_utc, end_utc),
+    )
+    b = {"opened": 0, "updated": 0, "closed": 0}
+    emails = 0
+    for action, n in cur.fetchall():
+        b[_pulse_bucket(action)] += int(n or 0)
+        emails += int(n or 0)
+    return round((b["opened"] * 8 + (b["updated"] + b["closed"]) * 1.5 + emails * 2) / 60.0, 1)
+
+
+def _pulse_weekly_hours_trend(get_conn, end_sunday, weeks, ET):
+    """Hours saved per week, trailing ``weeks`` weeks ending ``end_sunday``."""
+    from datetime import timedelta
+    out: list = []
+    with get_conn() as conn:
+        if conn is None:
+            return out
+        with conn.cursor() as cur:
+            for back in range(weeks - 1, -1, -1):
+                we = end_sunday - timedelta(days=back * 7)
+                ws = we - timedelta(days=6)
+                s, e = _pulse_window_utc(ws, we, ET)
+                out.append((we.strftime("%b %-d"), _pulse_period_hours(cur, s, e)))
+    return out
+
+
+def _pulse_monthly_hours_trend(get_conn, report_month_start, months, ET):
+    """Hours saved per calendar month, trailing ``months`` months (drops leading zeros)."""
+    import datetime as dt
+    from datetime import timedelta
+    y, m = report_month_start.year, report_month_start.month
+    seq = []
+    for _ in range(months):
+        seq.append((y, m)); m -= 1
+        if m == 0:
+            m = 12; y -= 1
+    seq.reverse()
+    out: list = []
+    with get_conn() as conn:
+        if conn is None:
+            return out
+        with conn.cursor() as cur:
+            for yy, mm in seq:
+                ms = dt.date(yy, mm, 1)
+                ns = dt.date(yy + 1, 1, 1) if mm == 12 else dt.date(yy, mm + 1, 1)
+                me = ns - timedelta(days=1)
+                s, e = _pulse_window_utc(ms, me, ET)
+                out.append((ms.strftime("%b"), _pulse_period_hours(cur, s, e)))
+    while out and out[0][1] == 0:
+        out.pop(0)
+    return out
+
+
+def _build_monthly_stats(get_conn) -> dict:
+    """
+    Monthly pulse dataset for ``send_monthly_summary`` — previous calendar month,
+    MoM deltas vs the month before. Adds per-week trend + opened/updated/closed
+    split by week of the month.
+    """
+    from datetime import datetime, timedelta
+    ET = _pulse_et()
+    now_et = datetime.now(ET)
+    first_this_month = now_et.date().replace(day=1)
+    last_month_end   = first_this_month - timedelta(days=1)       # last day prior month
+    last_month_start = last_month_end.replace(day=1)              # first day prior month
+    prev_month_end   = last_month_start - timedelta(days=1)
+    prev_month_start = prev_month_end.replace(day=1)
+    cur_start_utc, cur_end_utc = _pulse_window_utc(last_month_start, last_month_end, ET)
+    prv_start_utc, prv_end_utc = _pulse_window_utc(prev_month_start, prev_month_end, ET)
+    period_label = last_month_start.strftime("%B %Y")
+
+    stats = _build_period_stats(get_conn, cur_start_utc, cur_end_utc,
+                                prv_start_utc, prv_end_utc, period_label, ET)
+
+    trend, weekly_split = _pulse_month_weeks(get_conn, last_month_start, last_month_end, ET)
+    stats["trend_weekly"]        = trend          # emails per week-of-month
+    stats["weekly_split_series"] = weekly_split   # [(label, {opened,updated,closed})]
+    stats["monthly_trend"]       = _pulse_monthly_trend(get_conn, last_month_start, 6, ET)
+    stats["hours_trend"]         = _pulse_monthly_hours_trend(get_conn, last_month_start, 6, ET)
+    return stats
+
+
+def _build_impact_stats(get_conn) -> dict:
+    """
+    All-time impact dataset for ``send_impact_report`` — covers launch → today.
+    Same validated aggregates as the pulse, over the whole window: totals,
+    capture, latency, hours saved, open-duration lifecycle, geography, plus a
+    full month-by-month trend of activity and hours. No period deltas (it's the
+    whole history).
+    """
+    from datetime import datetime, timedelta
+    ET = _pulse_et()
+    now_et = datetime.now(ET)
+
+    launch = None
+    with get_conn() as conn:
+        if conn is not None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT MIN(COALESCE("date", created_at)) FROM email_scrapes
+                       WHERE job_post_id IS NOT NULL AND job_post_id <> ''"""
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    launch = row[0].astimezone(ET).date()
+    if launch is None:
+        launch = now_et.date()
+
+    cur_start_utc, cur_end_utc = _pulse_window_utc(launch, now_et.date(), ET)
+    # Degenerate "previous" window before launch — yields zero, deltas unused.
+    prv_start_utc, prv_end_utc = _pulse_window_utc(launch - timedelta(days=2), launch - timedelta(days=1), ET)
+    period_label = f"{launch.strftime('%b %-d, %Y')} – {now_et.strftime('%b %-d, %Y')}"
+
+    stats = _build_period_stats(get_conn, cur_start_utc, cur_end_utc,
+                                prv_start_utc, prv_end_utc, period_label, ET)
+
+    months = (now_et.year - launch.year) * 12 + (now_et.month - launch.month) + 1
+    this_month_start = now_et.date().replace(day=1)
+    stats["monthly_trend"] = _pulse_monthly_trend(get_conn, this_month_start, months, ET)
+    stats["hours_trend"]   = _pulse_monthly_hours_trend(get_conn, this_month_start, months, ET)
+    stats["launch_iso"]    = launch.isoformat()
+    stats["today_iso"]     = now_et.date().isoformat()
+    stats["days_live"]     = (now_et.date() - launch).days + 1
+    return stats
+
+
+def _pulse_monthly_trend(get_conn, report_month_start, months, ET):
+    """Emails per calendar month for the trailing ``months`` months (inclusive)."""
+    import datetime as dt
+    from datetime import timedelta
+    y, m = report_month_start.year, report_month_start.month
+    seq = []
+    for _ in range(months):
+        seq.append((y, m))
+        m -= 1
+        if m == 0:
+            m = 12; y -= 1
+    seq.reverse()
+    out: list = []
+    with get_conn() as conn:
+        if conn is None:
+            return out
+        with conn.cursor() as cur:
+            for yy, mm in seq:
+                mstart = dt.date(yy, mm, 1)
+                nstart = dt.date(yy + 1, 1, 1) if mm == 12 else dt.date(yy, mm + 1, 1)
+                mend = nstart - timedelta(days=1)
+                s, e = _pulse_window_utc(mstart, mend, ET)
+                cur.execute(
+                    """
+                    SELECT count(*)::int FROM email_scrapes
+                    WHERE COALESCE("date", created_at) >= %s
+                      AND COALESCE("date", created_at) <= %s
+                      AND job_post_id IS NOT NULL AND job_post_id <> ''
+                    """,
+                    (s, e),
+                )
+                out.append((mstart.strftime("%b"), int(cur.fetchone()[0])))
+    while out and out[0][1] == 0:   # drop pre-launch leading zero months
+        out.pop(0)
+    return out
+
+
+def _pulse_month_weeks(get_conn, m_start, m_end, ET):
+    """Split a month into 7-day chunks; return (trend, opened/updated/closed split)."""
+    from datetime import timedelta
+    chunks: list = []
+    ws = m_start
+    while ws <= m_end:
+        we = min(ws + timedelta(days=6), m_end)
+        chunks.append((ws, we))
+        ws = we + timedelta(days=1)
+    trend: list = []
+    split: list = []
+    with get_conn() as conn:
+        if conn is None:
+            return trend, split
+        with conn.cursor() as cur:
+            for ws, we in chunks:
+                s, e = _pulse_window_utc(ws, we, ET)
+                cur.execute(
+                    """
+                    SELECT action_or_change, count(*)::int FROM email_scrapes
+                    WHERE COALESCE("date", created_at) >= %s
+                      AND COALESCE("date", created_at) <= %s
+                      AND job_post_id IS NOT NULL AND job_post_id <> ''
+                    GROUP BY action_or_change
+                    """,
+                    (s, e),
+                )
+                buckets = {"opened": 0, "updated": 0, "closed": 0}
+                total = 0
+                for action, n in cur.fetchall():
+                    buckets[_pulse_bucket(action)] += int(n or 0)
+                    total += int(n or 0)
+                label = ws.strftime("%b %-d")
+                trend.append((label, total))
+                split.append((label, buckets))
+    return trend, split
 
 
 @app.local_entrypoint()
@@ -1776,3 +2062,10 @@ def run_weekly_summary_once():
     """Run the C-level weekly pulse once (same as scheduled ``weekly_summary_job``)."""
     ok = weekly_summary_job.remote()
     print(f"Done: weekly pulse email sent={ok}")
+
+
+@app.local_entrypoint()
+def run_monthly_summary_once():
+    """Run the monthly pulse once (same as scheduled ``monthly_summary_job``)."""
+    ok = monthly_summary_job.remote()
+    print(f"Done: monthly pulse email sent={ok}")

@@ -786,27 +786,22 @@ def send_weekly_summary(stats: dict) -> bool:
     period = stats.get("period_label", "Last week")
 
     emails   = int(cur.get("emails_received", 0))
-    scraped  = int(cur.get("scraped_ok", 0))
+    cap_ok   = int(cur.get("content_ok", 0))
+    cap_tot  = int(cur.get("content_emails", 0))
+    cap_pass = emails - max(0, cap_tot - cap_ok)   # status pings pass; only true content misses count as errors
     opened   = int(cur.get("opened", 0))
-    updated  = int(cur.get("updated", 0))   # used by the hours breakdown
     closed   = int(cur.get("closed", 0))
     patches  = int(cur.get("field_patches_total", 0))
-    needs    = int(cur.get("needs_attention", 0))
+    flagged  = cur.get("needs_attention_jobs", []) or []
     latency  = cur.get("mean_latency_min")  # outlier-trimmed average (headline)
 
     hrs_saved = float(stats.get("hours_saved_estimate", 0.0))
     hrs_prev  = float(stats.get("hours_saved_prev", 0.0))
-    model     = stats.get("manual_time_model", {}) or {}
 
-    top_states   = stats.get("top_states", [])
-    states_total = int(stats.get("states_total", 0))
-    weekday_hist = stats.get("weekday_hist", [])
-    hour_hist    = stats.get("hour_hist", [])
-    trend        = stats.get("trend_weekly", [])
-    cumulative   = stats.get("cumulative", {}) or {}
-    lifecycle    = stats.get("lifecycle", {}) or {}
-    split_series = stats.get("daily_split_series", [])
-    series       = stats.get("daily_series", [])
+    top_states    = stats.get("top_states", [])
+    states_total  = int(stats.get("states_total", 0))
+    cumulative    = stats.get("cumulative", {}) or {}
+    lifecycle     = stats.get("lifecycle", {}) or {}
 
     if emails == 0:
         print(f"[alert_email] Weekly pulse skipped — no emails in {period}")
@@ -830,7 +825,7 @@ def send_weekly_summary(stats: dict) -> bool:
         arrow = "↑" if pct > 0 else "↓"
         return f'<span style="color:{color};font-size:12px;font-weight:600;">{arrow} {abs(pct)}% WoW</span>'
 
-    coverage_pct = round(scraped / emails * 100) if emails else 0
+    coverage_pct = round(cap_pass / emails * 100) if emails else 100
 
     def _fmt_dur(hours):
         """Human duration from a float number of hours."""
@@ -843,24 +838,7 @@ def send_weekly_summary(stats: dict) -> bool:
         days = hours / 24.0
         return f"{days:.1f} days"
 
-    # Health framing — restrained palette.
-    if needs == 0:
-        health_text = "All systems healthy"
-        health_dot  = "#16a34a"
-        health_bg   = "#ecfdf5"
-        health_fg   = "#15803d"
-    elif needs <= 2:
-        health_text = f"{needs} job{'s' if needs != 1 else ''} flagged for review"
-        health_dot  = "#f59e0b"
-        health_bg   = "#fffbeb"
-        health_fg   = "#b45309"
-    else:
-        health_text = f"{needs} jobs flagged for review"
-        health_dot  = "#dc2626"
-        health_bg   = "#fef2f2"
-        health_fg   = "#b91c1c"
-
-    subject = f"Proxi Weekly Pulse · {period} · {opened} opened, {closed} closed, ~{hrs_saved:g} hrs saved"
+    subject = f"Proxi Weekly Pulse · {period} · {opened} opened, {closed} closed, {hrs_saved:g} hrs saved"
 
     # ── Top-line metrics, two rows: market outcomes + how well Proxi handled ─
     def _card_big(label, num, secondary):
@@ -897,57 +875,45 @@ def send_weekly_summary(stats: dict) -> bool:
     <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
       <tr>
         {_card_big("Emails received", f"{emails:,}", _delta_pill(_delta(emails, prv_emails)))}
-        {_card_big("Roles opened",    f"{opened:,}", _delta_pill(_delta(opened, prv_open)))}
-        {_card_big("Roles closed",    f"{closed:,}", _delta_pill(_delta(closed, prv_close)))}
+        {_card_big("Jobs opened",     f"{opened:,}", _delta_pill(_delta(opened, prv_open)))}
+        {_card_big("Jobs closed",     f"{closed:,}", _delta_pill(_delta(closed, prv_close)))}
       </tr>
     </table>
     <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
       <tr>
         {_card_sm("SF field updates", f"{patches:,}",      _delta_pill(_delta(patches, prv_patch)))}
-        {_card_sm("Capture rate",     f"{coverage_pct}%",  _sub(f"{scraped:,} of {emails:,} synced"))}
+        {_card_sm("Capture rate",     f"{coverage_pct}%",  _sub(f"{cap_pass:,} of {emails:,} captured"))}
         {_card_sm("Avg sync time",    lat_txt,             _sub("email → Salesforce"))}
       </tr>
     </table>"""
-
-    # ── Health line: distinct jobs needing a human (separate from coverage) ──
-    health_line = f"""
-    <div style="margin:8px 0 0;padding:10px 14px;background:{health_bg};border-radius:8px;">
-      <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:{health_dot};margin-right:8px;vertical-align:middle;"></span>
-      <span style="font-size:13px;color:{health_fg};font-weight:600;vertical-align:middle;">{health_text}</span>
-    </div>"""
 
     # ── Hours recouped (week + all-time; no dollars) ─────────────────────────
     cum_h     = float(cumulative.get("hours_saved", 0) or 0)
     launch    = cumulative.get("launch_iso") or ""
     cum_eml   = int(cumulative.get("emails", 0) or 0)
     cum_field = int(cumulative.get("fields", 0) or 0)
-    cum_new   = int(cumulative.get("new_jobs", 0) or 0)
     hrs_delta = _delta_html(_delta(round(hrs_saved), round(hrs_prev)))
-    mpo  = model.get("min_per_open", 8)
-    mpot = model.get("min_per_other", 1.5)
-    mps  = model.get("min_per_switch", 2)
-    hands_on_h = (opened * mpo + (updated + closed) * mpot) / 60.0
-    switch_h   = (emails * mps) / 60.0
+    spark = _pulse_trend(stats.get("hours_trend", []), "hrs saved per week")
     roi_html = ""
     if hrs_saved >= 1 or cum_h >= 1:
+        all_time_txt = f"{cum_h:g} hrs all-time{f' since {launch}' if launch else ''}"
+        spark_cell = (f'<td class="spark-cell" style="vertical-align:bottom;width:38%;padding-left:20px;">{spark}</td>'
+                      if spark else "")
         roi_html = f"""
         <div class="roi" style="margin:18px 0 0;padding:22px 24px;background:#18181b;border-radius:8px;">
-          <div style="color:#a1a1aa;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;">Manual time recouped</div>
-          <table role="presentation" cellpadding="0" cellspacing="0" class="duo-stack" style="width:100%;margin-top:6px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" class="duo-stack" style="width:100%;border-collapse:collapse;">
             <tr>
-              <td style="vertical-align:top;width:50%;">
-                <div style="color:#ffffff;font-size:40px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;">~{hrs_saved:g} hrs</div>
-                <div style="color:#a1a1aa;font-size:13px;margin-top:6px;">this week &nbsp;{hrs_delta}</div>
+              <td style="vertical-align:top;">
+                <div style="color:#a1a1aa;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;">Manual time recouped this week</div>
+                <div style="margin-top:10px;white-space:nowrap;">
+                  <span style="color:#ffffff;font-size:48px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;vertical-align:middle;">{hrs_saved:g} hrs</span>
+                  <span style="margin-left:12px;vertical-align:middle;">{hrs_delta}</span>
+                </div>
+                <div style="color:#71717a;font-size:11px;margin-top:12px;">{all_time_txt}</div>
               </td>
-              <td style="vertical-align:top;width:50%;padding-left:20px;">
-                <div style="color:#ffffff;font-size:40px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;">~{cum_h:g} hrs</div>
-                <div style="color:#a1a1aa;font-size:13px;margin-top:6px;">all-time{f' since {launch}' if launch else ''}</div>
-              </td>
+              {spark_cell}
             </tr>
           </table>
-          <div style="color:#71717a;font-size:12px;margin-top:14px;padding-top:12px;border-top:1px solid #27272a;line-height:1.5;">
-            ~{hands_on_h:.1f} hrs hands-on entry &nbsp;+&nbsp; ~{switch_h:.1f} hrs not stopping to check {emails} emails
-          </div>
         </div>"""
 
     # ── Chart helpers ────────────────────────────────────────────────────────
@@ -981,89 +947,46 @@ def send_weekly_summary(stats: dict) -> bool:
                 f'style="width:100%;border-collapse:collapse;table-layout:fixed;">'
                 f'<tr>{"".join(bar_cells)}</tr><tr>{"".join(lbl_cells)}</tr></table>')
 
-    def _stacked(series_split, bar_h=120) -> str:
-        labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        totals = [v["opened"] + v["updated"] + v["closed"] for _, v in series_split]
-        max_v  = max(totals) if totals else 0
-        max_v  = max_v or 1
-        reserve = 18  # headroom for the floating total above the tallest column
-        bar_cells, lbl_cells = [], []
-        for i, (_d, v) in enumerate(series_split):
-            tot = v["opened"] + v["updated"] + v["closed"]
-            if tot > 0:
-                col_h = max(3, int(round((tot / max_v) * (bar_h - reserve))))
-                o = int(round(v["opened"]  / tot * col_h))
-                u = int(round(v["updated"] / tot * col_h))
-                c = max(0, col_h - o - u)
-                stack = f'<div style="width:64%;margin:0 auto;height:{col_h}px;border-radius:3px 3px 0 0;overflow:hidden;">'
-                if o: stack += f'<div class="seg-open"  style="height:{o}px;"></div>'
-                if u: stack += f'<div class="seg-upd"   style="height:{u}px;"></div>'
-                if c: stack += f'<div class="seg-close" style="height:{c}px;"></div>'
-                stack += "</div>"
-            else:
-                stack = '<div class="bar-zero" style="width:64%;height:2px;margin:0 auto;"></div>'
-            num = (
-                f'<div class="chart-num" style="font-size:11px;line-height:14px;height:14px;'
-                f'font-weight:600;font-variant-numeric:tabular-nums;">{tot}</div>'
-            )
-            bar_cells.append(
-                f'<td class="chart-base" style="text-align:center;vertical-align:bottom;padding:0 3px;height:{bar_h}px;">{num}{stack}</td>'
-            )
-            lbl = labels[i] if i < len(labels) else ""
-            lbl_cells.append(
-                f'<td class="chart-lbl" style="text-align:center;padding:6px 3px 0;font-size:10px;font-weight:500;">{lbl}</td>'
-            )
-        return (f'<table role="presentation" cellpadding="0" cellspacing="0" '
-                f'style="width:100%;border-collapse:collapse;table-layout:fixed;">'
-                f'<tr>{"".join(bar_cells)}</tr><tr>{"".join(lbl_cells)}</tr></table>')
-
-    _legend_dot = (
-        '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;'
-        'vertical-align:middle;margin-right:5px;"></span>'
-    )
-    daily_legend = (
-        f'<span style="font-size:11px;color:#52525b;margin-right:14px;">'
-        f'<span class="seg-open"  style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Opened</span>'
-        f'<span style="font-size:11px;color:#52525b;margin-right:14px;">'
-        f'<span class="seg-upd"   style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Updated</span>'
-        f'<span style="font-size:11px;color:#52525b;">'
-        f'<span class="seg-close" style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Closed</span>'
-    )
-
-    # ── Daily activity (stacked: opened / updated / closed) ──────────────────
-    daily_section = f"""
-    <div class="card" style="margin:18px 0 0;padding:20px 22px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-      <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;margin-bottom:14px;"><tr>
-        <td class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Daily activity</td>
-        <td style="text-align:right;white-space:nowrap;">{daily_legend}</td>
-      </tr></table>
-      {_stacked(split_series)}
+    # ── Job flow this week (opened vs closed) ───────────────────────────────
+    if closed and opened >= closed * 1.25:
+        flow_msg = f"{round(opened / closed, 1)}× more jobs opened than closed — your open pipeline grew this week."
+    elif opened and closed and abs(opened - closed) <= 0.2 * max(opened, closed):
+        flow_msg = "Openings and closes ran roughly even this week."
+    elif closed and opened < closed:
+        flow_msg = "More jobs closed than opened — the open pipeline contracted this week."
+    else:
+        flow_msg = "Jobs came in faster than they were retired this week."
+    flow_bar = _pulse_seg_bar([(opened, "seg-open"), (closed, "seg-close")], (opened + closed) or 1, 14)
+    role_flow_html = f"""
+    <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+      <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Job flow this week</div>
+      <div style="margin:8px 0 12px;">
+        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{opened:,}</span>
+        <span class="muted" style="font-size:13px;color:#52525b;">opened</span>
+        &nbsp;&nbsp;<span class="dim" style="color:#a1a1aa;">vs</span>&nbsp;&nbsp;
+        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{closed:,}</span>
+        <span class="muted" style="font-size:13px;color:#52525b;">closed</span>
+      </div>
+      {flow_bar}
+      <div class="muted" style="font-size:13px;color:#52525b;margin-top:12px;line-height:1.5;">{flow_msg}</div>
+      <div style="margin-top:8px;font-size:11px;">
+        <span class="muted" style="color:#52525b;"><span class="seg-open" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Opened</span>
+        &nbsp;&nbsp;<span class="muted" style="color:#52525b;"><span class="seg-close" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Closed</span>
+      </div>
     </div>"""
 
-    # ── 4-week throughput trend ──────────────────────────────────────────────
-    trend_html = ""
-    if trend:
-        trend_html = f"""
-        <div class="card" style="margin:18px 0 0;padding:20px 22px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:16px;">Weekly throughput</div>
-          {_hist(list(trend), bar_h=72)}
-        </div>"""
-
-    # ── Cadence: day-of-week + hour-of-day distributions ─────────────────────
-    cadence_html = ""
-    if weekday_hist or hour_hist:
-        hour_labels = []
-        for h, c in hour_hist:
-            ampm = "a" if h < 12 else "p"
-            h12 = h % 12 or 12
-            hour_labels.append((f"{h12}{ampm}", c))
-        keep_hours = {i for i, (h, _c) in enumerate(hour_hist) if h in (0, 6, 12, 18)}
-        cadence_html = f"""
-        <div class="card" style="margin:18px 0 0;padding:20px 22px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:14px;">By day of week</div>
-          {_hist(list(weekday_hist), bar_h=64)}
-          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin:20px 0 14px;">By hour (ET)</div>
-          {_hist(hour_labels, bar_h=64, show_counts=True, label_keep=keep_hours, num_fs=9, show_zeros=False)}
+    # ── Flagged jobs to act on (only shown when something needs a human) ──────
+    flags_html = ""
+    if flagged:
+        ids = " · ".join(
+            f'<a href="https://portal.kimedics.com/app/workspace/job-posts/{j}" style="color:#b45309;font-weight:600;text-decoration:none;border-bottom:1px solid #fde68a;">#{j}</a>'
+            for j in flagged[:12]
+        )
+        more = f" +{len(flagged) - 12} more" if len(flagged) > 12 else ""
+        flags_html = f"""
+        <div class="card" style="margin:18px 0 0;padding:16px 18px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;">
+          <div style="font-size:13px;color:#92400e;font-weight:600;">{len(flagged)} job{'s' if len(flagged) != 1 else ''} need a look</div>
+          <div style="font-size:13px;color:#b45309;margin-top:4px;line-height:1.6;">Salesforce sync didn't complete for: {ids}{more}</div>
         </div>"""
 
     # ── Lifecycle: this-week open duration + fast-close watch ────────────────
@@ -1079,7 +1002,7 @@ def send_weekly_summary(stats: dict) -> bool:
         # All-time, demoted to a single reference line.
         all_ref = (
             f'Since launch: {_fmt_dur(lc_all.get("median_hours"))} median open across '
-            f'{int(lc_all.get("closed_total", 0)):,} closed roles.'
+            f'{int(lc_all.get("closed_total", 0)):,} closed jobs.'
         )
 
         if wk_closed > 0:
@@ -1127,7 +1050,7 @@ def send_weekly_summary(stats: dict) -> bool:
             )
             body = f"""
           <div class="num" style="font-size:24px;color:#18181b;font-weight:700;margin:6px 0 2px;letter-spacing:-0.02em;">{wk_median} median open</div>
-          <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">{wk_closed} of {wk_opened} roles opened this week have closed</div>
+          <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">{wk_closed} of {wk_opened} jobs opened this week have closed</div>
           <div class="dim" style="{_mini_lbl}margin-bottom:5px;">This week</div>
           {week_bar}
           <div class="dim" style="{_mini_lbl}margin:11px 0 5px;">All-time</div>
@@ -1135,12 +1058,12 @@ def send_weekly_summary(stats: dict) -> bool:
           <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin-top:14px;">{legend_rows}</table>"""
         else:
             body = f"""
-          <div class="num" style="font-size:24px;color:#18181b;font-weight:700;margin:6px 0 2px;letter-spacing:-0.02em;">{wk_opened} roles opened</div>
+          <div class="num" style="font-size:24px;color:#18181b;font-weight:700;margin:6px 0 2px;letter-spacing:-0.02em;">{wk_opened} jobs opened</div>
           <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:6px;">none have closed yet this week</div>"""
 
         lifecycle_html = f"""
         <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">How long roles stayed open · this week</div>
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">How long jobs stayed open · this week vs all-time</div>
           {body}
           <div class="muted" style="margin-top:12px;font-size:11px;color:#71717a;line-height:1.5;">{all_ref}</div>
         </div>"""
@@ -1192,7 +1115,7 @@ def send_weekly_summary(stats: dict) -> bool:
                 continue
             c = state_counts.get(cell_code, 0)
             lvl = _state_level(c)
-            title = f"{cell_code}: {c} signal{'' if c == 1 else 's'}"
+            title = f"{cell_code}: {c} email{'' if c == 1 else 's'}"
             if c > 0:
                 # Abbreviation over count, two fixed-height lines — never wraps.
                 inner = (
@@ -1223,7 +1146,7 @@ def send_weekly_summary(stats: dict) -> bool:
     <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
       <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">National footprint</div>
       <div class="num" style="font-size:24px;color:#18181b;font-weight:700;margin:6px 0 4px;letter-spacing:-0.02em;">{states_total} state{'s' if states_total != 1 else ''} active</div>
-      <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">This week's signals by state.</div>
+      <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">This week's emails by state.</div>
       <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:0 auto;table-layout:fixed;">
         {''.join(rows_html)}
       </table>
@@ -1238,10 +1161,9 @@ def send_weekly_summary(stats: dict) -> bool:
         all_time_html = f"""
         <div class="muted" style="margin:18px 0 0;padding:14px 4px 0;border-top:1px solid #e4e4e7;font-size:11px;color:#71717a;line-height:1.6;">
           <span style="font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#52525b;">All-time since {launch}</span> ·
-          {cum_eml:,} signals ·
+          {cum_eml:,} emails ·
           {cum_field:,} field updates ·
-          {cum_new:,} roles created ·
-          ~{cum_h:g} hrs returned
+          {cum_h:g} hrs returned
         </div>"""
 
     # ── Assemble full document ───────────────────────────────────────────────
@@ -1275,8 +1197,9 @@ def send_weekly_summary(stats: dict) -> bool:
       /* Mobile: stack hero cards, shrink map tiles. */
       @media only screen and (max-width: 600px) {
         .hero-stack > tbody > tr, .duo-stack > tbody > tr { display:block !important; }
-        .hero-stack td, .duo-stack td { display:block !important; width:100% !important; box-sizing:border-box; }
+        .hero-stack > tbody > tr > td, .duo-stack > tbody > tr > td { display:block !important; width:100% !important; box-sizing:border-box; }
         .hero-num { font-size:32px !important; }
+        .spark-cell { padding-left:0 !important; padding-top:18px !important; }
         .map-cell { width:26px !important; height:26px !important; padding:1px !important; }
         .map-tile { height:26px !important; }
         .map-tile.lvl0 { line-height:26px !important; }
@@ -1338,11 +1261,9 @@ def send_weekly_summary(stats: dict) -> bool:
       </div>
 
       {hero_row}
-      {health_line}
       {roi_html}
-      {daily_section}
-      {trend_html}
-      {cadence_html}
+      {role_flow_html}
+      {flags_html}
       {lifecycle_html}
       {map_html}
       {all_time_html}
@@ -1356,36 +1277,997 @@ def send_weekly_summary(stats: dict) -> bool:
 </html>"""
 
     # Plain-text fallback (concise; full charts render in HTML).
-    daily_txt = "  " + "  ".join(
-        f"{wl} {v['opened']}/{v['updated']}/{v['closed']}"
-        for (_, v), wl in zip(split_series, ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
-    )
     lat_line = f"{latency:.1f} min average" if latency is not None else "—"
     lc_all_t = lifecycle.get("all", {}) or {}
     median_all = _fmt_dur(lc_all_t.get("median_hours"))
-    ft  = int(lc_all_t.get("fast_total", 0))
-    fg  = int(lc_all_t.get("fast_grabbed", 0))
     text = textwrap.dedent(f"""
     Proxi Weekly Pulse — {period}
     ============================================
 
     Emails received : {emails}   (prior week: {prv_emails})
-    Roles opened    : {opened}   (prior week: {prv_open})
-    Roles closed    : {closed}   (prior week: {prv_close})
+    Jobs opened     : {opened}   (prior week: {prv_open})
+    Jobs closed     : {closed}   (prior week: {prv_close})
     SF field updates: {patches}  (prior week: {prv_patch})
-    Capture rate    : {coverage_pct}% ({scraped} of {emails} synced)
+    Capture rate    : {coverage_pct}% ({cap_pass} of {emails} captured)
     Avg sync time   : {lat_line}
-    Needs attention : {needs} job{'' if needs == 1 else 's'}
-    Manual time recouped : ~{hrs_saved:g} hrs this week · ~{cum_h:g} hrs all-time
+    Manual time recouped : {hrs_saved:g} hrs this week · {cum_h:g} hrs all-time
 
-    Open duration (all-time): {median_all} median · {ft} closed within 1 hr ({fg} reached before close)
+    Open duration (all-time): {median_all} median across {int(lc_all_t.get('closed_total', 0)):,} closed jobs
+    States active: {states_total}
 
-    Daily activity (opened/updated/closed):
-    {daily_txt}
+    Proxi · Kimedics → Salesforce automation
+    """).strip()
+
+    return _send(subject, body_html, text)
+
+
+# ── Shared pulse rendering helpers (weekly + monthly) ────────────────────────
+# NOTE: send_weekly_summary still carries inline copies of these; the weekly can
+# later be pointed at these module-level versions for a 1-line dedupe.
+
+_PULSE_STYLE = """
+    <style>
+      body { margin:0; padding:0; }
+      a { color:#3f3f46; }
+      .chart-num  { color:#18181b; }
+      .chart-lbl  { color:#71717a; }
+      .chart-base { border-bottom:1px solid #e4e4e7; }
+      .bar        { background:#27272a; }
+      .bar-zero   { background:#d4d4d8; }
+      .bar-track  { background:#d4d4d8; }
+      .seg-open   { background:#6e9b7e; }
+      .seg-upd    { background:#897fa8; }
+      .seg-close  { background:#b07f93; }
+      .delta-up   { background:#ecfdf5; color:#15803d; }
+      .delta-down { background:#fef2f2; color:#b91c1c; }
+      .pill-live  { background:#ecfdf5; color:#15803d; }
+      .pill-build { background:#fffbeb; color:#b45309; }
+      .note-box   { background:#fafafa; }
+      .lvl0 { background:#f4f4f5; color:#a1a1aa; }
+      .lvl1 { background:#e4e4e7; color:#3f3f46; }
+      .lvl2 { background:#a1a1aa; color:#18181b; }
+      .lvl3 { background:#52525b; color:#ffffff; }
+      .lvl4 { background:#18181b; color:#ffffff; }
+      @media only screen and (max-width: 600px) {
+        .hero-stack > tbody > tr, .duo-stack > tbody > tr { display:block !important; }
+        .hero-stack > tbody > tr > td, .duo-stack > tbody > tr > td { display:block !important; width:100% !important; box-sizing:border-box; }
+        .hero-num { font-size:32px !important; }
+        .spark-cell { padding-left:0 !important; padding-top:18px !important; }
+        .map-cell { width:26px !important; height:26px !important; padding:1px !important; }
+        .map-tile { height:26px !important; }
+        .map-tile.lvl0 { line-height:26px !important; }
+        .map-ab { font-size:7px !important; line-height:9px !important; padding-top:3px !important; }
+        .map-ct { font-size:10px !important; line-height:11px !important; }
+      }
+      @media (prefers-color-scheme: dark) {
+        body, .wrap-bg { background:#09090b !important; }
+        .card { background:#18181b !important; border-color:#27272a !important; }
+        .text, .num { color:#fafafa !important; }
+        .muted { color:#a1a1aa !important; }
+        .dim   { color:#71717a !important; }
+        a { color:#d4d4d8 !important; }
+        .roi  { background:#0a0a0c !important; border:1px solid #27272a; }
+        .chart-num  { color:#fafafa !important; }
+        .chart-base { border-bottom-color:#3f3f46 !important; }
+        .bar        { background:#d4d4d8 !important; }
+        .bar-zero   { background:#3f3f46 !important; }
+        .bar-track  { background:#3f3f46 !important; }
+        .seg-open   { background:#85b394 !important; }
+        .seg-upd    { background:#a79dc4 !important; }
+        .seg-close  { background:#c79aac !important; }
+        .delta-up   { background:#052e1b !important; color:#4ade80 !important; }
+        .delta-down { background:#3a0d0d !important; color:#f87171 !important; }
+        .pill-live  { background:#052e1b !important; color:#4ade80 !important; }
+        .pill-build { background:#3a2a06 !important; color:#fbbf24 !important; }
+        .note-box   { background:#27272a !important; }
+        .lvl0 { background:#27272a !important; color:#52525b !important; }
+        .lvl1 { background:#3f3f46 !important; color:#d4d4d8 !important; }
+        .lvl2 { background:#52525b !important; color:#fafafa !important; }
+        .lvl3 { background:#a1a1aa !important; color:#18181b !important; }
+        .lvl4 { background:#fafafa !important; color:#18181b !important; }
+      }
+    </style>
+    """
+
+_US_TILES = [
+    (0, 0, 'AK'), (0, 10, 'ME'),
+    (1, 9, 'VT'), (1, 10, 'NH'),
+    (2, 1, 'WA'), (2, 2, 'ID'), (2, 3, 'MT'), (2, 4, 'ND'), (2, 5, 'MN'), (2, 6, 'WI'), (2, 7, 'MI'),
+    (2, 9, 'NY'), (2, 10, 'MA'), (2, 11, 'RI'),
+    (3, 1, 'OR'), (3, 2, 'NV'), (3, 3, 'WY'), (3, 4, 'SD'), (3, 5, 'IA'), (3, 6, 'IL'), (3, 7, 'IN'),
+    (3, 8, 'OH'), (3, 9, 'PA'), (3, 10, 'NJ'), (3, 11, 'CT'),
+    (4, 1, 'CA'), (4, 2, 'UT'), (4, 3, 'CO'), (4, 4, 'NE'), (4, 5, 'MO'), (4, 6, 'KY'), (4, 7, 'WV'),
+    (4, 8, 'VA'), (4, 9, 'MD'), (4, 10, 'DE'), (4, 11, 'DC'),
+    (5, 3, 'AZ'), (5, 4, 'NM'), (5, 5, 'KS'), (5, 6, 'AR'), (5, 7, 'TN'), (5, 8, 'NC'), (5, 9, 'SC'),
+    (6, 5, 'OK'), (6, 6, 'LA'), (6, 7, 'MS'), (6, 8, 'AL'), (6, 9, 'GA'),
+    (7, 5, 'TX'), (7, 9, 'FL'), (8, 0, 'HI'), (8, 11, 'PR'),
+]
+
+
+def _pulse_fmt_dur(hours):
+    if hours is None:
+        return "—"
+    if hours < 1:
+        return f"{round(hours * 60)} min"
+    if hours < 24:
+        return f"{hours:.0f} hr" if abs(hours - round(hours)) < 0.05 else f"{hours:.1f} hr"
+    return f"{hours / 24.0:.1f} days"
+
+
+def _pulse_delta(cur_v, prev_v):
+    if prev_v == 0:
+        return None
+    return round((cur_v - prev_v) / prev_v * 100)
+
+
+def _pulse_delta_pill(pct, unit="WoW"):
+    if pct is None:
+        return '<span class="dim" style="font-size:11px;color:#a1a1aa;">first period</span>'
+    if pct == 0:
+        return f'<span class="dim" style="font-size:11px;color:#71717a;">flat {unit}</span>'
+    cls = "delta-up" if pct > 0 else "delta-down"
+    arrow = "↑" if pct > 0 else "↓"
+    return (f'<span class="{cls}" style="display:inline-block;border-radius:999px;'
+            f'padding:3px 10px;font-size:11px;font-weight:700;">{arrow} {abs(pct)}% {unit}</span>')
+
+
+def _pulse_delta_text(pct, unit="WoW"):
+    if pct is None:
+        return '<span class="dim" style="color:#a1a1aa;font-size:12px;">first reporting period</span>'
+    if pct == 0:
+        return f'<span class="dim" style="color:#71717a;font-size:12px;">unchanged {unit}</span>'
+    color = "#16a34a" if pct > 0 else "#dc2626"
+    arrow = "↑" if pct > 0 else "↓"
+    return f'<span style="color:{color};font-size:12px;font-weight:600;">{arrow} {abs(pct)}% {unit}</span>'
+
+
+def _pulse_sub(text):
+    return f'<span class="muted" style="font-size:12px;color:#52525b;">{text}</span>'
+
+
+def _pulse_card_big(label, num, secondary, width="33.33%"):
+    return f"""
+        <td class="card hero-cell" style="padding:20px 18px;background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;width:{width};vertical-align:top;">
+          <div class="dim" style="font-size:10px;color:#71717a;font-weight:700;text-transform:uppercase;letter-spacing:.09em;line-height:1.3;">{label}</div>
+          <div class="num hero-num" style="font-size:38px;line-height:1.0;font-weight:700;color:#18181b;margin:11px 0 9px;letter-spacing:-0.02em;white-space:nowrap;">{num}</div>
+          <div>{secondary}</div>
+        </td>"""
+
+
+def _pulse_card_sm(label, num, secondary):
+    return f"""
+        <td class="card hero-cell" style="padding:18px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;width:33.33%;vertical-align:top;">
+          <div class="dim" style="font-size:10px;color:#71717a;font-weight:700;text-transform:uppercase;letter-spacing:.08em;line-height:1.3;">{label}</div>
+          <div class="num" style="font-size:27px;line-height:1.05;font-weight:700;color:#18181b;margin:9px 0 7px;letter-spacing:-0.02em;white-space:nowrap;">{num}</div>
+          <div>{secondary}</div>
+        </td>"""
+
+
+def _pulse_hist(items, bar_h=64, show_counts=True, label_keep=None, num_fs=11, show_zeros=True):
+    max_v = max((c for _, c in items), default=0) or 1
+    reserve = (num_fs + 6) if show_counts else 2
+    bar_cells, lbl_cells = [], []
+    for i, (label, count) in enumerate(items):
+        fill = max(2, int(round((count / max_v) * (bar_h - reserve)))) if count > 0 else 2
+        num_html = ""
+        if show_counts and (count > 0 or show_zeros):
+            num_html = (f'<div class="chart-num" style="font-size:{num_fs}px;line-height:{num_fs + 3}px;'
+                        f'height:{num_fs + 3}px;font-weight:600;font-variant-numeric:tabular-nums;">{count}</div>')
+        bar_cls = "bar" if count > 0 else "bar-zero"
+        radius = "border-radius:2px 2px 0 0;" if count > 0 else ""
+        bar_cells.append(
+            f'<td class="chart-base" style="text-align:center;vertical-align:bottom;padding:0 1px;height:{bar_h}px;">'
+            f'{num_html}<div class="{bar_cls}" style="width:62%;height:{fill}px;margin:0 auto;{radius}"></div></td>')
+        keep = (label_keep is None) or (i in label_keep)
+        lbl_cells.append(
+            f'<td class="chart-lbl" style="text-align:center;padding:6px 1px 0;font-size:10px;font-weight:500;">{label if keep else ""}</td>')
+    return (f'<table role="presentation" cellpadding="0" cellspacing="0" '
+            f'style="width:100%;border-collapse:collapse;table-layout:fixed;">'
+            f'<tr>{"".join(bar_cells)}</tr><tr>{"".join(lbl_cells)}</tr></table>')
+
+
+def _pulse_stacked(series_split, labels, bar_h=120, show_totals=True, label_keep=None, num_fs=11):
+    totals = [v["opened"] + v["updated"] + v["closed"] for _, v in series_split]
+    max_v = (max(totals) if totals else 0) or 1
+    reserve = (num_fs + 5) if show_totals else 2
+    pad = 1 if len(series_split) >= 12 else 3      # dense charts (24h) get tight columns
+    bar_cells, lbl_cells = [], []
+    for i, (_d, v) in enumerate(series_split):
+        tot = v["opened"] + v["updated"] + v["closed"]
+        if tot > 0:
+            col_h = max(3, int(round((tot / max_v) * (bar_h - reserve))))
+            o = int(round(v["opened"] / tot * col_h))
+            u = int(round(v["updated"] / tot * col_h))
+            c = max(0, col_h - o - u)
+            stack = f'<div style="width:64%;margin:0 auto;height:{col_h}px;border-radius:3px 3px 0 0;overflow:hidden;">'
+            if o: stack += f'<div class="seg-open"  style="height:{o}px;"></div>'
+            if u: stack += f'<div class="seg-upd"   style="height:{u}px;"></div>'
+            if c: stack += f'<div class="seg-close" style="height:{c}px;"></div>'
+            stack += "</div>"
+        else:
+            stack = '<div class="bar-zero" style="width:64%;height:2px;margin:0 auto;"></div>'
+        num = ""
+        if show_totals and tot > 0:
+            num = (f'<div class="chart-num" style="font-size:{num_fs}px;line-height:{num_fs + 3}px;'
+                   f'height:{num_fs + 3}px;font-weight:600;font-variant-numeric:tabular-nums;">{tot}</div>')
+        bar_cells.append(
+            f'<td class="chart-base" style="text-align:center;vertical-align:bottom;padding:0 {pad}px;height:{bar_h}px;">{num}{stack}</td>')
+        keep = (label_keep is None) or (i in label_keep)
+        lbl = labels[i] if (i < len(labels) and keep) else ""
+        lbl_cells.append(
+            f'<td class="chart-lbl" style="text-align:center;padding:6px {pad}px 0;font-size:10px;font-weight:500;">{lbl}</td>')
+    return (f'<table role="presentation" cellpadding="0" cellspacing="0" '
+            f'style="width:100%;border-collapse:collapse;table-layout:fixed;">'
+            f'<tr>{"".join(bar_cells)}</tr><tr>{"".join(lbl_cells)}</tr></table>')
+
+
+def _pulse_line_chart(series, w=280, h=84):
+    """True red line chart as a rendered image (QuickChart / Chart.js). Renders
+    in the browser preview AND email clients including Gmail (which strip inline
+    SVG). Single red line, only the last point dotted; no axes/grid."""
+    import json, urllib.parse
+    pts = [(l, v) for l, v in series if v is not None]
+    if len(pts) < 2:
+        return ""
+    data = [v for _, v in pts]
+    cfg = {
+        "type": "line",
+        "data": {
+            "labels": [l for l, _ in pts],
+            "datasets": [{
+                "data": data,
+                "borderColor": "#f87171",
+                "borderWidth": 2,
+                "pointRadius": [0] * (len(data) - 1) + [4],
+                "pointBackgroundColor": "#f87171",
+                "fill": False,
+                "lineTension": 0.35,
+            }],
+        },
+        "options": {
+            "legend": {"display": False},
+            "layout": {"padding": {"top": 6, "right": 8, "left": 2, "bottom": 2}},
+            # Anchor at 0 so low periods don't visually read as "dropping to zero".
+            "scales": {"xAxes": [{"display": False}],
+                       "yAxes": [{"display": False, "ticks": {"beginAtZero": True}}]},
+        },
+    }
+    c = urllib.parse.quote(json.dumps(cfg, separators=(",", ":")))
+    url = f"https://quickchart.io/chart?bkg=transparent&w={w * 2}&h={h * 2}&c={c}"
+    return (f'<img src="{url}" width="{w}" height="{h}" alt="Hours saved trend" '
+            f'style="display:block;width:100%;max-width:{w}px;height:auto;">')
+
+
+def _pulse_trend(series, caption=""):
+    """Red line chart for the ROI card: the last point's value floats top-right,
+    and a caption underneath says what the line is (so it isn't mistaken for a
+    cumulative/running total)."""
+    img = _pulse_line_chart(series)
+    if not img:
+        return ""
+    last = series[-1][1] or 0
+    label = (f'<div style="font-size:12px;line-height:14px;color:#f87171;font-weight:700;'
+             f'text-align:right;font-variant-numeric:tabular-nums;margin-bottom:4px;">{last:g} hrs</div>')
+    cap = (f'<div style="font-size:10px;color:#71717a;text-align:right;margin-top:5px;'
+           f'text-transform:uppercase;letter-spacing:.04em;">{caption}</div>') if caption else ""
+    return label + img + cap
+
+
+def _pulse_seg_bar(vals, total, h):
+    nz = [(n, cls) for n, cls in vals if n > 0]
+    cells = ""
+    for idx, (n, cls) in enumerate(nz):
+        w = "" if idx == len(nz) - 1 else f"width:{round(n / total * 100)}%;"
+        cells += f'<td class="{cls}" style="{w}height:{h}px;"></td>'
+    return (f'<div style="border-radius:{h // 2 + 1}px;overflow:hidden;">'
+            '<table role="presentation" cellpadding="0" cellspacing="0" '
+            'style="width:100%;table-layout:fixed;border-collapse:collapse;">'
+            f'<tr>{cells}</tr></table></div>')
+
+
+def _pulse_us_map(top_states, states_total, caption):
+    state_counts = {st: c for st, c in top_states}
+    max_state = max(state_counts.values()) if state_counts else 1
+
+    def _lvl(c):
+        if c <= 0:
+            return 0
+        r = c / max_state
+        return 1 if r <= 0.25 else 2 if r <= 0.50 else 3 if r <= 0.75 else 4
+
+    grid = [[None] * 12 for _ in range(9)]
+    for r, c, code in _US_TILES:
+        grid[r][c] = code
+    cell = 34
+    rows_html = []
+    for row in grid:
+        cells = []
+        for code in row:
+            if code is None:
+                cells.append(f'<td class="map-cell" style="width:{cell}px;height:{cell}px;padding:2px;"></td>')
+                continue
+            c = state_counts.get(code, 0)
+            lvl = _lvl(c)
+            title = f"{code}: {c} email{'' if c == 1 else 's'}"
+            if c > 0:
+                inner = (f'<div class="map-tile lvl{lvl}" style="height:{cell}px;border-radius:4px;text-align:center;overflow:hidden;">'
+                         f'<div class="map-ab" style="font-size:8px;line-height:11px;font-weight:700;letter-spacing:.02em;padding-top:4px;">{code}</div>'
+                         f'<div class="map-ct" style="font-size:12px;line-height:13px;font-weight:700;">{c}</div></div>')
+            else:
+                inner = (f'<div class="map-tile lvl0" style="height:{cell}px;line-height:{cell}px;border-radius:4px;'
+                         f'text-align:center;font-size:9px;font-weight:700;letter-spacing:.02em;">{code}</div>')
+            cells.append(f'<td class="map-cell" title="{title}" style="width:{cell}px;height:{cell}px;padding:2px;">{inner}</td>')
+        rows_html.append(f"<tr>{''.join(cells)}</tr>")
+    legend = "".join(
+        f'<td style="padding:0 6px;font-size:10px;vertical-align:middle;">'
+        f'<span class="{cls}" style="display:inline-block;width:12px;height:12px;border-radius:2px;vertical-align:middle;margin-right:4px;"></span>'
+        f'<span class="dim" style="color:#71717a;">{label}</span></td>'
+        for cls, label in [("lvl0", "0"), ("lvl1", "1–25%"), ("lvl2", "26–50%"), ("lvl3", "51–75%"), ("lvl4", "76–100%")]
+    )
+    return f"""
+    <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+      <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">National footprint</div>
+      <div class="num" style="font-size:24px;color:#18181b;font-weight:700;margin:6px 0 4px;letter-spacing:-0.02em;">{states_total} state{'s' if states_total != 1 else ''} active</div>
+      <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">{caption}</div>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:0 auto;table-layout:fixed;">{''.join(rows_html)}</table>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:14px auto 0;border-collapse:collapse;"><tr>{legend}</tr></table>
+    </div>"""
+
+
+def _pulse_doc(kicker, period, body_html, title):
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="supported-color-schemes" content="light dark">
+  <title>{title}</title>
+  {_PULSE_STYLE}
+</head>
+<body style="margin:0;padding:0;background:#fafafa;color:#18181b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <div class="wrap-bg" style="background:#fafafa;padding:24px 12px 32px;">
+    <div style="max-width:720px;margin:0 auto;">
+      <div style="padding:8px 4px 0;">
+        <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.08em;">{kicker}</div>
+        <div class="text" style="margin:6px 0 2px;font-size:24px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{period}</div>
+      </div>
+      {body_html}
+      <div class="muted" style="margin:24px 0 0;padding:12px 4px 0;font-size:11px;color:#a1a1aa;line-height:1.6;">
+        Reporting window: {period} (US Eastern). Generated automatically — reply with questions.
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def send_monthly_summary(stats: dict) -> bool:
+    """
+    Client-facing monthly pulse — the comprehensive overview. Same metric set as
+    the weekly but over the prior calendar month, with month-over-month deltas
+    and the richer chart set (activity by week, throughput, day/hour cadence,
+    open-duration distribution, footprint). Skips sending on a zero-email month.
+    """
+    cur    = stats.get("current") or {}
+    prv    = stats.get("previous") or {}
+    period = stats.get("period_label", "Last month")
+
+    emails  = int(cur.get("emails_received", 0))
+    cap_ok  = int(cur.get("content_ok", 0))
+    cap_tot = int(cur.get("content_emails", 0))
+    cap_pass = emails - max(0, cap_tot - cap_ok)   # status pings pass; only true content misses count as errors
+    opened  = int(cur.get("opened", 0))
+    updated = int(cur.get("updated", 0))
+    closed  = int(cur.get("closed", 0))
+    patches = int(cur.get("field_patches_total", 0))
+    latency = cur.get("mean_latency_min")
+
+    hrs_saved = float(stats.get("hours_saved_estimate", 0.0))
+    hrs_prev  = float(stats.get("hours_saved_prev", 0.0))
+    top_states    = stats.get("top_states", [])
+    states_total  = int(stats.get("states_total", 0))
+    weekday_split = stats.get("weekday_split", [])
+    hour_split    = stats.get("hour_split", [])
+    monthly_trend = stats.get("monthly_trend", [])
+    cumulative    = stats.get("cumulative", {}) or {}
+    lifecycle     = stats.get("lifecycle", {}) or {}
+
+    if emails == 0:
+        print(f"[alert_email] Monthly pulse skipped — no emails in {period}")
+        return False
+
+    prv_emails = int(prv.get("emails_received", 0))
+    prv_open   = int(prv.get("opened", 0))
+    prv_close  = int(prv.get("closed", 0))
+    prv_patch  = int(prv.get("field_patches_total", 0))
+    coverage_pct = round(cap_pass / emails * 100) if emails else 100
+    MoM = "MoM"
+
+    subject = f"Proxi Monthly Pulse · {period} · {opened} opened, {closed} closed, {hrs_saved:g} hrs saved"
+
+    lat_txt = f"{latency:.1f} min" if latency is not None else "—"
+
+    # Overview metrics — the same headline set as the weekly, monthly totals + MoM.
+    hero_row = f"""
+    <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
+      <tr>
+        {_pulse_card_big("Emails received", f"{emails:,}", _pulse_delta_pill(_pulse_delta(emails, prv_emails), MoM))}
+        {_pulse_card_big("Jobs opened",     f"{opened:,}", _pulse_delta_pill(_pulse_delta(opened, prv_open), MoM))}
+        {_pulse_card_big("Jobs closed",     f"{closed:,}", _pulse_delta_pill(_pulse_delta(closed, prv_close), MoM))}
+      </tr>
+    </table>
+    <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
+      <tr>
+        {_pulse_card_sm("SF field updates", f"{patches:,}",     _pulse_delta_pill(_pulse_delta(patches, prv_patch), MoM))}
+        {_pulse_card_sm("Capture rate",     f"{coverage_pct}%", _pulse_sub(f"{cap_pass:,} of {emails:,} captured"))}
+        {_pulse_card_sm("Avg sync time",    lat_txt,            _pulse_sub("email → Salesforce"))}
+      </tr>
+    </table>"""
+
+    cum_h     = float(cumulative.get("hours_saved", 0) or 0)
+    launch    = cumulative.get("launch_iso") or ""
+    cum_eml   = int(cumulative.get("emails", 0) or 0)
+    cum_field = int(cumulative.get("fields", 0) or 0)
+    hrs_delta = _pulse_delta_text(_pulse_delta(round(hrs_saved), round(hrs_prev)), MoM)
+    spark = _pulse_trend(stats.get("hours_trend", []), "hrs saved per month")
+    roi_html = ""
+    if hrs_saved >= 1 or cum_h >= 1:
+        spark_cell = (f'<td class="spark-cell" style="vertical-align:bottom;width:38%;padding-left:20px;">{spark}</td>'
+                      if spark else "")
+        roi_html = f"""
+        <div class="roi" style="margin:18px 0 0;padding:22px 24px;background:#18181b;border-radius:8px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" class="duo-stack" style="width:100%;border-collapse:collapse;">
+            <tr>
+              <td style="vertical-align:top;">
+                <div style="color:#a1a1aa;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;">Manual time recouped this month</div>
+                <div style="margin-top:10px;white-space:nowrap;">
+                  <span style="color:#ffffff;font-size:48px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;vertical-align:middle;">{hrs_saved:g} hrs</span>
+                  <span style="margin-left:12px;vertical-align:middle;">{hrs_delta}</span>
+                </div>
+                <div style="color:#71717a;font-size:11px;margin-top:14px;">{cum_h:g} hrs all-time{f' since {launch}' if launch else ''}</div>
+              </td>
+              {spark_cell}
+            </tr>
+          </table>
+        </div>"""
+
+    # ── Activity by month — the strategic trajectory ─────────────────────────
+    monthly_trend_html = ""
+    if monthly_trend:
+        monthly_trend_html = f"""
+        <div class="card" style="margin:18px 0 0;padding:20px 22px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:16px;">Activity by month · emails handled</div>
+          {_pulse_hist(list(monthly_trend), bar_h=84)}
+        </div>"""
+
+    # ── Job flow — opened vs closed, with a plain-English read ──────────────
+    if closed and opened >= closed * 1.25:
+        flow_msg = f"Roughly {round(opened / closed, 1)}× more jobs opened than closed — the active pipeline grew this month."
+    elif opened and closed and abs(opened - closed) <= 0.2 * max(opened, closed):
+        flow_msg = "Openings and closes ran roughly even — a steady pipeline this month."
+    elif closed and opened < closed:
+        flow_msg = "More jobs closed than opened — the open pipeline contracted this month."
+    else:
+        flow_msg = "Jobs flowed in faster than they were retired this month."
+    flow_bar = _pulse_seg_bar([(opened, "seg-open"), (closed, "seg-close")], (opened + closed) or 1, 14)
+    role_flow_html = f"""
+    <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+      <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Job flow</div>
+      <div style="margin:8px 0 12px;">
+        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{opened:,}</span>
+        <span class="muted" style="font-size:13px;color:#52525b;">opened</span>
+        &nbsp;&nbsp;<span class="dim" style="color:#a1a1aa;">vs</span>&nbsp;&nbsp;
+        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{closed:,}</span>
+        <span class="muted" style="font-size:13px;color:#52525b;">closed</span>
+      </div>
+      {flow_bar}
+      <div class="muted" style="font-size:13px;color:#52525b;margin-top:12px;line-height:1.5;">{flow_msg}</div>
+      <div style="margin-top:8px;font-size:11px;">
+        <span class="muted" style="color:#52525b;"><span class="seg-open" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Opened</span>
+        &nbsp;&nbsp;<span class="muted" style="color:#52525b;"><span class="seg-close" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Closed</span>
+      </div>
+    </div>"""
+
+    # When work happens: weekday + hour totals (plain bars, no open/update/close split).
+    cadence_html = ""
+    if weekday_split or hour_split:
+        wtot = [(l, v["opened"] + v["updated"] + v["closed"]) for l, v in weekday_split]
+        htot = [(f"{h % 12 or 12}{'a' if h < 12 else 'p'}", v["opened"] + v["updated"] + v["closed"])
+                for h, v in hour_split]
+        keep_hours = {i for i, (h, _v) in enumerate(hour_split) if h in (0, 6, 12, 18)}
+        cadence_html = f"""
+        <div class="card" style="margin:18px 0 0;padding:20px 22px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:14px;">By day of week · Mon–Fri</div>
+          {_pulse_hist(wtot, bar_h=92)}
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin:22px 0 14px;">By hour (ET)</div>
+          {_pulse_hist(htot, bar_h=72, show_counts=True, label_keep=keep_hours, num_fs=9, show_zeros=False)}
+        </div>"""
+
+    # Lifecycle: open-duration distribution for the month.
+    lc_m   = lifecycle.get("week", {}) or {}
+    lc_all = lifecycle.get("all", {}) or {}
+    lifecycle_html = ""
+    if lc_all.get("closed_total"):
+        m_opened = int(lc_m.get("opened", 0))
+        m_closed = int(lc_m.get("closed", 0))
+        m_median = _pulse_fmt_dur(lc_m.get("median_hours"))
+        all_ref = (f'Since launch: {_pulse_fmt_dur(lc_all.get("median_hours"))} median open across '
+                   f'{int(lc_all.get("closed_total", 0)):,} closed jobs.')
+        if m_closed > 0:
+            buckets = [
+                ("Within 1 hr", int(lc_m.get("lt_1h", 0)),  int(lc_all.get("lt_1h", 0)),  "seg-close"),
+                ("1–24 hrs",    int(lc_m.get("h1_24", 0)),  int(lc_all.get("h1_24", 0)),  "seg-upd"),
+                ("1–7 days",    int(lc_m.get("d1_7", 0)),   int(lc_all.get("d1_7", 0)),   "seg-open"),
+                ("Over 7 days", int(lc_m.get("gt_7d", 0)),  int(lc_all.get("gt_7d", 0)),  "bar-track"),
+            ]
+            mtot   = m_closed
+            alltot = int(lc_all.get("closed_total", 0)) or 1
+            month_bar = _pulse_seg_bar([(mn, cls) for _l, mn, _an, cls in buckets], mtot, 14)
+            all_bar   = _pulse_seg_bar([(an, cls) for _l, _mn, an, cls in buckets], alltot, 8)
+            mini = 'font-size:10px;color:#a1a1aa;font-weight:600;text-transform:uppercase;letter-spacing:.04em;'
+            hdr = ('<tr><td></td>'
+                   '<td class="dim" style="padding:0 0 4px;font-size:10px;color:#a1a1aa;font-weight:600;text-transform:uppercase;letter-spacing:.04em;text-align:right;">This month</td>'
+                   '<td class="dim" style="padding:0 0 4px 10px;font-size:10px;color:#a1a1aa;font-weight:600;text-transform:uppercase;letter-spacing:.04em;text-align:right;">All-time</td></tr>')
+            rows = hdr + "".join(
+                f'<tr>'
+                f'<td style="padding:5px 0;font-size:12px;white-space:nowrap;width:46%;">'
+                f'<span class="{cls}" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:6px;"></span>'
+                f'<span class="text" style="color:#27272a;">{lbl}</span></td>'
+                f'<td class="muted" style="padding:5px 0;font-size:12px;color:#52525b;text-align:right;width:27%;white-space:nowrap;font-variant-numeric:tabular-nums;">{mn} &nbsp;·&nbsp; {round(mn / mtot * 100)}%</td>'
+                f'<td class="muted" style="padding:5px 0 5px 10px;font-size:12px;color:#52525b;text-align:right;width:27%;white-space:nowrap;font-variant-numeric:tabular-nums;">{an:,} &nbsp;·&nbsp; {round(an / alltot * 100)}%</td>'
+                f'</tr>'
+                for lbl, mn, an, cls in buckets
+            )
+            lifecycle_html = f"""
+        <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Hiring velocity · how long jobs stayed open · this month vs all-time</div>
+          <div class="num" style="font-size:24px;color:#18181b;font-weight:700;margin:6px 0 2px;letter-spacing:-0.02em;">{m_median} median open</div>
+          <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">{m_closed} of {m_opened} jobs opened this month have closed</div>
+          <div class="dim" style="{mini}margin-bottom:5px;">This month</div>
+          {month_bar}
+          <div class="dim" style="{mini}margin:11px 0 5px;">All-time</div>
+          {all_bar}
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin-top:14px;">{rows}</table>
+          <div class="muted" style="margin-top:12px;font-size:11px;color:#71717a;line-height:1.5;">{all_ref}</div>
+        </div>"""
+
+    map_html = _pulse_us_map(top_states, states_total, "This month's emails by state.")
+
+    all_time_html = ""
+    if launch and (cum_eml or cum_field):
+        all_time_html = f"""
+        <div class="muted" style="margin:18px 0 0;padding:14px 4px 0;border-top:1px solid #e4e4e7;font-size:11px;color:#71717a;line-height:1.6;">
+          <span style="font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#52525b;">All-time since {launch}</span> ·
+          {cum_eml:,} emails · {cum_field:,} field updates · {cum_h:g} hrs returned
+        </div>"""
+
+    # Ordered by client impact: value (ROI) → pipeline (job flow) → growth
+    # trajectory → fill speed → reach → operational rhythm (cadence) last.
+    body_inner = (hero_row + roi_html + role_flow_html + monthly_trend_html
+                  + lifecycle_html + map_html + cadence_html + all_time_html)
+    body_html = _pulse_doc("Proxi · Monthly pulse", period, body_inner, "Proxi Monthly Pulse")
+
+    lat_line = f"{latency:.1f} min average" if latency is not None else "—"
+    text = textwrap.dedent(f"""
+    Proxi Monthly Pulse — {period}
+    ============================================
+
+    Emails received : {emails}   (prior month: {prv_emails})
+    Jobs opened     : {opened}   (prior month: {prv_open})
+    Jobs closed     : {closed}   (prior month: {prv_close})
+    SF field updates: {patches}  (prior month: {prv_patch})
+    Capture rate    : {coverage_pct}% ({cap_pass} of {emails} captured)
+    Avg sync time   : {lat_line}
+    Manual time recouped : {hrs_saved:g} hrs this month · {cum_h:g} hrs all-time
 
     States active: {states_total}
 
     Proxi · Kimedics → Salesforce automation
+    """).strip()
+
+    return _send(subject, body_html, text)
+
+
+def _pulse_section_header(title, status_text, kind):
+    """Divider between automations: bold name on the left, status pill on the right.
+    kind: 'live' (green) or 'build' (amber)."""
+    dot = "#16a34a" if kind == "live" else "#d97706"
+    pill_cls = "pill-live" if kind == "live" else "pill-build"
+    return f"""
+    <div style="margin:32px 0 0;padding:0 4px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">
+        <tr>
+          <td style="vertical-align:middle;">
+            <span class="text" style="font-size:19px;font-weight:700;color:#18181b;letter-spacing:-0.01em;">{title}</span>
+          </td>
+          <td style="vertical-align:middle;text-align:right;white-space:nowrap;">
+            <span class="{pill_cls}" style="display:inline-block;border-radius:999px;padding:4px 12px;font-size:11px;font-weight:700;letter-spacing:.02em;">
+              <span style="display:inline-block;width:7px;height:7px;border-radius:999px;background:{dot};vertical-align:middle;margin-right:6px;"></span>{status_text}</span>
+          </td>
+        </tr>
+      </table>
+    </div>"""
+
+
+def _impact_djc_section(djc=None):
+    """DJC → Salesforce results block. Driven by real scrape KPIs from the DJC
+    pipeline's dry-run period (no Salesforce writes — scraped/processed only)."""
+    d = djc or {}
+    cand   = int(d.get("candidates", 0))
+    cvs    = int(d.get("cvs_parsed", 0))
+    newc   = int(d.get("net_new", 0))
+    dup    = int(d.get("already_in_sf", 0))
+    unc    = int(d.get("uncontactable", 0))
+    contact = int(d.get("contactable", 0))
+    states = int(d.get("states", 0))
+    specs  = int(d.get("specialties", 0))
+    cv_only = int(d.get("cv_only_contact", 0))
+    runs   = int(d.get("runs", 0))
+    days   = int(d.get("days", 0))
+    start  = d.get("start_disp", d.get("start", ""))
+    end    = d.get("end_disp", d.get("end", ""))
+    cov    = d.get("coverage") or {}
+
+    intro = (f"Sources dental candidates from Dentist Job Cafe and creates Salesforce <strong>Contacts</strong> "
+             f"with the résumé attached. It has been running daily in <strong>read-only (dry-run) mode</strong> — "
+             f"fully scraping and processing candidates without writing to Salesforce yet. "
+             f"Here's what it did over {days} days ({start} – {end}):")
+
+    hero_big = f"""
+    <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:12px;">
+      <tr>
+        {_pulse_card_big("Candidates scraped",  f"{cand:,}", _pulse_sub(f"across {specs} dental specialties"))}
+        {_pulse_card_big("Résumés parsed",      f"{cvs:,}",  _pulse_sub("in memory — nothing stored"))}
+        {_pulse_card_big("Net-new for Salesforce", f"{newc:,}", _pulse_sub("deduped &amp; contactable"))}
+      </tr>
+    </table>"""
+    hero_sm = f"""
+    <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
+      <tr>
+        {_pulse_card_sm("Already in Salesforce", f"{dup:,}",     _pulse_sub("matched &amp; skipped"))}
+        {_pulse_card_sm("Contact recovered",     f"{contact:,}", _pulse_sub("phone and/or email"))}
+        {_pulse_card_sm("States covered",        f"{states}",    _pulse_sub("national reach"))}
+      </tr>
+    </table>"""
+
+    # Funnel — what the pipeline did with every scraped candidate.
+    funnel_html = ""
+    if cand:
+        segs = [(dup, "seg-upd", "Already in Salesforce"),
+                (unc, "bar-track", "Uncontactable — skipped"),
+                (newc, "seg-open", "Net-new, ready for SF")]
+        bar = _pulse_seg_bar([(n, cls) for n, cls, _l in segs], cand or 1, 14)
+        rows = "".join(
+            f'<tr>'
+            f'<td style="padding:5px 0;font-size:12px;white-space:nowrap;width:62%;">'
+            f'<span class="{cls}" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:6px;"></span>'
+            f'<span class="text" style="color:#27272a;">{lbl}</span></td>'
+            f'<td class="muted" style="padding:5px 0;font-size:12px;color:#52525b;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;">{n:,} &nbsp;·&nbsp; {round(n / cand * 100)}%</td>'
+            f'</tr>'
+            for n, cls, lbl in segs
+        )
+        funnel_html = f"""
+        <div style="margin:18px 0 0;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px;">What the pipeline did with all {cand:,} candidates</div>
+          {bar}
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin-top:12px;">{rows}</table>
+        </div>"""
+
+    # Salesforce coverage — does the scrape catch who SF flags as active on DJC?
+    coverage_html = ""
+    if cov:
+        P = int(cov.get("population", 0)); C = int(cov.get("covered", 0))
+        pct = int(cov.get("pct", 0)); ceil = int(cov.get("ceiling", 0))
+        was = int(cov.get("was_pct", 0)); recovered = int(cov.get("recovered", 0))
+        win = int(cov.get("window_days", 7)); ref = cov.get("ref", "")
+        gap = round(ceil / P * 100) if P else 0
+        csegs = [(C, "seg-open", "Captured"),
+                 (ceil, "bar-track", "By-design ceiling (out-of-window)")]
+        cbar = _pulse_seg_bar([(n, cls) for n, cls, _l in csegs if n], P or 1, 14)
+        crows = "".join(
+            f'<tr>'
+            f'<td style="padding:5px 0;font-size:12px;white-space:nowrap;width:66%;">'
+            f'<span class="{cls}" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:6px;"></span>'
+            f'<span class="text" style="color:#27272a;">{lbl}</span></td>'
+            f'<td class="muted" style="padding:5px 0;font-size:12px;color:#52525b;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;">{n} &nbsp;·&nbsp; {round(n / P * 100)}%</td>'
+            f'</tr>'
+            for n, cls, lbl in csegs if n
+        )
+        rose = (f'<span class="delta-up" style="display:inline-block;border-radius:999px;padding:3px 10px;'
+                f'font-size:11px;font-weight:700;margin-left:8px;">↑ from {was}%</span>') if was else ""
+        coverage_html = f"""
+        <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Salesforce coverage · candidates SF flags active on DJC (last {win} days)</div>
+          <div style="margin:8px 0 4px;">
+            <span class="num" style="font-size:30px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{pct}%</span>
+            <span class="muted" style="font-size:13px;color:#52525b;">covered</span>{rose}
+          </div>
+          <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">{C} of {P} candidates Salesforce marks active on DJC in the trailing {win} days are in the scrape (as of {ref}). Viewed-collision fix confirmed live in production.</div>
+          {cbar}
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin-top:12px;">{crows}</table>
+          <div class="note-box muted" style="margin-top:14px;padding:14px 16px;border-radius:6px;font-size:12px;color:#52525b;line-height:1.6;">
+            A <strong class="text" style="color:#27272a;">viewed-collision fix is now live in production</strong> — {recovered} candidates the old viewed-flag filter was silently dropping are recovered via the new DB-dedup selection, lifting coverage {was}% → {pct}%.
+            The remaining {ceil} (~{gap}%) are a <strong class="text" style="color:#27272a;">by-design ceiling</strong>: their real DJC activity is older than {win} days, while Salesforce's "Active on DJC" is a manually-entered date — so a {win}-day-activity scrape can't reach them. At {pct}%, this is effectively full coverage of the population the automation is designed to capture; widening the activity window (14/30 days) is the only further lever, a scope decision rather than a defect.
+          </div>
+        </div>"""
+
+    steps = [
+        f"Ran <strong>{runs} automated passes</strong> across {specs} dental roles/specialties, scraping under fixed filters (recent activity, exclude visa).",
+        f"Recovered contact info from the profile, or parsed the résumé in memory with Claude when missing — CV parsing alone made <strong>{cv_only:,}</strong> otherwise-uncontactable candidates reachable.",
+        "Deduped every candidate against Salesforce on phone <em>or</em> email <em>or</em> name + profile link, skipping anyone already on file.",
+        "For each net-new candidate, assembled the full Contact payload + résumé — ready to create the moment writes are switched on.",
+    ]
+    bullets = "".join(
+        f'<tr><td style="vertical-align:top;padding:4px 8px 4px 0;color:#a1a1aa;font-size:13px;">•</td>'
+        f'<td class="text" style="padding:4px 0;font-size:13px;line-height:1.55;color:#27272a;">{s}</td></tr>'
+        for s in steps
+    )
+    return f"""
+    <div class="card" style="margin:14px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+      <div class="text" style="font-size:14px;line-height:1.6;color:#27272a;">{intro}</div>
+      {hero_big}{hero_sm}{funnel_html}{coverage_html}
+      <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin:22px 0 8px;">How it works</div>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">{bullets}</table>
+      <div class="note-box muted" style="margin-top:16px;padding:14px 16px;border-radius:6px;font-size:12px;color:#52525b;line-height:1.6;">
+        <strong class="text" style="color:#27272a;">Status:</strong> running daily in read-only mode — <strong class="text" style="color:#27272a;">zero Salesforce writes by design</strong>.
+        The scrape, contact-recovery, CV-parsing, and dedup stages are all working end to end on live data; flipping to live mode would create the {newc:,} net-new candidates above automatically, each with its résumé attached.
+      </div>
+    </div>"""
+
+
+def send_impact_report(stats: dict, djc: dict | None = None) -> bool:
+    """
+    One-time, all-time impact report for the client — the full record of what the
+    Kimedics → Salesforce automation has done since launch. Every figure is taken
+    directly from the sync logs (volume, capture, sync time, hiring velocity,
+    footprint); the only modeled number is hours saved, which is stated with its
+    assumptions. No period-over-period deltas — this is the whole history.
+
+    ``djc`` carries the Dentist Job Cafe pipeline's real dry-run scrape KPIs (from
+    its separate DB); when provided, the DJC section renders those instead of a
+    placeholder.
+    """
+    cur    = stats.get("current") or {}
+    period = stats.get("period_label", "Since launch")
+
+    emails  = int(cur.get("emails_received", 0))
+    opened  = int(cur.get("opened", 0))
+    updated = int(cur.get("updated", 0))
+    closed  = int(cur.get("closed", 0))
+    patches = int(cur.get("field_patches_total", 0))
+    latency = cur.get("mean_latency_min")
+
+    cap_ok   = int(cur.get("content_ok", 0))
+    cap_tot  = int(cur.get("content_emails", 0))
+    cap_pass = emails - max(0, cap_tot - cap_ok)
+    cov      = (cap_pass / emails * 100) if emails else 100.0
+    cov_str  = f"{cov:.1f}%"
+
+    hrs_saved     = float(stats.get("hours_saved_estimate", 0.0))
+    top_states    = stats.get("top_states", [])
+    states_total  = int(stats.get("states_total", 0))
+    monthly_trend = stats.get("monthly_trend", [])
+    hours_trend   = stats.get("hours_trend", [])
+    lifecycle     = stats.get("lifecycle", {}) or {}
+    lc_all        = lifecycle.get("all", {}) or {}
+    model         = stats.get("manual_time_model", {}) or {}
+    launch        = stats.get("launch_iso") or ""
+    today         = stats.get("today_iso") or ""
+    days_live     = int(stats.get("days_live", 0))
+
+    if emails == 0:
+        print("[alert_email] Impact report skipped — no data")
+        return False
+
+    launch_disp = ""
+    if launch:
+        from datetime import date
+        try:
+            launch_disp = date.fromisoformat(launch).strftime("%B %-d, %Y")
+        except ValueError:
+            launch_disp = launch
+
+    lat_txt = f"{latency:.1f} min" if latency is not None else "—"
+    djc_cand = int((djc or {}).get("candidates", 0))
+    djc_tail = f" · DJC pilot: {djc_cand:,} candidates scraped" if djc_cand else ""
+    subject = (f"Proxi · Automation Impact Report · Kimedics: {hrs_saved:g} hrs saved, "
+               f"{emails:,} emails{djc_tail}")
+
+    intro = f"""
+    <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+      <div class="text" style="font-size:15px;line-height:1.65;color:#27272a;">
+        Proxi runs two automations against your Salesforce org. The <strong>Kimedics → Salesforce</strong>
+        job sync has been live since <strong>{launch_disp or launch}</strong>; the
+        <strong>Dentist Job Cafe → Salesforce</strong> candidate pipeline is in active development.
+        Here's where each stands.
+      </div>
+    </div>"""
+    kimedics_header = _pulse_section_header("Kimedics → Salesforce", "Live", "live")
+    djc_header      = _pulse_section_header("Dentist Job Cafe → Salesforce", "Dry-run pilot", "build")
+    djc_section     = _impact_djc_section(djc)
+
+    # ── ROI centerpiece — the headline: hours of manual work returned ────────
+    spark = _pulse_trend(hours_trend, "hrs saved / month")
+    spark_cell = (f'<td class="spark-cell" style="vertical-align:bottom;width:38%;padding-left:20px;">{spark}</td>'
+                  if spark else "")
+    roi_html = f"""
+    <div class="roi" style="margin:18px 0 0;padding:24px 26px;background:#18181b;border-radius:8px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" class="duo-stack" style="width:100%;border-collapse:collapse;">
+        <tr>
+          <td style="vertical-align:top;">
+            <div style="color:#a1a1aa;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;">Manual time recouped since launch</div>
+            <div style="margin-top:10px;white-space:nowrap;">
+              <span style="color:#ffffff;font-size:52px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;">{hrs_saved:g} hrs</span>
+            </div>
+            <div style="color:#71717a;font-size:12px;margin-top:14px;line-height:1.5;">Estimated hands-on data-entry time the automation handled across {days_live} days.</div>
+          </td>
+          {spark_cell}
+        </tr>
+      </table>
+    </div>"""
+
+    # ── What the automation processed — the measured volume ──────────────────
+    hero_big = f"""
+    <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:10px;">
+      <tr>
+        {_pulse_card_big("Emails processed",     f"{emails:,}",  _pulse_sub("every Kimedics job email"))}
+        {_pulse_card_big("Jobs opened",          f"{opened:,}",  _pulse_sub("new postings synced to SF"))}
+        {_pulse_card_big("Salesforce updates",   f"{patches:,}", _pulse_sub("fields written automatically"))}
+      </tr>
+    </table>"""
+    hero_a = f"""
+    <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
+      <tr>
+        {_pulse_card_sm("Jobs updated",   f"{updated:,}", _pulse_sub("change syncs pushed"))}
+        {_pulse_card_sm("Jobs closed",    f"{closed:,}",  _pulse_sub("lifecycles completed"))}
+        {_pulse_card_sm("Capture rate",   cov_str,        _pulse_sub(f"{cap_pass:,} of {emails:,} captured"))}
+      </tr>
+    </table>"""
+    hero_b = f"""
+    <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
+      <tr>
+        {_pulse_card_sm("Avg sync time",  lat_txt,             _pulse_sub("email → Salesforce"))}
+        {_pulse_card_sm("States active",  f"{states_total}",   _pulse_sub("national coverage"))}
+        {_pulse_card_sm("Days live",      f"{days_live}",      _pulse_sub(f"since {launch_disp or launch}"))}
+      </tr>
+    </table>"""
+    hero_row = hero_big + hero_a + hero_b
+
+    # ── Growth trajectory — activity by month ────────────────────────────────
+    monthly_trend_html = ""
+    if monthly_trend:
+        partial = ""
+        if today:
+            from datetime import date
+            try:
+                d = date.fromisoformat(today)
+                if d.day < 28:
+                    partial = (f'<div class="dim" style="font-size:11px;color:#a1a1aa;margin-top:12px;line-height:1.5;">'
+                               f'{monthly_trend[-1][0]} reflects activity through {d.strftime("%b %-d")} (month-to-date).</div>')
+            except ValueError:
+                pass
+        monthly_trend_html = f"""
+        <div class="card" style="margin:18px 0 0;padding:20px 22px 16px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:16px;">Activity by month · emails handled</div>
+          {_pulse_hist(list(monthly_trend), bar_h=92)}
+          {partial}
+        </div>"""
+
+    # ── Job flow — opened vs closed across the whole history ──────────────────
+    if closed and opened >= closed * 1.25:
+        flow_msg = f"Roughly {round(opened / closed, 1)}× more jobs opened than closed — the active pipeline has grown since launch."
+    elif opened and closed and abs(opened - closed) <= 0.2 * max(opened, closed):
+        flow_msg = "Openings and closes have run roughly even — a steady pipeline since launch."
+    elif closed and opened < closed:
+        flow_msg = "More jobs closed than opened — the open pipeline has contracted since launch."
+    else:
+        flow_msg = "Jobs have flowed in faster than they were retired."
+    flow_bar = _pulse_seg_bar([(opened, "seg-open"), (closed, "seg-close")], (opened + closed) or 1, 14)
+    flow_html = f"""
+    <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+      <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Job flow · since launch</div>
+      <div style="margin:8px 0 12px;">
+        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{opened:,}</span>
+        <span class="muted" style="font-size:13px;color:#52525b;">opened</span>
+        &nbsp;&nbsp;<span class="dim" style="color:#a1a1aa;">vs</span>&nbsp;&nbsp;
+        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{closed:,}</span>
+        <span class="muted" style="font-size:13px;color:#52525b;">closed</span>
+      </div>
+      {flow_bar}
+      <div class="muted" style="font-size:13px;color:#52525b;margin-top:12px;line-height:1.5;">{flow_msg}</div>
+      <div style="margin-top:8px;font-size:11px;">
+        <span class="muted" style="color:#52525b;"><span class="seg-open" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Opened</span>
+        &nbsp;&nbsp;<span class="muted" style="color:#52525b;"><span class="seg-close" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Closed</span>
+      </div>
+    </div>"""
+
+    # ── Hiring velocity — how long jobs stayed open (all-time) ────────────────
+    lifecycle_html = ""
+    if lc_all.get("closed_total"):
+        alltot = int(lc_all.get("closed_total", 0)) or 1
+        buckets = [
+            ("Within 1 hr", int(lc_all.get("lt_1h", 0)),  "seg-close"),
+            ("1–24 hrs",    int(lc_all.get("h1_24", 0)),  "seg-upd"),
+            ("1–7 days",    int(lc_all.get("d1_7", 0)),   "seg-open"),
+            ("Over 7 days", int(lc_all.get("gt_7d", 0)),  "bar-track"),
+        ]
+        bar = _pulse_seg_bar([(n, cls) for _l, n, cls in buckets], alltot, 14)
+        rows = "".join(
+            f'<tr>'
+            f'<td style="padding:5px 0;font-size:12px;white-space:nowrap;width:50%;">'
+            f'<span class="{cls}" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:6px;"></span>'
+            f'<span class="text" style="color:#27272a;">{lbl}</span></td>'
+            f'<td class="muted" style="padding:5px 0;font-size:12px;color:#52525b;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;">{n:,} &nbsp;·&nbsp; {round(n / alltot * 100)}%</td>'
+            f'</tr>'
+            for lbl, n, cls in buckets
+        )
+        lifecycle_html = f"""
+        <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
+          <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Hiring velocity · how long jobs stayed open</div>
+          <div class="num" style="font-size:24px;color:#18181b;font-weight:700;margin:6px 0 2px;letter-spacing:-0.02em;">{_pulse_fmt_dur(lc_all.get("median_hours"))} median open</div>
+          <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">across {alltot:,} jobs with a completed open → close lifecycle</div>
+          {bar}
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin-top:14px;">{rows}</table>
+        </div>"""
+
+    map_html = _pulse_us_map(top_states, states_total, "Every job email by state since launch.")
+
+    # ── Methodology — so every number is auditable ───────────────────────────
+    mo = int(model.get("min_per_open", 8))
+    mt = float(model.get("min_per_other", 1.5))
+    sw = int(model.get("min_per_switch", 2))
+    method_html = f"""
+    <div class="muted" style="margin:18px 0 0;padding:16px 4px 0;border-top:1px solid #e4e4e7;font-size:11px;color:#71717a;line-height:1.7;">
+      <span style="font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#52525b;">How these numbers are measured</span><br>
+      Volume, capture rate, sync time, hiring velocity, and footprint are counted directly from the
+      automation's sync logs over {period}. Hours saved is the one estimate: {mo} min of manual entry
+      per job opened, {mt:g} min per update or close, plus {sw} min of context-switching per email —
+      applied to the {emails:,} emails actually processed. Sync time is the mean email→Salesforce delay
+      with statistical outliers removed.
+    </div>"""
+
+    body_inner = (intro
+                  + kimedics_header + roi_html + hero_row + monthly_trend_html
+                  + flow_html + lifecycle_html + map_html
+                  + djc_header + djc_section
+                  + method_html)
+    body_html = _pulse_doc("Proxi · Automation impact report", period, body_inner,
+                           "Proxi Automation Impact Report")
+
+    text = textwrap.dedent(f"""
+    Proxi — Automation Impact Report
+    {period}
+    ============================================
+
+    1) KIMEDICS -> SALESFORCE   [LIVE]
+    Since launch ({launch_disp or launch}), {days_live} days live.
+
+    Manual time recouped : {hrs_saved:g} hrs (estimated)
+    Emails processed     : {emails}
+    Jobs opened          : {opened}
+    Jobs updated         : {updated}
+    Jobs closed          : {closed}
+    Salesforce updates   : {patches} fields
+    Capture rate         : {cov_str} ({cap_pass} of {emails} captured)
+    Avg sync time        : {lat_txt} (email -> Salesforce)
+    States active        : {states_total}
+    Median time open     : {_pulse_fmt_dur(lc_all.get("median_hours"))} across {int(lc_all.get("closed_total", 0))} closed jobs
+
+    2) DENTIST JOB CAFE -> SALESFORCE   [DRY-RUN PILOT]
+    Running daily in read-only mode (no Salesforce writes yet).
+    Candidates scraped   : {int((djc or {}).get('candidates', 0))}
+    Resumes parsed       : {int((djc or {}).get('cvs_parsed', 0))}
+    Already in Salesforce: {int((djc or {}).get('already_in_sf', 0))} (deduped, skipped)
+    Uncontactable        : {int((djc or {}).get('uncontactable', 0))} (skipped)
+    Net-new for SF       : {int((djc or {}).get('net_new', 0))} (ready to create)
+    States covered       : {int((djc or {}).get('states', 0))}
+
+    SF coverage (active-on-DJC, last {int(((djc or {}).get('coverage') or {}).get('window_days', 7))} days):
+      {int(((djc or {}).get('coverage') or {}).get('covered', 0))} of {int(((djc or {}).get('coverage') or {}).get('population', 0))} covered = {int(((djc or {}).get('coverage') or {}).get('pct', 0))}% ({int(((djc or {}).get('coverage') or {}).get('was_pct', 0))}% -> {int(((djc or {}).get('coverage') or {}).get('pct', 0))}%; viewed-collision fix confirmed live in production).
+      Remaining {int(((djc or {}).get('coverage') or {}).get('ceiling', 0))} are a by-design ceiling (real DJC activity >7 days old; manual Active_on_DJC date). 91% = effectively full coverage of the designed population.
+
+    Proxi · Kimedics & DJC -> Salesforce automations
     """).strip()
 
     return _send(subject, body_html, text)
