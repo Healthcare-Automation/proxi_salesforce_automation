@@ -175,13 +175,40 @@ def extract_active_needs_dates(description_full_text: str) -> Optional[str]:
     return None
 
 
+_ACTIVE_DATES_OVERRIDE_CACHE: dict[str, Optional[str]] = {}
+
+
+def active_dates_override(description_full_text: str) -> Optional[str]:
+    """
+    Currently-active dates stated in a post's top line (which override the full
+    structured ``dates_needed`` list). An LLM makes the call so new top-line
+    phrasings keep working; if the AI is unavailable it falls back to the
+    deterministic :func:`extract_active_needs_dates` regex. Result is cached per
+    description text so parse + push in one run don't double-call the model.
+    """
+    t = (description_full_text or "").strip()
+    if not t:
+        return None
+    if t in _ACTIVE_DATES_OVERRIDE_CACHE:
+        return _ACTIVE_DATES_OVERRIDE_CACHE[t]
+    try:
+        from utils.job_description_ai import ai_active_dates_override
+
+        result = ai_active_dates_override(t)  # str (override) or None (AI: no override)
+    except Exception:
+        result = extract_active_needs_dates(t)  # AI unavailable → regex fallback
+    if len(_ACTIVE_DATES_OVERRIDE_CACHE) < 1024:
+        _ACTIVE_DATES_OVERRIDE_CACHE[t] = result
+    return result
+
+
 def effective_dates_needed(row: dict) -> str:
     """
-    Dates for Job copy and ``Job_Dates_Needed__c``: an **Active need(s) …** clause in
-    ``description_full_text`` (see :func:`extract_active_needs_dates`) overrides ``dates_needed``
+    Dates for Job copy and ``Job_Dates_Needed__c``: a top-line override (see
+    :func:`active_dates_override`) wins over the structured ``dates_needed`` list
     when present.
     """
-    active = extract_active_needs_dates((row.get("description_full_text") or "").strip())
+    active = active_dates_override((row.get("description_full_text") or "").strip())
     if active:
         return active
     return (row.get("dates_needed") or "").strip()

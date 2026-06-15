@@ -19,7 +19,7 @@ from typing import Union, Optional
 
 from utils.address_display_format import format_us_address_line_for_display
 from utils.sf_text_normalize import strip_trailing_commas_from_sf_text
-from utils.job_description_proxi_template import extract_active_needs_dates
+from utils.job_description_proxi_template import active_dates_override
 from utils.us_state_expand import US_STATE_CODE_TO_NAME
 
 # Invert for "Missouri" row + "… Independence MO" street (abbrev vs full name).
@@ -379,7 +379,7 @@ def _fill_from_description_blocks(out: dict) -> None:
     desc = _split_chained_desc_labels_into_lines(desc)
     lines = desc.splitlines()
 
-    active_dates = extract_active_needs_dates(desc)
+    active_dates = active_dates_override(desc)
     if active_dates:
         out["dates_needed"] = active_dates
 
