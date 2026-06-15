@@ -19,7 +19,7 @@ from typing import Union, Optional
 
 from utils.address_display_format import format_us_address_line_for_display
 from utils.sf_text_normalize import strip_trailing_commas_from_sf_text
-from utils.job_description_proxi_template import active_dates_override
+from utils.job_description_proxi_template import active_dates_resolution
 from utils.us_state_expand import US_STATE_CODE_TO_NAME
 
 # Invert for "Missouri" row + "… Independence MO" street (abbrev vs full name).
@@ -412,10 +412,17 @@ def _fill_from_description_blocks(out: dict) -> None:
 
     # Resolve any top-line override / cancellation against the structured dates,
     # now that the full "Dates:" list has been parsed (so a cancellation can be
-    # subtracted from it). Override/active-need cases replace it outright.
-    resolved_dates = active_dates_override(desc, out.get("dates_needed"))
-    if resolved_dates:
-        out["dates_needed"] = resolved_dates
+    # subtracted from it). Override/active-need cases replace it outright. Record
+    # the structured input + the model's confidence so a low-confidence resolution
+    # can be flagged for human review downstream (before it reaches Salesforce).
+    _structured_dates = (out.get("dates_needed") or "").strip()
+    _res = active_dates_resolution(desc, _structured_dates)
+    if _res.dates:
+        out["dates_needed"] = _res.dates
+        if _res.confidence < 100:
+            out["dates_confidence"] = _res.confidence
+            out["dates_reason"] = _res.reason
+            out["dates_structured"] = _structured_dates
 
     if not (out.get("standard_schedule") or "").strip():
         # Avoid bare "schedule" — it often grabs the next non-label line (e.g. a person's name).

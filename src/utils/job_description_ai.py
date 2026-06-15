@@ -21,6 +21,16 @@ class AIDescriptionResult:
     model: str
 
 
+@dataclass(frozen=True)
+class DateResolution:
+    """Resolved active dates plus the model's self-reported confidence (0-100).
+    ``dates`` is None when the top line does not change the dates. ``confidence``
+    is 100 when the result is fully certain; anything lower flags for human review."""
+    dates: Optional[str]
+    confidence: int = 100
+    reason: str = ""
+
+
 # ── Active-dates override (AI) ───────────────────────────────────────────────
 #
 # Kimedics posts carry a full ``Dates:`` line listing every date ever associated
@@ -59,13 +69,13 @@ def _norm_for_match(s: str) -> str:
 
 def _validate_ai_dates(
     raw_text: str, description_full_text: str, structured_dates: str = ""
-) -> Optional[str]:
-    """Parse the model's JSON and return the resolved active dates. Anti-hallucination
+) -> DateResolution:
+    """Parse the model's JSON into a :class:`DateResolution`. Anti-hallucination
     guard is token-level: every comma-separated date piece in the result must appear
     in the post (or the structured Dates list) — this allows cancellation results
     (full list minus removed dates), which are not a single verbatim substring, while
     still rejecting invented dates. Raises ``ValueError`` on anything unusable so the
-    caller falls back to the regex extractor; returns ``None`` for "no change"."""
+    caller falls back to the regex extractor; returns dates=None for "no change"."""
     import json
 
     t = (raw_text or "").strip()
@@ -78,16 +88,21 @@ def _validate_ai_dates(
     if not isinstance(obj, dict):
         raise ValueError("AI date override: JSON is not an object")
     if not obj.get("override"):
-        return None
+        return DateResolution(None, 100, "")
     dates = str(obj.get("dates") or "").strip().rstrip(".").strip()
     if not dates:
-        return None
+        return DateResolution(None, 100, "")
     haystack = _norm_for_match(f"{description_full_text} {structured_dates or ''}")
     for piece in dates.split(","):
         p = _norm_for_match(piece)
         if p and p not in haystack:
             raise ValueError(f"AI date piece not present in post: {piece!r}")
-    return dates
+    try:
+        confidence = int(round(float(obj.get("confidence", 100))))
+    except (TypeError, ValueError):
+        confidence = 0  # unparseable confidence → treat as needs-review
+    confidence = max(0, min(100, confidence))
+    return DateResolution(dates, confidence, str(obj.get("reason") or "").strip())
 
 
 def ai_active_dates_override(
@@ -96,16 +111,17 @@ def ai_active_dates_override(
     *,
     model: Optional[str] = None,
     timeout_s: float = 15.0,
-) -> Optional[str]:
+) -> DateResolution:
     """Resolve the currently-active dates from a post's top line, applying any
     override (active need / dates added) OR cancellation (full list minus removed
-    dates). Returns the resolved date string, or ``None`` when the top line does not
-    change the dates. Raises when the AI cannot run (no key / package / network /
-    bad output) so callers fall back to regex. ``structured_dates`` is the parsed
-    full "Dates:" list, used as the base for cancellation subtraction."""
+    dates). Returns a :class:`DateResolution` (dates=None when the top line does not
+    change the dates) with the model's self-reported confidence. Raises when the AI
+    cannot run (no key / package / network / bad output) so callers fall back to
+    regex. ``structured_dates`` is the parsed full "Dates:" list, used as the base
+    for cancellation subtraction."""
     t = (description_full_text or "").strip()
     if not t or not _has_top_line_date_signal(t):
-        return None
+        return DateResolution(None, 100, "")
 
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -130,12 +146,14 @@ Every post has a structured full "Dates:" list (every date ever associated with 
 
 Never invent dates: every date you return must appear in the post or the structured list.
 
+Also report "confidence": an integer 0-100 for how certain you are the returned dates are EXACTLY correct. Use 100 ONLY when the active dates are completely unambiguous and required no guessing. Lower it when the wording is ambiguous or conflicting, the cancellation scope is unclear, dates are malformed, or you had to interpret. When confidence < 100, give a brief "reason".
+
 Examples (structured | top → output):
-- "June 8-9, 17-19, 26, 29-30, July 1-2" | "6/12 Dates added: June 29-30, July 1-2" → {{"override": true, "dates": "June 29-30, July 1-2"}}
-- "Monday only" | "4/8 Active needs are Fridays June 5, 12" → {{"override": true, "dates": "Fridays June 5, 12"}}
-- "June 1-2, 11-12, 15-19, 22" | "6/10 the office cancelled the need for June 11/12" → {{"override": true, "dates": "June 1-2, 15-19, 22"}}
-- "June 8-9, 17-19, 26" | "6/5 June 8-9 have been cancelled. Active need is June 26" → {{"override": true, "dates": "June 26"}}
-- "June 8-9, 17-19, 26" | "**Aspen exp preferred" → {{"override": false, "dates": ""}}
+- "June 8-9, 17-19, 26, 29-30, July 1-2" | "6/12 Dates added: June 29-30, July 1-2" → {{"override": true, "dates": "June 29-30, July 1-2", "confidence": 100, "reason": ""}}
+- "Monday only" | "4/8 Active needs are Fridays June 5, 12" → {{"override": true, "dates": "Fridays June 5, 12", "confidence": 100, "reason": ""}}
+- "June 1-2, 11-12, 15-19, 22" | "6/10 the office cancelled the need for June 11/12" → {{"override": true, "dates": "June 1-2, 15-19, 22", "confidence": 100, "reason": ""}}
+- "June 8-9, 17-19, 26" | "6/5 June 8-9 have been cancelled. Active need is June 26" → {{"override": true, "dates": "June 26", "confidence": 100, "reason": ""}}
+- "June 8-9, 17-19, 26" | "**Aspen exp preferred" → {{"override": false, "dates": "", "confidence": 100, "reason": ""}}
 
 Structured "Dates:" list: {structured or "(none provided)"}
 
@@ -144,7 +162,7 @@ POST (top portion):
 {top}
 >>>
 
-Respond with STRICT JSON and nothing else: {{"override": true or false, "dates": "<resulting active dates, or empty string>"}}
+Respond with STRICT JSON and nothing else: {{"override": true or false, "dates": "<resulting active dates, or empty string>", "confidence": <0-100>, "reason": "<brief, only if confidence < 100>"}}
 """.strip()
 
     client = OpenAI(api_key=api_key, timeout=timeout_s)

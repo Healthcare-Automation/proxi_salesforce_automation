@@ -94,6 +94,15 @@ def process_link_scrape_batch(
             view_job_link=view_link,
         )
 
+        # Flag AI date resolutions made with < 100% confidence for human review
+        # (set by the parser only when a top-line override/cancellation fired and
+        # the model was unsure). Best-effort, deduped per (job, resolved value).
+        if cl.get("dates_confidence") is not None:
+            try:
+                _alert_low_confidence_dates(conn, job_post_id, cl, schema=schema, run_id=link_run_id)
+            except Exception as _e:
+                print(f"  [alert_email] dates review alert skipped for #{job_post_id}: {_e}")
+
     # ── SF resolution + scrape-field sync (existing) ──────────────────────────
     if touched_job_ids:
         try:
@@ -128,6 +137,63 @@ def process_link_scrape_batch(
     _decide_and_send_alerts(conn, per_row_state, link_run_id, schema)
 
     return touched_job_ids
+
+
+def _alert_low_confidence_dates(conn, job_post_id, cl: dict, *, schema: str, run_id) -> None:
+    """Email the team when AI resolved a job's active dates with < 100% confidence,
+    so a human can verify before the value is relied on in Salesforce. Deduped on
+    (job_id, resolved value) so a re-scrape of the same content stays silent."""
+    from utils.supabase_db import _validate_pg_identifier, log_job_event
+
+    resolved = (cl.get("dates_needed") or "").strip()
+    confidence = int(cl.get("dates_confidence") or 0)
+    reason = (cl.get("dates_reason") or "").strip()
+    structured = (cl.get("dates_structured") or "").strip()
+    jid = str(job_post_id or "").strip()
+    if not jid:
+        return
+    sch = _validate_pg_identifier(schema, "schema")
+
+    sf_job_id = ""
+    if conn is not None:
+        with conn.cursor() as cur:
+            cur.execute(
+                f'SELECT 1 FROM "{sch}".job_event_log WHERE job_id=%s '
+                f"AND event_type='sf_dates_low_confidence' AND payload->>'resolved'=%s LIMIT 1",
+                (jid, resolved),
+            )
+            if cur.fetchone():
+                return  # already alerted for this job + resolved value
+            cur.execute(f'SELECT sf_job_id FROM "{sch}".job_current WHERE job_id=%s', (jid,))
+            row = cur.fetchone()
+            sf_job_id = ((row[0] or "").strip() if row else "")
+
+    from utils.alert_email import send_dates_review_alert
+
+    sent = send_dates_review_alert(
+        jid,
+        kimedics_url=f"https://portal.kimedics.com/app/workspace/job-posts/{jid}",
+        sf_job_id=sf_job_id,
+        structured=structured,
+        resolved=resolved,
+        confidence=confidence,
+        reason=reason,
+    )
+    print(f"  [alert_email] dates review alert for #{jid} ({confidence}% conf) sent={sent}")
+    log_job_event(
+        conn,
+        job_id=jid,
+        event_type="sf_dates_low_confidence",
+        run_id=run_id,
+        schema=schema,
+        payload={
+            "resolved": resolved,
+            "structured": structured,
+            "confidence": confidence,
+            "reason": reason,
+            "email_sent": bool(sent),
+        },
+    )
 
 
 def _decide_and_send_alerts(conn, per_row_state, link_run_id: int, schema: str) -> None:

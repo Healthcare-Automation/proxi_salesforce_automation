@@ -175,33 +175,44 @@ def extract_active_needs_dates(description_full_text: str) -> Optional[str]:
     return None
 
 
-_ACTIVE_DATES_OVERRIDE_CACHE: dict[str, Optional[str]] = {}
+_ACTIVE_DATES_OVERRIDE_CACHE: dict = {}
 
 
-def active_dates_override(description_full_text: str, structured_dates: Optional[str] = None) -> Optional[str]:
+def active_dates_resolution(description_full_text: str, structured_dates: Optional[str] = None):
     """
     Resolve a post's top-line date change against the structured ``dates_needed``
-    list: an override (active need / dates added) replaces it, a cancellation
-    removes the cancelled dates from it. An LLM makes the call so new top-line
-    phrasings keep working; if the AI is unavailable it falls back to the
-    deterministic :func:`extract_active_needs_dates` regex (override-only). Cached
+    list — an override (active need / dates added) replaces it, a cancellation
+    removes the cancelled dates from it — returning a ``DateResolution`` with the
+    model's self-reported confidence. An LLM makes the call so new top-line phrasings
+    keep working; if the AI is unavailable it falls back to the deterministic
+    :func:`extract_active_needs_dates` regex (override-only, confidence 100). Cached
     per (description, structured) so parse + push in one run don't double-call it.
     """
+    from utils.job_description_ai import DateResolution
+
     t = (description_full_text or "").strip()
     if not t:
-        return None
+        return DateResolution(None, 100, "")
     key = f"{t}\x00{(structured_dates or '').strip()}"
     if key in _ACTIVE_DATES_OVERRIDE_CACHE:
         return _ACTIVE_DATES_OVERRIDE_CACHE[key]
     try:
         from utils.job_description_ai import ai_active_dates_override
 
-        result = ai_active_dates_override(t, structured_dates)  # resolved dates or None
+        result = ai_active_dates_override(t, structured_dates)
     except Exception:
-        result = extract_active_needs_dates(t)  # AI unavailable → regex fallback (override-only)
+        # AI unavailable → deterministic regex fallback (override-only); no AI
+        # confidence to report, so treat as certain (no review alert).
+        result = DateResolution(extract_active_needs_dates(t), 100, "regex fallback")
     if len(_ACTIVE_DATES_OVERRIDE_CACHE) < 1024:
         _ACTIVE_DATES_OVERRIDE_CACHE[key] = result
     return result
+
+
+def active_dates_override(description_full_text: str, structured_dates: Optional[str] = None) -> Optional[str]:
+    """The resolved active-dates string (or None for no change). See
+    :func:`active_dates_resolution` for the confidence-bearing form."""
+    return active_dates_resolution(description_full_text, structured_dates).dates
 
 
 def effective_dates_needed(row: dict) -> str:
