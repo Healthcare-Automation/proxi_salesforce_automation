@@ -43,6 +43,13 @@ from typing import Sequence, Optional
 from utils.sf_practice_key import practice_key
 from utils.sf_write_flags import proxi_sf_writes_enabled
 
+# New Job__c records are assigned to Cara Griffin (0055f000007qcxEAAQ) on CREATE only.
+# Salesforce otherwise defaults a new record's owner to the integration run-as user
+# (Sean Yang). This is never applied on update — re-asserting OwnerId on every 10-minute
+# sync would yank ownership back from whoever a recruiter later assigns the job to.
+# Mirrors the worksite (Account) owner default in sf_worksite_create.py.
+JOB_DEFAULT_OWNER_ID = os.environ.get("PROXI_JOB_DEFAULT_OWNER_ID", "0055f000007qcxEAAQ")
+
 
 def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
@@ -397,6 +404,9 @@ def _try_create_sf_job_after_no_match(
             fields = filter_createable_fields(describe, fields)
             if not fields:
                 raise RuntimeError("create payload empty after createable filter")
+            # Assign new Job__c to Cara on create (create-only — see JOB_DEFAULT_OWNER_ID).
+            if JOB_DEFAULT_OWNER_ID:
+                fields["OwnerId"] = JOB_DEFAULT_OWNER_ID
             resp = create_job_record(instance_url, access_token, job_object_name, fields)
             new_job_id = (resp.get("id") or "").strip()
             if not new_job_id:
