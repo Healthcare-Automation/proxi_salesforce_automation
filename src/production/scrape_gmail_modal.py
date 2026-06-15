@@ -2069,3 +2069,39 @@ def run_monthly_summary_once():
     """Run the monthly pulse once (same as scheduled ``monthly_summary_job``)."""
     ok = monthly_summary_job.remote()
     print(f"Done: monthly pulse email sent={ok}")
+
+
+@app.function(
+    image=_light_image,
+    secrets=[modal.Secret.from_name("salesforce-automation")],
+    timeout=60,
+)
+def dates_alert_sample_job():
+    """Send a [SAMPLE] low-confidence date-review alert (the email a real scrape
+    fires when AI resolves a job's active dates with < 100% confidence)."""
+    sys.path.insert(0, "/root")
+    import utils.alert_email as ae
+
+    _orig = ae._send
+    ae._send = lambda subject, html, text="", recipients=None: _orig(
+        f"[SAMPLE] {subject}", html, text, recipients=recipients
+    )
+    ok = ae.send_dates_review_alert(
+        "19796",
+        kimedics_url="https://portal.kimedics.com/app/workspace/job-posts/19796",
+        sf_job_id="a015f00000KxSFwAAN",
+        structured="June 1-2, 11-12, 15-19, 22",
+        resolved="June 1-2, 15-19, 22",
+        confidence=72,
+        reason=("Cancellation wording \"cancelled the need for June 11/12\" is slightly "
+                "ambiguous about whether both the 11th and 12th are removed."),
+    )
+    print(f"dates_alert_sample_job: sent={ok}")
+    return ok
+
+
+@app.local_entrypoint()
+def run_dates_alert_sample():
+    """Send the [SAMPLE] low-confidence date-review alert via Modal."""
+    ok = dates_alert_sample_job.remote()
+    print(f"Done: sample low-confidence dates alert sent={ok}")
