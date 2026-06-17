@@ -838,7 +838,7 @@ def send_weekly_summary(stats: dict) -> bool:
         days = hours / 24.0
         return f"{days:.1f} days"
 
-    subject = f"Proxi Weekly Pulse · {period} · {opened} opened, {closed} closed, {hrs_saved:g} hrs saved"
+    subject = f"Proxi Weekly Pulse · {period} · {emails:,} emails · {hrs_saved:g} hrs saved"
 
     # ── Top-line metrics, two rows: market outcomes + how well Proxi handled ─
     def _card_big(label, num, secondary):
@@ -871,12 +871,18 @@ def send_weekly_summary(stats: dict) -> bool:
         return f'<span class="muted" style="font-size:12px;color:#52525b;">{text}</span>'
 
     lat_txt = f"{latency:.1f} min" if latency is not None else "—"
+    # Hiring-velocity metrics replace the misleading opened/closed event counts (see
+    # send_impact_report): median time open + jobs that completed a full open→close
+    # lifecycle this week (distinct jobs, not status emails).
+    lc_week      = lifecycle.get("week", {}) or {}
+    med_open_w   = _pulse_fmt_dur(lc_week.get("median_hours"))
+    jobs_filled_w = int(lc_week.get("closed", 0))
     hero_row = f"""
     <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
       <tr>
         {_card_big("Emails received", f"{emails:,}", _delta_pill(_delta(emails, prv_emails)))}
-        {_card_big("Jobs opened",     f"{opened:,}", _delta_pill(_delta(opened, prv_open)))}
-        {_card_big("Jobs closed",     f"{closed:,}", _delta_pill(_delta(closed, prv_close)))}
+        {_card_big("Jobs filled",     f"{jobs_filled_w:,}", _sub("completed open → close"))}
+        {_card_big("Median time open", med_open_w, _sub("typical open → filled"))}
       </tr>
     </table>
     <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
@@ -947,33 +953,10 @@ def send_weekly_summary(stats: dict) -> bool:
                 f'style="width:100%;border-collapse:collapse;table-layout:fixed;">'
                 f'<tr>{"".join(bar_cells)}</tr><tr>{"".join(lbl_cells)}</tr></table>')
 
-    # ── Job flow this week (opened vs closed) ───────────────────────────────
-    if closed and opened >= closed * 1.25:
-        flow_msg = f"{round(opened / closed, 1)}× more jobs opened than closed — your open pipeline grew this week."
-    elif opened and closed and abs(opened - closed) <= 0.2 * max(opened, closed):
-        flow_msg = "Openings and closes ran roughly even this week."
-    elif closed and opened < closed:
-        flow_msg = "More jobs closed than opened — the open pipeline contracted this week."
-    else:
-        flow_msg = "Jobs came in faster than they were retired this week."
-    flow_bar = _pulse_seg_bar([(opened, "seg-open"), (closed, "seg-close")], (opened + closed) or 1, 14)
-    role_flow_html = f"""
-    <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-      <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Job flow this week</div>
-      <div style="margin:8px 0 12px;">
-        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{opened:,}</span>
-        <span class="muted" style="font-size:13px;color:#52525b;">opened</span>
-        &nbsp;&nbsp;<span class="dim" style="color:#a1a1aa;">vs</span>&nbsp;&nbsp;
-        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{closed:,}</span>
-        <span class="muted" style="font-size:13px;color:#52525b;">closed</span>
-      </div>
-      {flow_bar}
-      <div class="muted" style="font-size:13px;color:#52525b;margin-top:12px;line-height:1.5;">{flow_msg}</div>
-      <div style="margin-top:8px;font-size:11px;">
-        <span class="muted" style="color:#52525b;"><span class="seg-open" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Opened</span>
-        &nbsp;&nbsp;<span class="muted" style="color:#52525b;"><span class="seg-close" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Closed</span>
-      </div>
-    </div>"""
+    # Job-flow (opened-vs-closed) card removed — these are email status-EVENTS, not job
+    # state: opens are inflated by re-posts and closes are undercounted (jobs filled/expired
+    # send no "Closed" email), so the comparison misleads. Omitted from the report.
+    role_flow_html = ""
 
     # ── Flagged jobs to act on (only shown when something needs a human) ──────
     flags_html = ""
@@ -1502,9 +1485,10 @@ def _pulse_stacked(series_split, labels, bar_h=120, show_totals=True, label_keep
 
 
 def _pulse_line_chart(series, w=280, h=84):
-    """True red line chart as a rendered image (QuickChart / Chart.js). Renders
-    in the browser preview AND email clients including Gmail (which strip inline
-    SVG). Single red line, only the last point dotted; no axes/grid."""
+    """White line chart as a rendered image (QuickChart / Chart.js). Renders in the
+    browser preview AND email clients including Gmail (which strip inline SVG). Single
+    white line on the dark ROI card, only the last point dotted; no axes/grid.
+    (White, not red — the trend is a positive metric and red reads as negative.)"""
     import json, urllib.parse
     pts = [(l, v) for l, v in series if v is not None]
     if len(pts) < 2:
@@ -1516,10 +1500,10 @@ def _pulse_line_chart(series, w=280, h=84):
             "labels": [l for l, _ in pts],
             "datasets": [{
                 "data": data,
-                "borderColor": "#f87171",
+                "borderColor": "#ffffff",
                 "borderWidth": 2,
                 "pointRadius": [0] * (len(data) - 1) + [4],
-                "pointBackgroundColor": "#f87171",
+                "pointBackgroundColor": "#ffffff",
                 "fill": False,
                 "lineTension": 0.35,
             }],
@@ -1539,14 +1523,14 @@ def _pulse_line_chart(series, w=280, h=84):
 
 
 def _pulse_trend(series, caption=""):
-    """Red line chart for the ROI card: the last point's value floats top-right,
+    """White line chart for the ROI card: the last point's value floats top-right,
     and a caption underneath says what the line is (so it isn't mistaken for a
     cumulative/running total)."""
     img = _pulse_line_chart(series)
     if not img:
         return ""
     last = series[-1][1] or 0
-    label = (f'<div style="font-size:12px;line-height:14px;color:#f87171;font-weight:700;'
+    label = (f'<div style="font-size:12px;line-height:14px;color:#ffffff;font-weight:700;'
              f'text-align:right;font-variant-numeric:tabular-nums;margin-bottom:4px;">{last:g} hrs</div>')
     cap = (f'<div style="font-size:10px;color:#71717a;text-align:right;margin-top:5px;'
            f'text-transform:uppercase;letter-spacing:.04em;">{caption}</div>') if caption else ""
@@ -1588,7 +1572,7 @@ def _pulse_us_map(top_states, states_total, caption):
                 continue
             c = state_counts.get(code, 0)
             lvl = _lvl(c)
-            title = f"{code}: {c} email{'' if c == 1 else 's'}"
+            title = f"{code}: {c} job{'' if c == 1 else 's'}"
             if c > 0:
                 inner = (f'<div class="map-tile lvl{lvl}" style="height:{cell}px;border-radius:4px;text-align:center;overflow:hidden;">'
                          f'<div class="map-ab" style="font-size:8px;line-height:11px;font-weight:700;letter-spacing:.02em;padding-top:4px;">{code}</div>'
@@ -1598,11 +1582,14 @@ def _pulse_us_map(top_states, states_total, caption):
                          f'text-align:center;font-size:9px;font-weight:700;letter-spacing:.02em;">{code}</div>')
             cells.append(f'<td class="map-cell" title="{title}" style="width:{cell}px;height:{cell}px;padding:2px;">{inner}</td>')
         rows_html.append(f"<tr>{''.join(cells)}</tr>")
+    # Shading is RELATIVE to the busiest state (count ÷ top-state count), not a share of the
+    # national total — so the labels read as a fewer→more gradient, not as percentages that
+    # invite "but no state is 76% of all jobs" confusion.
     legend = "".join(
         f'<td style="padding:0 6px;font-size:10px;vertical-align:middle;">'
         f'<span class="{cls}" style="display:inline-block;width:12px;height:12px;border-radius:2px;vertical-align:middle;margin-right:4px;"></span>'
         f'<span class="dim" style="color:#71717a;">{label}</span></td>'
-        for cls, label in [("lvl0", "0"), ("lvl1", "1–25%"), ("lvl2", "26–50%"), ("lvl3", "51–75%"), ("lvl4", "76–100%")]
+        for cls, label in [("lvl0", "none"), ("lvl1", "fewer"), ("lvl2", ""), ("lvl3", ""), ("lvl4", "more")]
     )
     return f"""
     <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
@@ -1611,6 +1598,7 @@ def _pulse_us_map(top_states, states_total, caption):
       <div class="muted" style="font-size:13px;color:#52525b;margin-bottom:14px;">{caption}</div>
       <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:0 auto;table-layout:fixed;">{''.join(rows_html)}</table>
       <table role="presentation" cellpadding="0" cellspacing="0" style="margin:14px auto 0;border-collapse:collapse;"><tr>{legend}</tr></table>
+      <div class="muted" style="font-size:11px;color:#a1a1aa;text-align:center;margin-top:8px;line-height:1.5;">Darker = more jobs, shaded relative to the busiest state.</div>
     </div>"""
 
 
@@ -1684,17 +1672,22 @@ def send_monthly_summary(stats: dict) -> bool:
     coverage_pct = round(cap_pass / emails * 100) if emails else 100
     MoM = "MoM"
 
-    subject = f"Proxi Monthly Pulse · {period} · {opened} opened, {closed} closed, {hrs_saved:g} hrs saved"
+    subject = f"Proxi Monthly Pulse · {period} · {emails:,} emails · {hrs_saved:g} hrs saved"
 
     lat_txt = f"{latency:.1f} min" if latency is not None else "—"
 
-    # Overview metrics — the same headline set as the weekly, monthly totals + MoM.
+    # Hiring-velocity metrics replace the misleading opened/closed event counts (see
+    # send_impact_report): median time a job stays open + jobs that completed a full
+    # open→close lifecycle this month (distinct jobs, not status emails).
+    lc_month     = lifecycle.get("week", {}) or {}
+    med_open_m   = _pulse_fmt_dur(lc_month.get("median_hours"))
+    jobs_filled_m = int(lc_month.get("closed", 0))
     hero_row = f"""
     <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
       <tr>
         {_pulse_card_big("Emails received", f"{emails:,}", _pulse_delta_pill(_pulse_delta(emails, prv_emails), MoM))}
-        {_pulse_card_big("Jobs opened",     f"{opened:,}", _pulse_delta_pill(_pulse_delta(opened, prv_open), MoM))}
-        {_pulse_card_big("Jobs closed",     f"{closed:,}", _pulse_delta_pill(_pulse_delta(closed, prv_close), MoM))}
+        {_pulse_card_big("Jobs filled",     f"{jobs_filled_m:,}", _pulse_sub("completed open → close"))}
+        {_pulse_card_big("Median time open", med_open_m, _pulse_sub("typical open → filled"))}
       </tr>
     </table>
     <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
@@ -1741,33 +1734,9 @@ def send_monthly_summary(stats: dict) -> bool:
           {_pulse_hist(list(monthly_trend), bar_h=84)}
         </div>"""
 
-    # ── Job flow — opened vs closed, with a plain-English read ──────────────
-    if closed and opened >= closed * 1.25:
-        flow_msg = f"Roughly {round(opened / closed, 1)}× more jobs opened than closed — the active pipeline grew this month."
-    elif opened and closed and abs(opened - closed) <= 0.2 * max(opened, closed):
-        flow_msg = "Openings and closes ran roughly even — a steady pipeline this month."
-    elif closed and opened < closed:
-        flow_msg = "More jobs closed than opened — the open pipeline contracted this month."
-    else:
-        flow_msg = "Jobs flowed in faster than they were retired this month."
-    flow_bar = _pulse_seg_bar([(opened, "seg-open"), (closed, "seg-close")], (opened + closed) or 1, 14)
-    role_flow_html = f"""
-    <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-      <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Job flow</div>
-      <div style="margin:8px 0 12px;">
-        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{opened:,}</span>
-        <span class="muted" style="font-size:13px;color:#52525b;">opened</span>
-        &nbsp;&nbsp;<span class="dim" style="color:#a1a1aa;">vs</span>&nbsp;&nbsp;
-        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{closed:,}</span>
-        <span class="muted" style="font-size:13px;color:#52525b;">closed</span>
-      </div>
-      {flow_bar}
-      <div class="muted" style="font-size:13px;color:#52525b;margin-top:12px;line-height:1.5;">{flow_msg}</div>
-      <div style="margin-top:8px;font-size:11px;">
-        <span class="muted" style="color:#52525b;"><span class="seg-open" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Opened</span>
-        &nbsp;&nbsp;<span class="muted" style="color:#52525b;"><span class="seg-close" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Closed</span>
-      </div>
-    </div>"""
+    # Job-flow (opened-vs-closed) card removed — see send_weekly_summary: these are email
+    # status-EVENTS, not job state (inflated opens, undercounted closes), so omitted.
+    role_flow_html = ""
 
     # When work happens: weekday + hour totals (plain bars, no open/update/close split).
     cadence_html = ""
@@ -2016,7 +1985,8 @@ def _impact_djc_section(djc=None):
     </div>"""
 
 
-def send_impact_report(stats: dict, djc: dict | None = None) -> bool:
+def send_impact_report(stats: dict, djc: dict | None = None,
+                       recipients: Optional[Sequence[str]] = None) -> bool:
     """
     One-time, all-time impact report for the client — the full record of what the
     Kimedics → Salesforce automation has done since launch. Every figure is taken
@@ -2069,26 +2039,15 @@ def send_impact_report(stats: dict, djc: dict | None = None) -> bool:
             launch_disp = launch
 
     lat_txt = f"{latency:.1f} min" if latency is not None else "—"
-    djc_cand = int((djc or {}).get("candidates", 0))
-    djc_tail = f" · DJC pilot: {djc_cand:,} candidates scraped" if djc_cand else ""
-    subject = (f"Proxi · Automation Impact Report · Kimedics: {hrs_saved:g} hrs saved, "
-               f"{emails:,} emails{djc_tail}")
+    subject = f"Proxi · Kimedics → Salesforce Impact Report · {hrs_saved:g} hrs saved, {emails:,} emails"
 
-    intro = f"""
-    <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-      <div class="text" style="font-size:15px;line-height:1.65;color:#27272a;">
-        Proxi runs two automations against your Salesforce org. The <strong>Kimedics → Salesforce</strong>
-        job sync has been live since <strong>{launch_disp or launch}</strong>; the
-        <strong>Dentist Job Cafe → Salesforce</strong> candidate pipeline is in active development.
-        Here's where each stands.
-      </div>
-    </div>"""
     kimedics_header = _pulse_section_header("Kimedics → Salesforce", "Live", "live")
-    djc_header      = _pulse_section_header("Dentist Job Cafe → Salesforce", "Dry-run pilot", "build")
-    djc_section     = _impact_djc_section(djc)
 
     # ── ROI centerpiece — the headline: hours of manual work returned ────────
-    spark = _pulse_trend(hours_trend, "hrs saved / month")
+    # All-time recouped line chart intentionally omitted — the per-month trend on the
+    # whole-history report blurred with the single all-time total and added noise. The
+    # weekly/monthly reports still show the trend; here we show just the headline number.
+    spark = ""
     spark_cell = (f'<td class="spark-cell" style="vertical-align:bottom;width:38%;padding-left:20px;">{spark}</td>'
                   if spark else "")
     roi_html = f"""
@@ -2108,20 +2067,25 @@ def send_impact_report(stats: dict, djc: dict | None = None) -> bool:
     </div>"""
 
     # ── What the automation processed — the measured volume ──────────────────
+    # Hiring-velocity metrics that replace the misleading opened/closed event counts:
+    # median time a job stays open, and the count of jobs that completed a full open→close
+    # lifecycle (distinct jobs, not status emails).
+    med_open    = _pulse_fmt_dur(lc_all.get("median_hours"))
+    jobs_filled = int(lc_all.get("closed_total", 0))
     hero_big = f"""
     <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:10px;">
       <tr>
         {_pulse_card_big("Emails processed",     f"{emails:,}",  _pulse_sub("every Kimedics job email"))}
-        {_pulse_card_big("Jobs opened",          f"{opened:,}",  _pulse_sub("new postings synced to SF"))}
         {_pulse_card_big("Salesforce updates",   f"{patches:,}", _pulse_sub("fields written automatically"))}
+        {_pulse_card_big("Jobs filled",          f"{jobs_filled:,}", _pulse_sub("completed open → close"))}
       </tr>
     </table>"""
     hero_a = f"""
     <table role="presentation" cellpadding="0" cellspacing="8" class="hero-stack" style="width:100%;border-collapse:separate;margin-top:8px;">
       <tr>
-        {_pulse_card_sm("Jobs updated",   f"{updated:,}", _pulse_sub("change syncs pushed"))}
-        {_pulse_card_sm("Jobs closed",    f"{closed:,}",  _pulse_sub("lifecycles completed"))}
-        {_pulse_card_sm("Capture rate",   cov_str,        _pulse_sub(f"{cap_pass:,} of {emails:,} captured"))}
+        {_pulse_card_sm("Median time open", med_open,    _pulse_sub("typical open → filled"))}
+        {_pulse_card_sm("Jobs updated",     f"{updated:,}", _pulse_sub("change syncs pushed"))}
+        {_pulse_card_sm("Capture rate",     cov_str,        _pulse_sub(f"{cap_pass:,} of {emails:,} captured"))}
       </tr>
     </table>"""
     hero_b = f"""
@@ -2155,32 +2119,8 @@ def send_impact_report(stats: dict, djc: dict | None = None) -> bool:
         </div>"""
 
     # ── Job flow — opened vs closed across the whole history ──────────────────
-    if closed and opened >= closed * 1.25:
-        flow_msg = f"Roughly {round(opened / closed, 1)}× more jobs opened than closed — the active pipeline has grown since launch."
-    elif opened and closed and abs(opened - closed) <= 0.2 * max(opened, closed):
-        flow_msg = "Openings and closes have run roughly even — a steady pipeline since launch."
-    elif closed and opened < closed:
-        flow_msg = "More jobs closed than opened — the open pipeline has contracted since launch."
-    else:
-        flow_msg = "Jobs have flowed in faster than they were retired."
-    flow_bar = _pulse_seg_bar([(opened, "seg-open"), (closed, "seg-close")], (opened + closed) or 1, 14)
-    flow_html = f"""
-    <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-      <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Job flow · since launch</div>
-      <div style="margin:8px 0 12px;">
-        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{opened:,}</span>
-        <span class="muted" style="font-size:13px;color:#52525b;">opened</span>
-        &nbsp;&nbsp;<span class="dim" style="color:#a1a1aa;">vs</span>&nbsp;&nbsp;
-        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{closed:,}</span>
-        <span class="muted" style="font-size:13px;color:#52525b;">closed</span>
-      </div>
-      {flow_bar}
-      <div class="muted" style="font-size:13px;color:#52525b;margin-top:12px;line-height:1.5;">{flow_msg}</div>
-      <div style="margin-top:8px;font-size:11px;">
-        <span class="muted" style="color:#52525b;"><span class="seg-open" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Opened</span>
-        &nbsp;&nbsp;<span class="muted" style="color:#52525b;"><span class="seg-close" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Closed</span>
-      </div>
-    </div>"""
+    # Open/closed flow card removed — event counts, not job state (see send_weekly_summary).
+    flow_html = ""
 
     # ── Hiring velocity — how long jobs stayed open (all-time) ────────────────
     lifecycle_html = ""
@@ -2211,66 +2151,33 @@ def send_impact_report(stats: dict, djc: dict | None = None) -> bool:
           <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin-top:14px;">{rows}</table>
         </div>"""
 
-    map_html = _pulse_us_map(top_states, states_total, "Every job email by state since launch.")
+    map_html = _pulse_us_map(top_states, states_total, "Every job by state since launch.")
 
-    # ── Methodology — so every number is auditable ───────────────────────────
-    mo = int(model.get("min_per_open", 8))
-    mt = float(model.get("min_per_other", 1.5))
-    sw = int(model.get("min_per_switch", 2))
-    method_html = f"""
-    <div class="muted" style="margin:18px 0 0;padding:16px 4px 0;border-top:1px solid #e4e4e7;font-size:11px;color:#71717a;line-height:1.7;">
-      <span style="font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#52525b;">How these numbers are measured</span><br>
-      Volume, capture rate, sync time, hiring velocity, and footprint are counted directly from the
-      automation's sync logs over {period}. Hours saved is the one estimate: {mo} min of manual entry
-      per job opened, {mt:g} min per update or close, plus {sw} min of context-switching per email —
-      applied to the {emails:,} emails actually processed. Sync time is the mean email→Salesforce delay
-      with statistical outliers removed.
-    </div>"""
-
-    body_inner = (intro
-                  + kimedics_header + roi_html + hero_row + monthly_trend_html
-                  + flow_html + lifecycle_html + map_html
-                  + djc_header + djc_section
-                  + method_html)
-    body_html = _pulse_doc("Proxi · Automation impact report", period, body_inner,
-                           "Proxi Automation Impact Report")
+    body_inner = (kimedics_header + roi_html + hero_row + monthly_trend_html
+                  + flow_html + lifecycle_html + map_html)
+    body_html = _pulse_doc("Proxi · Kimedics impact report", period, body_inner,
+                           "Proxi · Kimedics Impact Report")
 
     text = textwrap.dedent(f"""
-    Proxi — Automation Impact Report
+    Proxi — Kimedics → Salesforce Impact Report
     {period}
     ============================================
-
-    1) KIMEDICS -> SALESFORCE   [LIVE]
-    Since launch ({launch_disp or launch}), {days_live} days live.
+    Live since launch ({launch_disp or launch}), {days_live} days live.
 
     Manual time recouped : {hrs_saved:g} hrs (estimated)
     Emails processed     : {emails}
-    Jobs opened          : {opened}
+    Jobs filled          : {int(lc_all.get("closed_total", 0))} (completed open -> close)
+    Median time open     : {_pulse_fmt_dur(lc_all.get("median_hours"))}
     Jobs updated         : {updated}
-    Jobs closed          : {closed}
     Salesforce updates   : {patches} fields
     Capture rate         : {cov_str} ({cap_pass} of {emails} captured)
     Avg sync time        : {lat_txt} (email -> Salesforce)
     States active        : {states_total}
-    Median time open     : {_pulse_fmt_dur(lc_all.get("median_hours"))} across {int(lc_all.get("closed_total", 0))} closed jobs
 
-    2) DENTIST JOB CAFE -> SALESFORCE   [DRY-RUN PILOT]
-    Running daily in read-only mode (no Salesforce writes yet).
-    Candidates scraped   : {int((djc or {}).get('candidates', 0))}
-    Resumes parsed       : {int((djc or {}).get('cvs_parsed', 0))}
-    Already in Salesforce: {int((djc or {}).get('already_in_sf', 0))} (deduped, skipped)
-    Uncontactable        : {int((djc or {}).get('uncontactable', 0))} (skipped)
-    Net-new for SF       : {int((djc or {}).get('net_new', 0))} (ready to create)
-    States covered       : {int((djc or {}).get('states', 0))}
-
-    SF coverage (active-on-DJC, last {int(((djc or {}).get('coverage') or {}).get('window_days', 7))} days):
-      {int(((djc or {}).get('coverage') or {}).get('covered', 0))} of {int(((djc or {}).get('coverage') or {}).get('population', 0))} covered = {int(((djc or {}).get('coverage') or {}).get('pct', 0))}% ({int(((djc or {}).get('coverage') or {}).get('was_pct', 0))}% -> {int(((djc or {}).get('coverage') or {}).get('pct', 0))}%; viewed-collision fix confirmed live in production).
-      Remaining {int(((djc or {}).get('coverage') or {}).get('ceiling', 0))} are a by-design ceiling (real DJC activity >7 days old; manual Active_on_DJC date). 91% = effectively full coverage of the designed population.
-
-    Proxi · Kimedics & DJC -> Salesforce automations
+    Proxi · Kimedics -> Salesforce automation
     """).strip()
 
-    return _send(subject, body_html, text)
+    return _send(subject, body_html, text, recipients=recipients)
 
 
 # ── Low-confidence date resolution review alert ──────────────────────────────────────
