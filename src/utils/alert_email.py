@@ -2153,23 +2153,8 @@ def send_impact_report(stats: dict, djc: dict | None = None,
 
     map_html = _pulse_us_map(top_states, states_total, "Every job by state since launch.")
 
-    # ── Methodology — so every number is auditable ───────────────────────────
-    mo = int(model.get("min_per_open", 8))
-    mt = float(model.get("min_per_other", 1.5))
-    sw = int(model.get("min_per_switch", 2))
-    method_html = f"""
-    <div class="muted" style="margin:18px 0 0;padding:16px 4px 0;border-top:1px solid #e4e4e7;font-size:11px;color:#71717a;line-height:1.7;">
-      <span style="font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#52525b;">How these numbers are measured</span><br>
-      Volume, capture rate, sync time, hiring velocity, and footprint are counted directly from the
-      automation's sync logs over {period}. Hours saved is the one estimate: {mo} min of manual entry
-      per job opened, {mt:g} min per update or close, plus {sw} min of context-switching per email —
-      applied to the {emails:,} emails actually processed. Sync time is the mean email→Salesforce delay
-      with statistical outliers removed.
-    </div>"""
-
     body_inner = (kimedics_header + roi_html + hero_row + monthly_trend_html
-                  + flow_html + lifecycle_html + map_html
-                  + method_html)
+                  + flow_html + lifecycle_html + map_html)
     body_html = _pulse_doc("Proxi · Kimedics impact report", period, body_inner,
                            "Proxi · Kimedics Impact Report")
 
