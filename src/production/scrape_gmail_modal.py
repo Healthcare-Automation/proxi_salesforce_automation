@@ -2074,6 +2074,35 @@ def run_monthly_summary_once():
 @app.function(
     image=_light_image,
     secrets=[modal.Secret.from_name("salesforce-automation")],
+    timeout=180,
+)
+def impact_report_job(recipients_csv: str = "") -> bool:
+    """Build + send the all-time impact report (launch → today). On-demand only — no
+    schedule. ``recipients_csv`` overrides the default distribution (used to send a
+    review-only copy); empty = the standard ALERT_RECIPIENTS list."""
+    sys.path.insert(0, "/root")
+    from utils.supabase_db import get_conn
+    from utils.alert_email import send_impact_report
+
+    recips = [r.strip() for r in recipients_csv.split(",") if r.strip()] or None
+    print("impact_report_job: starting...")
+    stats = _build_impact_stats(get_conn)
+    ok = send_impact_report(stats, djc=None, recipients=recips)
+    print(f"impact_report_job: email sent={ok}, emails={stats.get('current', {}).get('emails_received')}")
+    return ok
+
+
+@app.local_entrypoint()
+def run_impact_report_once(to: str = "anddy0622@gmail.com"):
+    """Generate + send the all-time impact report. Defaults to a REVIEW-ONLY copy to
+    one address; pass --to '' to send to the full distribution, or a comma list."""
+    ok = impact_report_job.remote(to)
+    print(f"Done: impact report sent={ok} to={to or 'default list'}")
+
+
+@app.function(
+    image=_light_image,
+    secrets=[modal.Secret.from_name("salesforce-automation")],
     timeout=60,
 )
 def dates_alert_sample_job():
