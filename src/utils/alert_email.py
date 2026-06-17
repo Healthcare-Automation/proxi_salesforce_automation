@@ -2039,23 +2039,17 @@ def send_impact_report(stats: dict, djc: dict | None = None,
             launch_disp = launch
 
     lat_txt = f"{latency:.1f} min" if latency is not None else "—"
-    djc_cand = int((djc or {}).get("candidates", 0))
-    djc_tail = f" · DJC pilot: {djc_cand:,} candidates scraped" if djc_cand else ""
-    subject = (f"Proxi · Automation Impact Report · Kimedics: {hrs_saved:g} hrs saved, "
-               f"{emails:,} emails{djc_tail}")
+    subject = f"Proxi · Kimedics → Salesforce Impact Report · {hrs_saved:g} hrs saved, {emails:,} emails"
 
     intro = f"""
     <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
       <div class="text" style="font-size:15px;line-height:1.65;color:#27272a;">
-        Proxi runs two automations against your Salesforce org. The <strong>Kimedics → Salesforce</strong>
-        job sync has been live since <strong>{launch_disp or launch}</strong>; the
-        <strong>Dentist Job Cafe → Salesforce</strong> candidate pipeline is in active development.
-        Here's where each stands.
+        The <strong>Kimedics → Salesforce</strong> job sync has run automatically since
+        <strong>{launch_disp or launch}</strong> — reading every Kimedics job email and keeping
+        the matching Salesforce records in sync, with no manual data entry. Here's the full record.
       </div>
     </div>"""
     kimedics_header = _pulse_section_header("Kimedics → Salesforce", "Live", "live")
-    djc_header      = _pulse_section_header("Dentist Job Cafe → Salesforce", "Dry-run pilot", "build")
-    djc_section     = _impact_djc_section(djc)
 
     # ── ROI centerpiece — the headline: hours of manual work returned ────────
     # All-time recouped line chart intentionally omitted — the per-month trend on the
@@ -2133,32 +2127,8 @@ def send_impact_report(stats: dict, djc: dict | None = None,
         </div>"""
 
     # ── Job flow — opened vs closed across the whole history ──────────────────
-    if closed and opened >= closed * 1.25:
-        flow_msg = f"Roughly {round(opened / closed, 1)}× more jobs opened than closed — the active pipeline has grown since launch."
-    elif opened and closed and abs(opened - closed) <= 0.2 * max(opened, closed):
-        flow_msg = "Openings and closes have run roughly even — a steady pipeline since launch."
-    elif closed and opened < closed:
-        flow_msg = "More jobs closed than opened — the open pipeline has contracted since launch."
-    else:
-        flow_msg = "Jobs have flowed in faster than they were retired."
-    flow_bar = _pulse_seg_bar([(opened, "seg-open"), (closed, "seg-close")], (opened + closed) or 1, 14)
-    flow_html = f"""
-    <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-      <div class="dim" style="font-size:11px;color:#71717a;font-weight:600;text-transform:uppercase;letter-spacing:.06em;">Job flow · since launch</div>
-      <div style="margin:8px 0 12px;">
-        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{opened:,}</span>
-        <span class="muted" style="font-size:13px;color:#52525b;">opened</span>
-        &nbsp;&nbsp;<span class="dim" style="color:#a1a1aa;">vs</span>&nbsp;&nbsp;
-        <span class="num" style="font-size:26px;font-weight:700;color:#18181b;letter-spacing:-0.02em;">{closed:,}</span>
-        <span class="muted" style="font-size:13px;color:#52525b;">closed</span>
-      </div>
-      {flow_bar}
-      <div class="muted" style="font-size:13px;color:#52525b;margin-top:12px;line-height:1.5;">{flow_msg}</div>
-      <div style="margin-top:8px;font-size:11px;">
-        <span class="muted" style="color:#52525b;"><span class="seg-open" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Opened</span>
-        &nbsp;&nbsp;<span class="muted" style="color:#52525b;"><span class="seg-close" style="display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px;"></span>Closed</span>
-      </div>
-    </div>"""
+    # Open/closed flow card removed — event counts, not job state (see send_weekly_summary).
+    flow_html = ""
 
     # ── Hiring velocity — how long jobs stayed open (all-time) ────────────────
     lifecycle_html = ""
@@ -2189,7 +2159,7 @@ def send_impact_report(stats: dict, djc: dict | None = None,
           <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin-top:14px;">{rows}</table>
         </div>"""
 
-    map_html = _pulse_us_map(top_states, states_total, "Every job email by state since launch.")
+    map_html = _pulse_us_map(top_states, states_total, "Every job by state since launch.")
 
     # ── Methodology — so every number is auditable ───────────────────────────
     mo = int(model.get("min_per_open", 8))
@@ -2208,44 +2178,27 @@ def send_impact_report(stats: dict, djc: dict | None = None,
     body_inner = (intro
                   + kimedics_header + roi_html + hero_row + monthly_trend_html
                   + flow_html + lifecycle_html + map_html
-                  + djc_header + djc_section
                   + method_html)
-    body_html = _pulse_doc("Proxi · Automation impact report", period, body_inner,
-                           "Proxi Automation Impact Report")
+    body_html = _pulse_doc("Proxi · Kimedics impact report", period, body_inner,
+                           "Proxi · Kimedics Impact Report")
 
     text = textwrap.dedent(f"""
-    Proxi — Automation Impact Report
+    Proxi — Kimedics → Salesforce Impact Report
     {period}
     ============================================
-
-    1) KIMEDICS -> SALESFORCE   [LIVE]
-    Since launch ({launch_disp or launch}), {days_live} days live.
+    Live since launch ({launch_disp or launch}), {days_live} days live.
 
     Manual time recouped : {hrs_saved:g} hrs (estimated)
     Emails processed     : {emails}
-    Jobs opened          : {opened}
+    Jobs filled          : {int(lc_all.get("closed_total", 0))} (completed open -> close)
+    Median time open     : {_pulse_fmt_dur(lc_all.get("median_hours"))}
     Jobs updated         : {updated}
-    Jobs closed          : {closed}
     Salesforce updates   : {patches} fields
     Capture rate         : {cov_str} ({cap_pass} of {emails} captured)
     Avg sync time        : {lat_txt} (email -> Salesforce)
     States active        : {states_total}
-    Median time open     : {_pulse_fmt_dur(lc_all.get("median_hours"))} across {int(lc_all.get("closed_total", 0))} closed jobs
 
-    2) DENTIST JOB CAFE -> SALESFORCE   [DRY-RUN PILOT]
-    Running daily in read-only mode (no Salesforce writes yet).
-    Candidates scraped   : {int((djc or {}).get('candidates', 0))}
-    Resumes parsed       : {int((djc or {}).get('cvs_parsed', 0))}
-    Already in Salesforce: {int((djc or {}).get('already_in_sf', 0))} (deduped, skipped)
-    Uncontactable        : {int((djc or {}).get('uncontactable', 0))} (skipped)
-    Net-new for SF       : {int((djc or {}).get('net_new', 0))} (ready to create)
-    States covered       : {int((djc or {}).get('states', 0))}
-
-    SF coverage (active-on-DJC, last {int(((djc or {}).get('coverage') or {}).get('window_days', 7))} days):
-      {int(((djc or {}).get('coverage') or {}).get('covered', 0))} of {int(((djc or {}).get('coverage') or {}).get('population', 0))} covered = {int(((djc or {}).get('coverage') or {}).get('pct', 0))}% ({int(((djc or {}).get('coverage') or {}).get('was_pct', 0))}% -> {int(((djc or {}).get('coverage') or {}).get('pct', 0))}%; viewed-collision fix confirmed live in production).
-      Remaining {int(((djc or {}).get('coverage') or {}).get('ceiling', 0))} are a by-design ceiling (real DJC activity >7 days old; manual Active_on_DJC date). 91% = effectively full coverage of the designed population.
-
-    Proxi · Kimedics & DJC -> Salesforce automations
+    Proxi · Kimedics -> Salesforce automation
     """).strip()
 
     return _send(subject, body_html, text, recipients=recipients)
