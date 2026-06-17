@@ -2041,14 +2041,6 @@ def send_impact_report(stats: dict, djc: dict | None = None,
     lat_txt = f"{latency:.1f} min" if latency is not None else "—"
     subject = f"Proxi · Kimedics → Salesforce Impact Report · {hrs_saved:g} hrs saved, {emails:,} emails"
 
-    intro = f"""
-    <div class="card" style="margin:18px 0 0;padding:20px 22px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
-      <div class="text" style="font-size:15px;line-height:1.65;color:#27272a;">
-        The <strong>Kimedics → Salesforce</strong> job sync has run automatically since
-        <strong>{launch_disp or launch}</strong> — reading every Kimedics job email and keeping
-        the matching Salesforce records in sync, with no manual data entry. Here's the full record.
-      </div>
-    </div>"""
     kimedics_header = _pulse_section_header("Kimedics → Salesforce", "Live", "live")
 
     # ── ROI centerpiece — the headline: hours of manual work returned ────────
@@ -2175,8 +2167,7 @@ def send_impact_report(stats: dict, djc: dict | None = None,
       with statistical outliers removed.
     </div>"""
 
-    body_inner = (intro
-                  + kimedics_header + roi_html + hero_row + monthly_trend_html
+    body_inner = (kimedics_header + roi_html + hero_row + monthly_trend_html
                   + flow_html + lifecycle_html + map_html
                   + method_html)
     body_html = _pulse_doc("Proxi · Kimedics impact report", period, body_inner,
