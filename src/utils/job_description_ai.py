@@ -67,6 +67,82 @@ def _norm_for_match(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
+## Field hints for the AI extraction safety-net. Keys are job_content fields.
+_DESC_FIELD_HINTS = {
+    "dates_needed": "coverage/assignment dates, e.g. 'July 20-22, 28-29'",
+    "standard_schedule": "daily hours / shift schedule, e.g. '8a-5p 1 hr unpaid lunch'",
+    "required_procedures": "required clinical procedures",
+    "support_staff": "clinical / support staff, e.g. '1 HYG, 3 DAs'",
+    "additional_requirements": "additional requirements / info",
+    "avg_patients_per_day": "average patients per day",
+}
+
+
+def ai_extract_description_fields(
+    description_full_text: str,
+    needed_fields,
+    *,
+    model: Optional[str] = None,
+    timeout_s: float = 15.0,
+) -> dict:
+    """Recover specific description fields the deterministic parser missed — for
+    posts with human formatting errors (a label with no colon like "Dates July
+    20-22", a misspelled label, a stray comma). Returns {field: value} only for
+    values found VERBATIM in the text (anti-hallucination); a field genuinely
+    absent is omitted. Raises when the AI can't run so the caller keeps the regex
+    result. Token-frugal: only the requested fields are asked for, and callers
+    gate this so well-formed posts never reach here."""
+    import json
+
+    fields = [f for f in (needed_fields or []) if f in _DESC_FIELD_HINTS]
+    desc = (description_full_text or "").strip()
+    if not fields or not desc:
+        return {}
+
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    try:
+        from openai import OpenAI
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("openai package is required") from e
+
+    target_model = (model or os.environ.get("PROXI_OPENAI_MODEL") or "gpt-4.1-mini").strip()
+    field_lines = "\n".join(f"- {f}: {_DESC_FIELD_HINTS[f]}" for f in fields)
+    prompt = f"""Extract these fields from a dental staffing job description. The text may contain human formatting errors (a label with a missing colon, a misspelled label, a missing comma) — read past them. Return each field's value EXACTLY as written in the text (verbatim, no rephrasing), or "" if it is genuinely not present. Never invent.
+
+Fields:
+{field_lines}
+
+Description:
+<<<
+{desc}
+>>>
+
+Return STRICT JSON with exactly these keys: {json.dumps(fields)}.""".strip()
+
+    client = OpenAI(api_key=api_key, timeout=timeout_s)
+    resp = client.responses.create(
+        model=target_model,
+        temperature=0,
+        input=[{"role": "user", "content": prompt}],
+    )
+    t = (resp.output_text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", t).strip()
+    obj = json.loads(t)
+    if not isinstance(obj, dict):
+        raise ValueError("AI field extraction: JSON is not an object")
+    hay = _norm_for_match(desc)
+    out: dict = {}
+    for f in fields:
+        v = str(obj.get(f) or "").strip()
+        # Trust only values that actually appear in the post (verbatim, normalized).
+        if v and _norm_for_match(v) in hay:
+            out[f] = v
+    return out
+
+
 def _validate_ai_dates(
     raw_text: str, description_full_text: str, structured_dates: str = ""
 ) -> DateResolution:

@@ -410,6 +410,26 @@ def _fill_from_description_blocks(out: dict) -> None:
         if block:
             out["dates_needed"] = block
 
+    # AI safety-net: when the deterministic parser missed a structured field — a
+    # label with a missing colon ("Dates July 20-22"), a misspelling, etc. — recover
+    # it from the text. Gated on the two structured Salesforce fields (dates +
+    # schedule), so well-formed posts (the 99%) never make an AI call. Only fills
+    # fields that are still empty and only with values found verbatim in the post.
+    _ai_desc_fields = (
+        "dates_needed", "standard_schedule", "required_procedures",
+        "support_staff", "additional_requirements", "avg_patients_per_day",
+    )
+    if not (out.get("dates_needed") or "").strip() or not (out.get("standard_schedule") or "").strip():
+        try:
+            from utils.job_description_ai import ai_extract_description_fields
+
+            _needed = [f for f in _ai_desc_fields if not (out.get(f) or "").strip()]
+            for _f, _v in ai_extract_description_fields(desc, _needed).items():
+                if _v and not (out.get(_f) or "").strip():
+                    out[_f] = _v
+        except Exception:
+            pass  # AI unavailable / error → keep the deterministic result
+
     # Resolve any top-line override / cancellation against the structured dates,
     # now that the full "Dates:" list has been parsed (so a cancellation can be
     # subtracted from it). Override/active-need cases replace it outright. Record
