@@ -2165,3 +2165,39 @@ def run_dates_alert_sample():
     """Send the [SAMPLE] low-confidence date-review alert via Modal."""
     ok = dates_alert_sample_job.remote()
     print(f"Done: sample low-confidence dates alert sent={ok}")
+
+
+@app.function(
+    image=_light_image,
+    secrets=[modal.Secret.from_name("salesforce-automation")],
+    timeout=60,
+)
+def dates_missing_sample_job(to: str = "anddy0622@gmail.com"):
+    """Send a [SAMPLE] 'no coverage dates captured' alert (the email a real scrape
+    fires when an open job yields no dates) to a single recipient."""
+    sys.path.insert(0, "/root")
+    import utils.alert_email as ae
+
+    _orig = ae._send
+    ae._send = lambda subject, html, text="", recipients=None: _orig(
+        f"[SAMPLE] {subject}", html, text, recipients=[to]
+    )
+    ok = ae.send_dates_review_alert(
+        "19586",
+        kind="missing",
+        kimedics_url="https://portal.kimedics.com/app/workspace/job-posts/19586",
+        sf_job_id="a015f00000KxSFwAAN",
+        structured="Other job post notes: April 7",
+        resolved="",
+        confidence=0,
+        reason="No 'Dates' line or recognizable coverage dates were found in the post.",
+    )
+    print(f"dates_missing_sample_job: sent={ok} -> {to}")
+    return ok
+
+
+@app.local_entrypoint()
+def run_dates_missing_sample(to: str = "anddy0622@gmail.com"):
+    """Send the [SAMPLE] 'no dates captured' alert via Modal to a single recipient."""
+    ok = dates_missing_sample_job.remote(to)
+    print(f"Done: sample missing-dates alert sent={ok} -> {to}")
