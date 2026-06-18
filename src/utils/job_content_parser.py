@@ -424,9 +424,17 @@ def _fill_from_description_blocks(out: dict) -> None:
             from utils.job_description_ai import ai_extract_description_fields
 
             _needed = [f for f in _ai_desc_fields if not (out.get(f) or "").strip()]
-            for _f, _v in ai_extract_description_fields(desc, _needed).items():
+            _ext = ai_extract_description_fields(desc, _needed)
+            _recovered_dates = "dates_needed" in _ext.fields and not (out.get("dates_needed") or "").strip()
+            for _f, _v in _ext.fields.items():
                 if _v and not (out.get(_f) or "").strip():
                     out[_f] = _v
+            # Recovered dates but not fully certain they're the coverage dates (vs a
+            # stray date in notes) → flag for human review via the existing alert.
+            if _recovered_dates and _ext.dates_confidence < 100:
+                out["dates_confidence"] = _ext.dates_confidence
+                out["dates_reason"] = _ext.dates_reason
+                out["dates_structured"] = ""
         except Exception:
             pass  # AI unavailable / error → keep the deterministic result
 

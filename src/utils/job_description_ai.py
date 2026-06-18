@@ -67,6 +67,16 @@ def _norm_for_match(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
+@dataclass(frozen=True)
+class FieldExtraction:
+    """Fields recovered by the AI safety-net, plus its confidence (0-100) that the
+    recovered ``dates_needed`` truly represents the coverage dates (vs. a stray date
+    in notes). < 100 flags the dates for human review."""
+    fields: dict
+    dates_confidence: int = 100
+    dates_reason: str = ""
+
+
 ## Field hints for the AI extraction safety-net. Keys are job_content fields.
 _DESC_FIELD_HINTS = {
     "dates_needed": "coverage/assignment dates, e.g. 'July 20-22, 28-29'",
@@ -84,20 +94,22 @@ def ai_extract_description_fields(
     *,
     model: Optional[str] = None,
     timeout_s: float = 15.0,
-) -> dict:
+) -> FieldExtraction:
     """Recover specific description fields the deterministic parser missed — for
     posts with human formatting errors (a label with no colon like "Dates July
-    20-22", a misspelled label, a stray comma). Returns {field: value} only for
-    values found VERBATIM in the text (anti-hallucination); a field genuinely
-    absent is omitted. Raises when the AI can't run so the caller keeps the regex
-    result. Token-frugal: only the requested fields are asked for, and callers
-    gate this so well-formed posts never reach here."""
+    20-22", a misspelled label, a stray comma). Returns a :class:`FieldExtraction`
+    whose ``fields`` holds only values found VERBATIM in the text (anti-hallucination);
+    a field genuinely absent is omitted. ``dates_needed`` is returned only when it
+    clearly represents the coverage dates, NOT a stray date in notes — and with a
+    confidence so an ambiguous extraction can be flagged. Raises when the AI can't
+    run so the caller keeps the regex result. Token-frugal: only the requested
+    fields are asked for, and callers gate this so well-formed posts never reach here."""
     import json
 
     fields = [f for f in (needed_fields or []) if f in _DESC_FIELD_HINTS]
     desc = (description_full_text or "").strip()
     if not fields or not desc:
-        return {}
+        return FieldExtraction({}, 100, "")
 
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -109,17 +121,33 @@ def ai_extract_description_fields(
 
     target_model = (model or os.environ.get("PROXI_OPENAI_MODEL") or "gpt-4.1-mini").strip()
     field_lines = "\n".join(f"- {f}: {_DESC_FIELD_HINTS[f]}" for f in fields)
+    want_dates = "dates_needed" in fields
+    dates_rule = (
+        "\nFor dates_needed: only return dates that clearly represent the assignment/COVERAGE dates "
+        "(e.g. under a 'Dates' label, even with a missing colon or typo). If a date appears only in "
+        "unrelated notes, or as a posting / credentialing / 'next update' date, return \"\" for it.\n"
+        if want_dates else ""
+    )
+    conf_keys = (
+        ', "dates_confidence": <0-100>, "dates_reason": "<brief; only if < 100>"'
+        if want_dates else ""
+    )
+    conf_rule = (
+        "\nAlso return dates_confidence (0-100): how certain dates_needed is the real coverage dates. "
+        "Use 100 for a clear Dates context; lower it if the date's role is ambiguous.\n"
+        if want_dates else ""
+    )
     prompt = f"""Extract these fields from a dental staffing job description. The text may contain human formatting errors (a label with a missing colon, a misspelled label, a missing comma) — read past them. Return each field's value EXACTLY as written in the text (verbatim, no rephrasing), or "" if it is genuinely not present. Never invent.
 
 Fields:
 {field_lines}
-
+{dates_rule}{conf_rule}
 Description:
 <<<
 {desc}
 >>>
 
-Return STRICT JSON with exactly these keys: {json.dumps(fields)}.""".strip()
+Return STRICT JSON with these keys: {json.dumps(fields)}{conf_keys}.""".strip()
 
     client = OpenAI(api_key=api_key, timeout=timeout_s)
     resp = client.responses.create(
@@ -140,7 +168,16 @@ Return STRICT JSON with exactly these keys: {json.dumps(fields)}.""".strip()
         # Trust only values that actually appear in the post (verbatim, normalized).
         if v and _norm_for_match(v) in hay:
             out[f] = v
-    return out
+    try:
+        conf = int(round(float(obj.get("dates_confidence", 100))))
+    except (TypeError, ValueError):
+        conf = 0
+    conf = max(0, min(100, conf))
+    reason = str(obj.get("dates_reason") or "").strip()
+    # Confidence only matters when dates were actually recovered.
+    if "dates_needed" not in out:
+        conf, reason = 100, ""
+    return FieldExtraction(out, conf, reason)
 
 
 def _validate_ai_dates(
