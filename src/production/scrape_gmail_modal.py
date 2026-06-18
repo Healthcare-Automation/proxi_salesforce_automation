@@ -2092,6 +2092,37 @@ def impact_report_job(recipients_csv: str = "") -> bool:
     return ok
 
 
+@app.function(
+    image=_endpoint_image,
+    # from_dotenv first, named secret second so prod creds win for shared keys; the endpoint
+    # token (IMPACT_ENDPOINT_TOKEN) lives only in .env and survives.
+    secrets=[modal.Secret.from_dotenv(), modal.Secret.from_name("salesforce-automation")],
+    timeout=300,
+)
+@modal.fastapi_endpoint(method="POST")
+def impact_report_endpoint(payload: dict):
+    """On-demand all-time Kimedics impact report, triggered from the automation hub.
+    Body: {token, recipients: [email, ...], invoker?}. Sends to the given recipients."""
+    sys.path.insert(0, "/root")
+    from fastapi import HTTPException
+    from utils.supabase_db import get_conn
+    from utils.alert_email import send_impact_report
+
+    expected = (os.environ.get("IMPACT_ENDPOINT_TOKEN") or "").strip()
+    supplied = (payload.get("token") or "").strip() if isinstance(payload, dict) else ""
+    if not expected or supplied != expected:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    recipients = [str(e).strip() for e in (payload.get("recipients") or []) if str(e).strip()]
+    if not recipients:
+        raise HTTPException(status_code=400, detail="no recipients")
+
+    stats = _build_impact_stats(get_conn)
+    ok = send_impact_report(stats, djc=None, recipients=recipients)
+    return {"ok": bool(ok), "recipients": recipients,
+            "emails": int(stats.get("current", {}).get("emails_received", 0))}
+
+
 @app.local_entrypoint()
 def run_impact_report_once(to: str = "anddy0622@gmail.com"):
     """Generate + send the all-time impact report. Defaults to a REVIEW-ONLY copy to
