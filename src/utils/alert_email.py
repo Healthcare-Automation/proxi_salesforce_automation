@@ -2185,6 +2185,7 @@ def send_impact_report(stats: dict, djc: dict | None = None,
 def send_dates_review_alert(
     job_id: str,
     *,
+    kind: str = "review",
     kimedics_url: str = "",
     sf_job_id: str = "",
     structured: str = "",
@@ -2194,19 +2195,22 @@ def send_dates_review_alert(
     recipients: Optional[Sequence[str]] = None,
 ) -> bool:
     """
-    Flag a job whose active-dates were resolved by AI with < 100% confidence, so a
-    human can verify before/after it lands in Salesforce. Goes to ALERT_RECIPIENTS.
+    Date alert to ALERT_RECIPIENTS. ``kind='review'``: AI resolved dates with < 100%
+    confidence — verify. ``kind='missing'``: no coverage dates could be captured at
+    all — dates must always be present, so add them manually.
     """
+    missing = kind == "missing"
     sf_url = (
         f"https://proxi.lightning.force.com/lightning/r/Job__c/{sf_job_id}/view"
         if sf_job_id else ""
     )
-    rows = [
-        ("Job", f"#{job_id}"),
-        ("Confidence", f"{confidence}%"),
-        ("AI reason", reason or "—"),
-        ("Structured dates (from post)", structured or "—"),
-        ("Resolved dates (to Salesforce)", resolved or "—"),
+    rows = [("Job", f"#{job_id}")]
+    if not missing:
+        rows.append(("Confidence", f"{confidence}%"))
+    rows += [
+        ("Note" if missing else "AI reason", reason or "—"),
+        ("Dates in post", structured or "—"),
+        ("Captured dates", resolved or "(none)"),
     ]
     row_html = "".join(
         f'<tr><td style="padding:6px 14px 6px 0;color:#6b7280;font-size:13px;white-space:nowrap;vertical-align:top;">{label}</td>'
@@ -2220,22 +2224,37 @@ def send_dates_review_alert(
         links.append(f'<a href="{sf_url}" style="color:#2563eb;">Salesforce job</a>')
     links_html = (" &nbsp;·&nbsp; ".join(links)) if links else ""
 
-    subject = f"⚠️ Proxi · Date review needed · Job #{job_id} ({confidence}% confidence)"
+    if missing:
+        border, kicker_color = "#dc2626", "#b91c1c"
+        subject = f"⚠️ Proxi · No dates captured · Job #{job_id} — please add manually"
+        kicker = "Coverage dates · MISSING"
+        headline = f"Job #{job_id} — no coverage dates captured"
+        lede = ("The automation could not capture any coverage dates from this post (it may use a "
+                "non-standard format or omit a Dates line). Coverage dates must always be present — "
+                "please review the post and add them in Salesforce.")
+    else:
+        border, kicker_color = "#fcd34d", "#b45309"
+        subject = f"⚠️ Proxi · Date review needed · Job #{job_id} ({confidence}% confidence)"
+        kicker = "Date resolution · review needed"
+        headline = f"Job #{job_id} — active dates resolved at {confidence}% confidence"
+        lede = ("The automation interpreted a top-line date update (an active-need / dates-added "
+                "override, or a cancellation) but was not fully certain. Please verify the dates below.")
+
     html = f"""<!DOCTYPE html><html><body style="margin:0;padding:24px;background:#f9fafb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-      <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #fcd34d;border-radius:10px;padding:22px 24px;">
-        <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#b45309;">Date resolution · review needed</div>
-        <div style="font-size:17px;font-weight:700;color:#111827;margin:6px 0 4px;">Job #{job_id} — active dates resolved at {confidence}% confidence</div>
-        <div style="font-size:13px;color:#6b7280;line-height:1.6;margin-bottom:14px;">The automation interpreted a top-line date update (an active-need / dates-added override, or a cancellation) but was not fully certain. Please verify the dates below.</div>
+      <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid {border};border-radius:10px;padding:22px 24px;">
+        <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:{kicker_color};">{kicker}</div>
+        <div style="font-size:17px;font-weight:700;color:#111827;margin:6px 0 4px;">{headline}</div>
+        <div style="font-size:13px;color:#6b7280;line-height:1.6;margin-bottom:14px;">{lede}</div>
         <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">{row_html}</table>
         {f'<div style="margin-top:16px;font-size:13px;">{links_html}</div>' if links_html else ''}
       </div>
       <div style="max-width:560px;margin:12px auto 0;font-size:11px;color:#9ca3af;text-align:center;">Proxi · Kimedics → Salesforce automation</div>
     </body></html>"""
     text = (
-        f"Date review needed — Job #{job_id} ({confidence}% confidence)\n"
-        f"AI reason: {reason or '—'}\n"
-        f"Structured dates (from post): {structured or '—'}\n"
-        f"Resolved dates (to Salesforce): {resolved or '—'}\n"
+        f"{headline}\n{lede}\n\n"
+        f"{'Note' if missing else 'AI reason'}: {reason or '—'}\n"
+        f"Dates in post: {structured or '—'}\n"
+        f"Captured dates: {resolved or '(none)'}\n"
         + (f"Kimedics: {kimedics_url}\n" if kimedics_url else "")
         + (f"Salesforce: {sf_url}\n" if sf_url else "")
     )

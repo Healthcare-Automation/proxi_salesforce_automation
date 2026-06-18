@@ -5,6 +5,7 @@ mapping, then PATCH Job__c — all in the same process / Modal invocation (no qu
 
 from __future__ import annotations
 
+import re
 from typing import Any, Set
 
 
@@ -94,14 +95,14 @@ def process_link_scrape_batch(
             view_job_link=view_link,
         )
 
-        # Flag AI date resolutions made with < 100% confidence for human review
-        # (set by the parser only when a top-line override/cancellation fired and
-        # the model was unsure). Best-effort, deduped per (job, resolved value).
-        if cl.get("dates_confidence") is not None:
-            try:
-                _alert_low_confidence_dates(conn, job_post_id, cl, schema=schema, run_id=link_run_id)
-            except Exception as _e:
-                print(f"  [alert_email] dates review alert skipped for #{job_post_id}: {_e}")
+        # Date alerts (client-facing — coverage dates must never be missing):
+        #   (a) AI resolved dates but wasn't fully certain → verify, OR
+        #   (b) no dates captured at all on a still-open job → add manually.
+        # Best-effort; deduped so a re-scrape of the same content stays silent.
+        try:
+            _review_job_dates(conn, job_post_id, cl, schema=schema, run_id=link_run_id)
+        except Exception as _e:
+            print(f"  [alert_email] dates review alert skipped for #{job_post_id}: {_e}")
 
     # ── SF resolution + scrape-field sync (existing) ──────────────────────────
     if touched_job_ids:
@@ -193,6 +194,77 @@ def _alert_low_confidence_dates(conn, job_post_id, cl: dict, *, schema: str, run
             "reason": reason,
             "email_sent": bool(sent),
         },
+    )
+
+
+def _review_job_dates(conn, job_post_id, cl: dict, *, schema: str, run_id) -> None:
+    """Decide which date alert (if any) a freshly-parsed job warrants:
+    a low-confidence resolution to verify, or — for a still-open job — no coverage
+    dates captured at all (which must never happen client-side)."""
+    if cl.get("dates_confidence") is not None:
+        _alert_low_confidence_dates(conn, job_post_id, cl, schema=schema, run_id=run_id)
+        return
+    dates = (cl.get("dates_needed") or "").strip()
+    status = (cl.get("status") or "").lower()
+    closed = ("closed" in status) or ("filled" in status)
+    if not dates and not closed:
+        _alert_missing_dates(conn, job_post_id, cl, schema=schema, run_id=run_id)
+
+
+_MONTH_HINT = re.compile(r"(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b|\b\d{1,2}/\d{1,2}\b")
+
+
+def _alert_missing_dates(conn, job_post_id, cl: dict, *, schema: str, run_id) -> None:
+    """Coverage dates are required but none were captured — email the team to add
+    them manually. Deduped per job so it fires once (until the job has dates)."""
+    from utils.supabase_db import _validate_pg_identifier, log_job_event
+
+    jid = str(job_post_id or "").strip()
+    if not jid:
+        return
+    sch = _validate_pg_identifier(schema, "schema")
+    sf_job_id = ""
+    if conn is not None:
+        with conn.cursor() as cur:
+            cur.execute(
+                f'SELECT 1 FROM "{sch}".job_event_log WHERE job_id=%s '
+                f"AND event_type='sf_dates_missing' LIMIT 1",
+                (jid,),
+            )
+            if cur.fetchone():
+                return  # already alerted for this job
+            cur.execute(f'SELECT sf_job_id FROM "{sch}".job_current WHERE job_id=%s', (jid,))
+            row = cur.fetchone()
+            sf_job_id = ((row[0] or "").strip() if row else "")
+
+    # Surface any date-bearing line so a human can spot the likely dates fast.
+    hint = ""
+    for ln in (cl.get("description_full_text") or "").splitlines():
+        s = ln.strip()
+        if s and len(s) < 80 and _MONTH_HINT.search(s):
+            hint = s
+            break
+
+    from utils.alert_email import send_dates_review_alert
+
+    sent = send_dates_review_alert(
+        jid,
+        kind="missing",
+        kimedics_url=f"https://portal.kimedics.com/app/workspace/job-posts/{jid}",
+        sf_job_id=sf_job_id,
+        structured=hint or "—",
+        resolved="",
+        confidence=0,
+        reason="No 'Dates' line or recognizable coverage dates were found in the post.",
+    )
+    print(f"  [alert_email] MISSING-dates alert for #{jid} sent={sent}")
+    log_job_event(
+        conn,
+        job_id=jid,
+        event_type="sf_dates_missing",
+        run_id=run_id,
+        schema=schema,
+        payload={"status": cl.get("status"), "hint": hint, "email_sent": bool(sent)},
     )
 
 
