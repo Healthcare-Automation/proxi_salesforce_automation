@@ -67,6 +67,12 @@ def _norm_for_match(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
+def description_top(description_full_text: str, n: int = 8) -> str:
+    """The top portion of a post that the date resolver actually reads (first ``n``
+    lines). Shared so the review alert can show reviewers the exact text the AI saw."""
+    return "\n".join((description_full_text or "").strip().splitlines()[:n])
+
+
 @dataclass(frozen=True)
 class FieldExtraction:
     """Fields recovered by the AI safety-net, plus its confidence (0-100) that the
@@ -245,7 +251,7 @@ def ai_active_dates_override(
         raise RuntimeError("openai package is required") from e
 
     target_model = (model or os.environ.get("PROXI_OPENAI_MODEL") or "gpt-4.1-mini").strip()
-    top = "\n".join(t.splitlines()[:8])
+    top = description_top(t)
     structured = (structured_dates or "").strip()
 
     prompt = f"""
@@ -254,8 +260,9 @@ You determine the CURRENTLY ACTIVE dates needed for a dental staffing job post.
 Every post has a structured full "Dates:" list (every date ever associated with the job). The TOP of the post sometimes CHANGES which dates are currently needed. Apply any such change and return the resulting active dates. Set "override" to true whenever the top changes the dates (override OR cancellation), false only when it does not.
 
 1. OVERRIDE — top states the active need or newly-added dates (e.g. "Active need is ...", "6/12 Dates added: ...", "Updated dates: ...") → return THOSE dates exactly as written, KEEPING any weekday/day-of-week qualifiers that are part of them (e.g. "Fridays June 5, 12"). Drop only the leading date stamp (e.g. "6/12"), unrelated labels, and trailing sentences.
-2. CANCELLATION — top says certain dates were cancelled, dropped, removed, no longer needed, or already filled (e.g. "the office cancelled the need for June 11/12", "June 8-9 have been cancelled") → return the structured "Dates:" list with EXACTLY those dates removed, keeping the rest in order. This IS a change → override=true.
-3. NO CHANGE — top is only context, requirements, a location, or just restates the full list → override=false.
+2. TENTATIVE vs CONFIRMED — only dates that are a CONFIRMED, currently-active need count. Dates the top marks as tentative / not-yet-firm — "pending confirmation", "tentative", "TBD", "may open up", "holding", "not yet confirmed", "if it opens" — are NOT active needs → EXCLUDE them. Dates marked "active need", "open to submittals", "confirmed", or "needed" ARE active → include them. When the top lists some of each, return ONLY the confirmed/active dates. This IS a change → override=true.
+3. CANCELLATION — top says certain dates were cancelled, dropped, removed, no longer needed, or already filled (e.g. "the office cancelled the need for June 11/12", "June 8-9 have been cancelled") → return the structured "Dates:" list with EXACTLY those dates removed, keeping the rest in order. This IS a change → override=true.
+4. NO CHANGE — top is only context, requirements, a location, or just restates the full list → override=false.
 
 Never invent dates: every date you return must appear in the post or the structured list.
 
@@ -264,6 +271,7 @@ Also report "confidence": an integer 0-100 for how certain you are the returned 
 Examples (structured | top → output):
 - "June 8-9, 17-19, 26, 29-30, July 1-2" | "6/12 Dates added: June 29-30, July 1-2" → {{"override": true, "dates": "June 29-30, July 1-2", "confidence": 100, "reason": ""}}
 - "Monday only" | "4/8 Active needs are Fridays June 5, 12" → {{"override": true, "dates": "Fridays June 5, 12", "confidence": 100, "reason": ""}}
+- "June 22-24" | "6/19 pending confirmation for June 22-24, open to submittals for June 25-26" → {{"override": true, "dates": "June 25-26", "confidence": 100, "reason": ""}}
 - "June 1-2, 11-12, 15-19, 22" | "6/10 the office cancelled the need for June 11/12" → {{"override": true, "dates": "June 1-2, 15-19, 22", "confidence": 100, "reason": ""}}
 - "June 8-9, 17-19, 26" | "6/5 June 8-9 have been cancelled. Active need is June 26" → {{"override": true, "dates": "June 26", "confidence": 100, "reason": ""}}
 - "June 8-9, 17-19, 26" | "**Aspen exp preferred" → {{"override": false, "dates": "", "confidence": 100, "reason": ""}}

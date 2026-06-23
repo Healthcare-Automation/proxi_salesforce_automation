@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import smtplib
 import textwrap
+from html import escape as _html_escape
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -2192,12 +2193,14 @@ def send_dates_review_alert(
     resolved: str = "",
     confidence: int = 0,
     reason: str = "",
+    top_text: str = "",
     recipients: Optional[Sequence[str]] = None,
 ) -> bool:
     """
     Date alert to ALERT_RECIPIENTS. ``kind='review'``: AI resolved dates with < 100%
     confidence — verify. ``kind='missing'``: no coverage dates could be captured at
-    all — dates must always be present, so add them manually.
+    all — dates must always be present, so add them manually. ``top_text`` is the
+    exact top-of-post text the resolver read, shown so reviewers can diagnose the call.
     """
     missing = kind == "missing"
     sf_url = (
@@ -2217,6 +2220,17 @@ def send_dates_review_alert(
         f'<td style="padding:6px 0;color:#111827;font-size:13px;font-weight:600;">{value}</td></tr>'
         for label, value in rows
     )
+
+    # The exact top-of-post text the resolver read — so a reviewer can see WHY the
+    # AI decided what it did, not just the parsed result. Escaped; preserves line breaks.
+    top_label = "Top of post — read by the AI" if not missing else "Top of post"
+    top_block = (
+        f'<div style="margin-top:16px;">'
+        f'<div style="font-size:11px;font-weight:600;color:#6b7280;margin-bottom:5px;">{top_label}</div>'
+        f'<div style="white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;'
+        f'font-size:12px;line-height:1.55;color:#374151;background:#f9fafb;border:1px solid #e5e7eb;'
+        f'border-radius:6px;padding:10px 12px;">{_html_escape(top_text)}</div></div>'
+    ) if (top_text or "").strip() else ""
     links = []
     if kimedics_url:
         links.append(f'<a href="{kimedics_url}" style="color:#2563eb;">Kimedics post</a>')
@@ -2246,6 +2260,7 @@ def send_dates_review_alert(
         <div style="font-size:17px;font-weight:700;color:#111827;margin:6px 0 4px;">{headline}</div>
         <div style="font-size:13px;color:#6b7280;line-height:1.6;margin-bottom:14px;">{lede}</div>
         <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">{row_html}</table>
+        {top_block}
         {f'<div style="margin-top:16px;font-size:13px;">{links_html}</div>' if links_html else ''}
       </div>
       <div style="max-width:560px;margin:12px auto 0;font-size:11px;color:#9ca3af;text-align:center;">Proxi · Kimedics → Salesforce automation</div>
@@ -2255,6 +2270,7 @@ def send_dates_review_alert(
         f"{'Note' if missing else 'AI reason'}: {reason or '—'}\n"
         f"Dates in post: {structured or '—'}\n"
         f"Captured dates: {resolved or '(none)'}\n"
+        + (f"\n{top_label}:\n{top_text.strip()}\n" if (top_text or '').strip() else "")
         + (f"Kimedics: {kimedics_url}\n" if kimedics_url else "")
         + (f"Salesforce: {sf_url}\n" if sf_url else "")
     )

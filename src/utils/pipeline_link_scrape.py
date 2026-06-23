@@ -170,6 +170,7 @@ def _alert_low_confidence_dates(conn, job_post_id, cl: dict, *, schema: str, run
             sf_job_id = ((row[0] or "").strip() if row else "")
 
     from utils.alert_email import send_dates_review_alert
+    from utils.job_description_ai import description_top
 
     sent = send_dates_review_alert(
         jid,
@@ -179,6 +180,7 @@ def _alert_low_confidence_dates(conn, job_post_id, cl: dict, *, schema: str, run
         resolved=resolved,
         confidence=confidence,
         reason=reason,
+        top_text=description_top(cl.get("description_full_text") or ""),
     )
     print(f"  [alert_email] dates review alert for #{jid} ({confidence}% conf) sent={sent}")
     log_job_event(
@@ -246,6 +248,7 @@ def _alert_missing_dates(conn, job_post_id, cl: dict, *, schema: str, run_id) ->
             break
 
     from utils.alert_email import send_dates_review_alert
+    from utils.job_description_ai import description_top
 
     sent = send_dates_review_alert(
         jid,
@@ -256,6 +259,7 @@ def _alert_missing_dates(conn, job_post_id, cl: dict, *, schema: str, run_id) ->
         resolved="",
         confidence=0,
         reason="No 'Dates' line or recognizable coverage dates were found in the post.",
+        top_text=description_top(cl.get("description_full_text") or ""),
     )
     print(f"  [alert_email] MISSING-dates alert for #{jid} sent={sent}")
     log_job_event(
