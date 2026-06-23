@@ -35,6 +35,13 @@ ALERT_RECIPIENTS = [
     "seanhyang1@gmail.com",
     "proxi@scrubnetwork.com",
 ]
+# Client-facing recurring pulses (weekly + monthly) also go to the proxidocs
+# stakeholders. The daily digest and all failure/date-review alerts stay on
+# ALERT_RECIPIENTS only.
+PULSE_RECIPIENTS = ALERT_RECIPIENTS + [
+    "Peter.Wood@proxidocs.com",
+    "cara.griffin@proxidocs.com",
+]
 SMTP_HOST        = "smtp.gmail.com"
 SMTP_PORT        = 587
 _SENDER_DEFAULT  = "proxi@scrubnetwork.com"
@@ -1118,12 +1125,13 @@ def send_weekly_summary(stats: dict) -> bool:
             )
         rows_html.append(f"<tr>{''.join(cells)}</tr>")
 
-    legend_steps = [("lvl0", "0"), ("lvl1", "1–25%"), ("lvl2", "26–50%"), ("lvl3", "51–75%"), ("lvl4", "76–100%")]
+    # Qualitative ramp (none → more), shaded relative to the busiest state — NOT percentages,
+    # which read as a misleading "share of national total". Matches the monthly pulse legend.
     legend_cells = "".join(
         f'<td style="padding:0 6px;font-size:10px;vertical-align:middle;">'
         f'<span class="{cls}" style="display:inline-block;width:12px;height:12px;border-radius:2px;vertical-align:middle;margin-right:4px;"></span>'
         f'<span class="dim" style="color:#71717a;">{label}</span></td>'
-        for cls, label in legend_steps
+        for cls, label in [("lvl0", "none"), ("lvl1", "fewer"), ("lvl2", ""), ("lvl3", ""), ("lvl4", "more")]
     )
 
     map_html = f"""
@@ -1282,7 +1290,7 @@ def send_weekly_summary(stats: dict) -> bool:
     Proxi · Kimedics → Salesforce automation
     """).strip()
 
-    return _send(subject, body_html, text)
+    return _send(subject, body_html, text, recipients=PULSE_RECIPIENTS)
 
 
 # ── Shared pulse rendering helpers (weekly + monthly) ────────────────────────
@@ -1836,7 +1844,7 @@ def send_monthly_summary(stats: dict) -> bool:
     Proxi · Kimedics → Salesforce automation
     """).strip()
 
-    return _send(subject, body_html, text)
+    return _send(subject, body_html, text, recipients=PULSE_RECIPIENTS)
 
 
 def _pulse_section_header(title, status_text, kind):
