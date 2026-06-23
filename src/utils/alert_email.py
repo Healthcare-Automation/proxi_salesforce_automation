@@ -1496,8 +1496,13 @@ def _pulse_stacked(series_split, labels, bar_h=120, show_totals=True, label_keep
 def _pulse_line_chart(series, w=280, h=84):
     """White line chart as a rendered image (QuickChart / Chart.js). Renders in the
     browser preview AND email clients including Gmail (which strip inline SVG). Single
-    white line on the dark ROI card, only the last point dotted; no axes/grid.
-    (White, not red — the trend is a positive metric and red reads as negative.)"""
+    white line, only the last point dotted; no axes/grid. (White, not red — the trend
+    is a positive metric and red reads as negative.)
+
+    The image carries its OWN dark background (not transparent): Gmail's dark theme
+    inverts the surrounding card's HTML background to light but can't recolor image
+    pixels, so a transparent white line would vanish on the flipped-light card. A solid
+    dark backing keeps the line legible in every client/mode."""
     import json, urllib.parse
     pts = [(l, v) for l, v in series if v is not None]
     if len(pts) < 2:
@@ -1526,9 +1531,11 @@ def _pulse_line_chart(series, w=280, h=84):
         },
     }
     c = urllib.parse.quote(json.dumps(cfg, separators=(",", ":")))
-    url = f"https://quickchart.io/chart?bkg=transparent&w={w * 2}&h={h * 2}&c={c}"
+    # Solid dark backing (matches the ROI card) so the white line survives client dark-mode
+    # inversion; rounded so it reads as an intentional inset chart if the card flips light.
+    url = f"https://quickchart.io/chart?bkg=%2318181b&w={w * 2}&h={h * 2}&c={c}"
     return (f'<img src="{url}" width="{w}" height="{h}" alt="Hours saved trend" '
-            f'style="display:block;width:100%;max-width:{w}px;height:auto;">')
+            f'style="display:block;width:100%;max-width:{w}px;height:auto;border-radius:6px;">')
 
 
 def _pulse_trend(series, caption=""):
