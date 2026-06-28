@@ -583,10 +583,9 @@ def send_daily_summary(stats: dict) -> bool:
             sfid  = (r.get("sf_job_id") or "").strip()
             tm    = r.get("et_time") or ""
 
-            jid_html = (
-                f'<a href="{link}" style="color:#2471a3;text-decoration:none;">#{jid}</a>'
-                if link else f"#{jid}"
-            )
+            # Job is a plain identifier now — the clickable link lives in the
+            # "Open" column as a labelled debug button.
+            jid_html = f'<span style="font-weight:600;color:#111;">#{jid}</span>'
 
             # Scrape result
             if r["scrape_ok"]:
@@ -600,25 +599,19 @@ def send_daily_summary(stats: dict) -> bool:
             else:
                 scrape_html = _chip("—", "slate", "No content row written for this email")
 
-            # SF mapping — link to the Salesforce Lightning record when mapped
-            # so the operator can open Kimedics (Job column) and SF side-by-side.
+            # SF mapping status — a single clear chip (the link is a button in
+            # the "Open" column). "blocked" is called out distinctly so a held job
+            # like #20038 never hides behind an ambiguous "pending".
             if r["sf_mapped"]:
-                sf_url = (
-                    f"https://proxi.lightning.force.com/lightning/r/Job__c/{sfid}/view"
-                    if sfid else ""
-                )
-                chip = _chip("✓", "green", f"Open Salesforce record · sf_job_id={sfid}")
-                id_html = (
-                    f'<span style="font-family:monospace;color:#2471a3;font-size:10px;">{sfid[:10]}…</span>'
-                    if sfid else ""
-                )
-                inner = chip + (" " + id_html if id_html else "")
-                sf_html = (
-                    f'<a href="{sf_url}" style="text-decoration:none;">{inner}</a>'
-                    if sf_url else inner
-                )
+                sf_html = _chip("mapped", "green", f"Mapped to Salesforce · sf_job_id={sfid}")
+            elif int(r.get("blocked_no_practice") or 0) > 0:
+                sf_html = _chip("blocked", "red",
+                                "Blocked — practice value missing, can't safely create the Job__c "
+                                "(auto-retry re-scrapes; alert fires if it stays stuck)")
+            elif r["stuck"]:
+                sf_html = _chip("stuck", "red", "Creation failed and hasn't recovered — needs a look")
             elif r["scrape_ok"]:
-                sf_html = _chip("pending", "amber", "Scraped but no SF Job__c yet")
+                sf_html = _chip("pending", "amber", "Scraped; SF Job__c mapping in progress")
             else:
                 sf_html = _chip("—", "slate", "Mapping deferred — no content")
 
@@ -664,6 +657,24 @@ def send_daily_summary(stats: dict) -> bool:
                 notes.append(_chip("rescraped", "blue", "Operator hit Rescrape in /admin/recovery"))
             notes_html = " ".join(notes) if notes else '<span style="color:#aaa;">—</span>'
 
+            # Debug buttons — Kimedics + Salesforce, side by side on one line so each
+            # job stays a single row. Clearly buttons (not inline text links).
+            def _btn(href: str, label: str) -> str:
+                return (
+                    f'<a href="{href}" style="display:inline-block;padding:3px 10px;border:1px solid #d1d5db;'
+                    f'border-radius:5px;background:#f3f4f6;color:#374151;font-size:10px;font-weight:700;'
+                    f'text-decoration:none;line-height:1.4;">{label}</a>'
+                )
+            btns = []
+            if link:
+                btns.append(_btn(link, "Kimedics"))
+            if sfid and r["sf_mapped"]:
+                btns.append(_btn(f"https://proxi.lightning.force.com/lightning/r/Job__c/{sfid}/view", "SF"))
+            open_html = (
+                f'<span style="white-space:nowrap;">{"&nbsp;".join(btns)}</span>'
+                if btns else '<span style="color:#aaa;">—</span>'
+            )
+
             org_html = f'<span style="color:#666;font-size:11px;">{org}</span>' if org else ""
             title_html = (
                 f'<div style="color:#111;font-size:12px;">{title}</div>'
@@ -682,6 +693,7 @@ def send_daily_summary(stats: dict) -> bool:
                 f"<td style='text-align:center;'>{sf_html}</td>"
                 f"<td>{fields_html}</td>"
                 f"<td>{notes_html}</td>"
+                f"<td style='white-space:nowrap;text-align:right;'>{open_html}</td>"
                 "</tr>"
             )
 
@@ -695,7 +707,7 @@ def send_daily_summary(stats: dict) -> bool:
           <table style="font-size:12px;width:100%;">
             <tr>
               <th>Time</th><th>Email</th><th>Job</th><th>Title / Org</th>
-              <th>Scrape</th><th>SF</th><th>SF Fields</th><th>Notes</th>
+              <th>Scrape</th><th>SF</th><th>SF Fields</th><th>Notes</th><th>Open</th>
             </tr>
             {''.join(body_rows)}
           </table>
@@ -730,7 +742,13 @@ def send_daily_summary(stats: dict) -> bool:
     def _pt_row(r: dict) -> str:
         kind = r.get("action_or_change") or r.get("subject") or "?"
         scrape = "OK" if r["scrape_ok"] else ("STUCK" if r["stuck"] else "—")
-        sf = "OK" if r["sf_mapped"] else ("pending" if r["scrape_ok"] else "—")
+        sf = (
+            "OK" if r["sf_mapped"]
+            else "BLOCKED" if int(r.get("blocked_no_practice") or 0) > 0
+            else "STUCK" if r["stuck"]
+            else "pending" if r["scrape_ok"]
+            else "—"
+        )
         patches = int(r.get("fields_changed") or 0)
         notes = []
         if r["created_sf_job"]: notes.append("new SF job")

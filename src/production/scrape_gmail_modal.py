@@ -1245,27 +1245,33 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
                 stats["rows"].append(d)
 
     rows = stats["rows"]
-    stats["emails_received"]     = len(rows)
-    stats["scraped_ok"]          = sum(1 for r in rows if r["scrape_ok"])
-    stats["sf_mapped"]           = sum(1 for r in rows if r["sf_mapped"])
-    stats["sf_jobs_created"]     = sum(1 for r in rows if r["created_sf_job"])
-    stats["worksites_created"]   = sum(1 for r in rows if r["created_sf_worksite"])
-    stats["field_patches_total"] = sum(int(r["fields_changed"] or 0) for r in rows)
-    stats["ext_id_swaps"]        = sum(1 for r in rows if r["ext_id_swap"])
-    stats["manual_rescrapes"]    = sum(1 for r in rows if r["manual_rescraped"])
-    stats["auto_retries"]        = sum(1 for r in rows if r["auto_retried"])
-    stats["stuck_jobs"]          = sum(1 for r in rows if r["stuck"])
-    stats["scrape_failures"]     = sum(1 for r in rows if not r["scrape_ok"] and not r["stuck"])
-    # Amendments — SF push errors that recovered (field dropped), fields
-    # quarantined by SF, and any push errors still unresolved. These are
-    # rows where SF was patched but with edits, or rows where SF rejected
-    # some/all of the update — operators wanted these surfaced in the report.
-    stats["fields_quarantined"]   = sum(int(r["fields_quarantined"] or 0) for r in rows)
-    stats["blocked_no_practice"]  = sum(int(r["blocked_no_practice"] or 0) for r in rows)
-    stats["silent_failures"]      = sum(int(r["silent_failures"] or 0) for r in rows)
-    stats["pushes_recovered"]     = sum(1 for r in rows if int(r["push_recovered"] or 0) > 0)
-    stats["push_errors_total"]    = sum(int(r["push_errors"] or 0) for r in rows)
-    stats["push_errors_unresolved"] = sum(1 for r in rows if r["push_error_unresolved"])
+
+    # Issue / action / created-record counts are reported at a 1-PER-JOB level: a job
+    # with several emails (or several blocked retries) must count ONCE, not once per
+    # event — otherwise "9 blocked" reads as 9 failed jobs when it's really one job
+    # (#20038) retried 9 times. Only the email funnel + field totals stay per-event.
+    def _jobs(pred) -> int:
+        return len({(r.get("job_post_id") or "") for r in rows
+                    if (r.get("job_post_id") or "") and pred(r)})
+
+    stats["emails_received"]     = len(rows)                                   # emails (volume)
+    stats["scraped_ok"]          = sum(1 for r in rows if r["scrape_ok"])      # emails (funnel)
+    stats["sf_mapped"]           = sum(1 for r in rows if r["sf_mapped"])      # emails (funnel)
+    stats["field_patches_total"] = sum(int(r["fields_changed"] or 0) for r in rows)  # fields
+    stats["fields_quarantined"]  = sum(int(r["fields_quarantined"] or 0) for r in rows)  # fields
+    stats["push_errors_total"]   = sum(int(r["push_errors"] or 0) for r in rows)     # errors
+    # ── 1-per-job ──
+    stats["sf_jobs_created"]     = _jobs(lambda r: r["created_sf_job"])
+    stats["worksites_created"]   = _jobs(lambda r: r["created_sf_worksite"])
+    stats["ext_id_swaps"]        = _jobs(lambda r: r["ext_id_swap"])
+    stats["manual_rescrapes"]    = _jobs(lambda r: r["manual_rescraped"])
+    stats["auto_retries"]        = _jobs(lambda r: r["auto_retried"])
+    stats["stuck_jobs"]          = _jobs(lambda r: r["stuck"])
+    stats["scrape_failures"]     = _jobs(lambda r: not r["scrape_ok"] and not r["stuck"])
+    stats["blocked_no_practice"] = _jobs(lambda r: int(r["blocked_no_practice"] or 0) > 0)
+    stats["silent_failures"]     = _jobs(lambda r: int(r["silent_failures"] or 0) > 0)
+    stats["pushes_recovered"]    = _jobs(lambda r: int(r["push_recovered"] or 0) > 0)
+    stats["push_errors_unresolved"] = _jobs(lambda r: r["push_error_unresolved"])
 
     return stats
 
