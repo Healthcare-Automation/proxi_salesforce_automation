@@ -356,14 +356,37 @@ def _auto_retry_orphaned_scrapes(*, kimedics_email: str, kimedics_password: str)
                 -- "Auto-retry will pick this up within ~5 min" promise was
                 -- broken because the empty row made the email_scrape look
                 -- complete.
-                WHERE NOT EXISTS (
-                        SELECT 1 FROM job_content j2
-                        WHERE j2.email_scrape_id = es.id
-                          AND (
-                            COALESCE(NULLIF(j2.title_line, ''), '') <> ''
-                            OR COALESCE(NULLIF(j2.description_full_text, ''), '') <> ''
-                            OR COALESCE(NULLIF(j2.job_title, ''), '') <> ''
-                          )
+                --
+                -- ALSO self-heal "blocked on a missing scrape field": a row that
+                -- scraped content fine but is stuck unmapped because practice_value
+                -- came back empty (e.g. an unlinked Kimedics practice rendered in a
+                -- field the text scrape missed). A mapping retry re-runs on the same
+                -- stale row forever; only a FRESH page re-scrape can recover it. Job
+                -- #20038 sat blocked here until a manual rescrape — this closes that.
+                WHERE (
+                        NOT EXISTS (
+                          SELECT 1 FROM job_content j2
+                          WHERE j2.email_scrape_id = es.id
+                            AND (
+                              COALESCE(NULLIF(j2.title_line, ''), '') <> ''
+                              OR COALESCE(NULLIF(j2.description_full_text, ''), '') <> ''
+                              OR COALESCE(NULLIF(j2.job_title, ''), '') <> ''
+                            )
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM job_content j3
+                          WHERE j3.email_scrape_id = es.id
+                            AND COALESCE(NULLIF(j3.title_line, ''), '') <> ''        -- DID scrape content
+                            AND COALESCE(NULLIF(j3.practice_value, ''), '') = ''     -- but practice missing
+                            AND COALESCE(NULLIF(j3.sf_job_id, ''), '') = ''          -- and not yet in Salesforce
+                            AND COALESCE(j3.status, '') NOT ILIKE '%%closed%%'       -- and still open
+                            AND EXISTS (
+                              SELECT 1 FROM job_event_log b
+                              WHERE b.job_id = es.job_post_id
+                                AND b.event_type = 'mapping_blocked_no_practice_value'
+                                AND b.created_at >= NOW() - INTERVAL '24 hours'
+                            )
+                        )
                       )
                   AND es.job_post_id IS NOT NULL
                   AND es.job_post_id <> ''
