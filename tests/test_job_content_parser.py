@@ -1,7 +1,12 @@
 """Unit tests for job_content_parser description sections and city/state."""
 
 from utils.job_content_ai import combined_types_of_cases, parse_with_pipeline
-from utils.job_content_parser import parse_job_content_txt, repair_flat_jobpost_text_missing_posted_date
+from utils.job_content_parser import (
+    parse_job_content_txt,
+    repair_flat_jobpost_text_missing_posted_date,
+    repair_flat_jobpost_text_missing_practice,
+    _backfill_practice_value,
+)
 
 SAMPLE_17967 = """Dentistry (Dentist (DMD/DDS)) (#17967)
 Los Lunas, NM
@@ -684,6 +689,30 @@ def test_repair_flat_text_inserts_posted_date_for_parser():
     out = parse_job_content_txt(fixed)
     assert (out.get("posted_date") or "").strip() == "10/15/25"
     assert (out.get("posting_org") or "").strip() == "Aspen Dental"
+
+
+def test_repair_practice_splices_dom_recovered_value():
+    """Job #20038 regression: the sidebar 'Practice' value lives in an <input> (dropped by
+    inner_text), and the description used 'Address:' not 'Facility:', so practice_value was
+    empty. The DOM-recovery splice must let the sidebar parser read the value."""
+    sidebar = "Practice\nJob Title\nPosted Date\nPosting Org\nPriority\nStatus"
+    fixed = repair_flat_jobpost_text_missing_practice(sidebar, "4403 - Dublin, GA")
+    assert "Practice\n4403 - Dublin, GA" in fixed
+
+    # End-to-end from the real 20038 start: empty practice_value, no Facility: line.
+    out = {"practice_value": "", "description_full_text": "Address: 2005 Veterans Blvd D4, Dublin GA"}
+    _backfill_practice_value(out, fixed)
+    assert out["practice_value"] == "4403 - Dublin, GA"
+
+
+def test_repair_practice_guards():
+    sidebar = "Practice\nJob Title\nPosted Date\nPosting Org"
+    # No-op when the recovered value isn't an office-id line.
+    assert repair_flat_jobpost_text_missing_practice(sidebar, "Dublin, GA") == sidebar
+    assert repair_flat_jobpost_text_missing_practice(sidebar, "") == sidebar
+    # Does not overwrite a value already present after the label.
+    good = "Practice\n4361 - Rosenberg, TX\nJob Title"
+    assert repair_flat_jobpost_text_missing_practice(good, "9999 - Wrong, ZZ") == good
 
 
 def test_parse_17967_labeled_description_fields():

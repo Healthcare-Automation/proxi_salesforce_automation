@@ -887,6 +887,45 @@ def repair_flat_jobpost_text_missing_posted_date(flat_text: str, posted_date: Op
     return flat_text
 
 
+def repair_flat_jobpost_text_missing_practice(flat_text: str, practice: Optional[str]) -> str:
+    """
+    Like the posted-date repair: the sidebar ``Practice`` value commonly lives in an
+    ``<input>`` in the value column, so Playwright's ``inner_text()`` omits it and the
+    flattened text shows the ``Practice`` label immediately followed by the *next* label.
+    Most posts still recover it from a ``Facility: #### - City, ST`` line in the description,
+    but posts that use ``Address:`` instead (e.g. #20038) leave ``practice_value`` empty.
+
+    When the browser exposes the real practice value (see
+    ``extract_practice_value_from_kimedics_page``), splice it right after the ``Practice``
+    label so ``_extract_practice_value_from_sidebar`` can read it. Only an office-id-shaped
+    value (``#### - City, ST``) is spliced, and only when the label has no value already.
+    """
+    pv = (practice or "").strip()
+    if not pv or not (flat_text or "").strip():
+        return flat_text or ""
+    if not re.match(r"^\d{3,5}\s*-\s*.*[A-Za-z]", pv):
+        return flat_text  # only splice a genuine office-id practice value
+    lines = (flat_text or "").replace("\r\n", "\n").split("\n")
+    out: list[str] = []
+    spliced = False
+    for i, ln in enumerate(lines):
+        out.append(ln)
+        if spliced or ln.strip().lower() != "practice":
+            continue
+        # Does a valid practice value already follow the label? Then leave it alone.
+        has_val = False
+        for nxt in lines[i + 1:i + 5]:
+            s = nxt.strip()
+            if not s:
+                continue
+            has_val = bool(re.match(r"^\d{3,5}\s*-\s*.*[A-Za-z]", s))
+            break
+        if not has_val:
+            out.append(pv)
+            spliced = True
+    return "\n".join(out) if spliced else flat_text
+
+
 def parse_job_content_txt(text: str, sf_practice_map: Optional[dict] = None) -> dict:
     """
     Parse raw job post text into a single row dict with keys in JOB_CONTENT_COLUMNS.

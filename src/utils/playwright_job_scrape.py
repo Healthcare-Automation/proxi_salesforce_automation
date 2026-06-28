@@ -11,7 +11,10 @@ import traceback
 from pathlib import Path
 from typing import Optional
 
-from utils.job_content_parser import repair_flat_jobpost_text_missing_posted_date
+from utils.job_content_parser import (
+    repair_flat_jobpost_text_missing_posted_date,
+    repair_flat_jobpost_text_missing_practice,
+)
 from utils.sf_job_payload import KIMEDICS_PORTAL_JOB_POST_URL_PREFIX
 
 _utils = Path(__file__).resolve().parent
@@ -156,10 +159,77 @@ def extract_posted_date_from_kimedics_page(page) -> str:
         return ""
 
 
+# ---------------------------------------------------------------------------
+# Browser-side JS: recover the sidebar ``Practice`` value (an office-id line like
+# "4403 - Dublin, GA"). It commonly lives in an <input> in the value column, so
+# inner_text() omits it — same two-column problem the posted-date recovery solves.
+# ---------------------------------------------------------------------------
+_KIMEDICS_PRACTICE_JS = r"""
+(selector) => {
+  const root = document.querySelector(selector);
+  if (!root) return '';
+  const PRACTICE_RE = /^\d{3,5}\s*-\s*.*[A-Za-z]/;
+  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const asPractice = (s) => { const t = clean(s); return PRACTICE_RE.test(t) ? t : ''; };
+
+  // 1. Any input/select whose value looks like an office-id practice line.
+  for (const inp of root.querySelectorAll('input, select')) {
+    const hit = asPractice(inp.value);
+    if (hit) return hit;
+  }
+  // 2. The 'Practice' label leaf → its adjacent value cell (text or input).
+  const leaves = Array.from(root.querySelectorAll('*')).filter(
+    (el) => el.childElementCount === 0 && clean(el.textContent).toLowerCase() === 'practice'
+  );
+  for (const leaf of leaves) {
+    const parent = leaf.parentElement;
+    if (!parent) continue;
+    const sibs = Array.from(parent.children);
+    const idx = sibs.indexOf(leaf);
+    for (let j = idx + 1; j < sibs.length; j++) {
+      const cell = sibs[j];
+      const hit = asPractice(cell.innerText || cell.textContent);
+      if (hit) return hit;
+      const inp = cell.matches && cell.matches('input, select') ? cell
+                : (cell.querySelector ? cell.querySelector('input, select') : null);
+      if (inp) { const v = asPractice(inp.value); if (v) return v; }
+    }
+  }
+  // 3. Two-column layout: 'Practice' at index i in the label column, value at index i.
+  function paired(node, depth) {
+    if (!node || depth > 10) return '';
+    const kids = Array.from(node.children);
+    if (kids.length === 2) {
+      const lines = (el) => (el.innerText || '').split(/\n/).map((s) => clean(s)).filter(Boolean);
+      const a = lines(kids[0]), b = lines(kids[1]);
+      const i = a.findIndex((x) => x.toLowerCase() === 'practice');
+      if (i >= 0 && i < b.length) { const hit = asPractice(b[i]); if (hit) return hit; }
+    }
+    for (const c of kids) { const r = paired(c, depth + 1); if (r) return r; }
+    return '';
+  }
+  return paired(root, 0);
+}
+"""
+
+
+def extract_practice_value_from_kimedics_page(page) -> str:
+    try:
+        v = page.evaluate(_KIMEDICS_PRACTICE_JS, ".sections__container")
+        return (v or "").strip() if isinstance(v, str) else ""
+    except Exception:
+        return ""
+
+
 def augment_kimedics_job_body_text(page, body_text: str) -> str:
-    """Splice DOM posted date into flat text before ``parse_job_content_txt``."""
+    """Splice DOM-recovered sidebar values (posted date, practice) into the flat text
+    before ``parse_job_content_txt`` — both live in value-column inputs that
+    ``inner_text()`` drops."""
     posted = extract_posted_date_from_kimedics_page(page)
-    return repair_flat_jobpost_text_missing_posted_date(body_text, posted or None)
+    body_text = repair_flat_jobpost_text_missing_posted_date(body_text, posted or None)
+    practice = extract_practice_value_from_kimedics_page(page)
+    body_text = repair_flat_jobpost_text_missing_practice(body_text, practice or None)
+    return body_text
 
 
 def canonical_kimedics_url(job_post_id: Optional[str]) -> Optional[str]:
