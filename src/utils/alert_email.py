@@ -255,7 +255,6 @@ def send_scrape_alert(
         ("title_line",          "Title"),
         ("job_title",           "Job Title"),
         ("status",              "Status"),
-        ("rates",               "Rates"),
         ("provider_start_date", "Start Date"),
         ("provider_end_date",   "End Date"),
         ("location_line",       "Location"),
@@ -2286,6 +2285,74 @@ def send_dates_review_alert(
         f"Dates in post: {structured or '—'}\n"
         f"Captured dates: {resolved or '(none)'}\n"
         + (f"\n{top_label}:\n{top_text.strip()}\n" if (top_text or '').strip() else "")
+        + (f"Kimedics: {kimedics_url}\n" if kimedics_url else "")
+        + (f"Salesforce: {sf_url}\n" if sf_url else "")
+    )
+    return _send(subject, html, text, recipients=recipients)
+
+
+# ── Practice-blocked (genuinely stuck) alert ─────────────────────────────────────────
+
+def send_practice_block_alert(
+    job_id: str,
+    *,
+    kimedics_url: str = "",
+    sf_job_id: str = "",
+    city: str = "",
+    state: str = "",
+    attempts: int = 0,
+    recipients: Optional[Sequence[str]] = None,
+) -> bool:
+    """
+    Layer-3 backstop: a job that could not capture ``practice_value`` and has exhausted
+    automatic re-scrapes is genuinely stuck — it can't be created in Salesforce. Surface
+    it immediately so a human can fix the post / link the practice, instead of leaving it
+    silent. Fired once per job (deduped by the caller).
+    """
+    sf_url = (
+        f"https://proxi.lightning.force.com/lightning/r/Job__c/{sf_job_id}/view"
+        if sf_job_id else ""
+    )
+    loc = ", ".join([p for p in (city, state) if (p or "").strip()]) or "—"
+    rows = [
+        ("Job", f"#{job_id}"),
+        ("Location", loc),
+        ("Auto-recovery", f"{attempts} re-scrapes attempted — all missing the practice"),
+    ]
+    row_html = "".join(
+        f'<tr><td style="padding:6px 14px 6px 0;color:#6b7280;font-size:13px;white-space:nowrap;vertical-align:top;">{label}</td>'
+        f'<td style="padding:6px 0;color:#111827;font-size:13px;font-weight:600;">{value}</td></tr>'
+        for label, value in rows
+    )
+    links = []
+    if kimedics_url:
+        links.append(f'<a href="{kimedics_url}" style="color:#2563eb;">Kimedics post</a>')
+    if sf_url:
+        links.append(f'<a href="{sf_url}" style="color:#2563eb;">Salesforce job</a>')
+    links_html = (" &nbsp;·&nbsp; ".join(links)) if links else ""
+
+    subject = f"⚠️ Proxi · Job stuck — practice not captured · Job #{job_id}"
+    kicker = "Salesforce sync · BLOCKED"
+    headline = f"Job #{job_id} — can't create in Salesforce (no practice value)"
+    lede = ("The automation couldn't read this job's practice (the office-id line, e.g. "
+            "\"4403 - Dublin, GA\") and automatic re-scrapes didn't recover it — so the job "
+            "is held back to avoid creating a duplicate. Please open the Kimedics post and "
+            "check the Practice field (an unlinked practice can render in a way the scrape "
+            "misses); a manual rescrape usually clears it once the field reads.")
+    html = f"""<!DOCTYPE html><html><body style="margin:0;padding:24px;background:#f9fafb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+      <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #dc2626;border-radius:10px;padding:22px 24px;">
+        <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#b91c1c;">{kicker}</div>
+        <div style="font-size:17px;font-weight:700;color:#111827;margin:6px 0 4px;">{headline}</div>
+        <div style="font-size:13px;color:#6b7280;line-height:1.6;margin-bottom:14px;">{lede}</div>
+        <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">{row_html}</table>
+        {f'<div style="margin-top:16px;font-size:13px;">{links_html}</div>' if links_html else ''}
+      </div>
+      <div style="max-width:560px;margin:12px auto 0;font-size:11px;color:#9ca3af;text-align:center;">Proxi · Kimedics → Salesforce automation</div>
+    </body></html>"""
+    text = (
+        f"{headline}\n{lede}\n\n"
+        f"Location: {loc}\n"
+        f"Auto-recovery: {attempts} re-scrapes attempted — all missing the practice\n"
         + (f"Kimedics: {kimedics_url}\n" if kimedics_url else "")
         + (f"Salesforce: {sf_url}\n" if sf_url else "")
     )

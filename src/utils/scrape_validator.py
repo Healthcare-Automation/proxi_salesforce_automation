@@ -43,7 +43,7 @@ Data notes (from 554-row export)
 - location_line:       always present (100% fill rate)
 - position_type:       never present in real data — not validated
 - number_of_open_positions: never present in real data — not validated
-- rates:               almost never present — absence is completely normal
+- rates:               NOT validated — we don't scrape rates (fixed value pushed to SF)
 """
 
 from __future__ import annotations
@@ -91,8 +91,9 @@ IMPORTANT_FIELDS_WARNING = [
 ]
 
 # Sometimes legitimately absent — flag INFO only (won't trigger immediate alert).
+# NOTE: rates are intentionally NOT validated — we don't scrape rates (a fixed value
+# is pushed to Salesforce), so they must never produce a warning/info anywhere.
 IMPORTANT_FIELDS_INFO = [
-    "rates",     # almost never populated; absence is normal
     "posted_date",
 ]
 # NOTE: position_type and number_of_open_positions are never populated in
@@ -146,14 +147,6 @@ _JOB_TITLE_RE = re.compile(r"^#\d{3,}:")
 # with an optional trailing suffix like " - Closed".
 # The separator can be hyphen (-) or em-dash (–).
 _PRACTICE_VALUE_RE = re.compile(r"^\d{3,5}\s*[-\u2013]\s*.+,\s*[A-Z]{2}", re.UNICODE)
-
-# Rate patterns (only checked when the field is actually present).
-_RATE_RE = re.compile(
-    r"\$\s*[\d,]+"
-    r"|\d+[\.,]\d+\s*/?\s*(hr|hour)"
-    r"|\b\d{3,}\b",
-    re.IGNORECASE,
-)
 
 # Description length thresholds (calibrated from real data: min=313, median=633).
 _DESC_SHORT_THRESHOLD = 200   # anything below this is suspicious
@@ -415,17 +408,6 @@ def _check_formats(c: dict, issues: list) -> None:
             f"job_id '{job_id}' is not purely numeric — regex extraction may have failed",
             value=job_id,
         ))
-
-    # ── Rates (only when present) ─────────────────────────────────────────────
-    # Absence is normal. But if present it should look like a number.
-    rates = c.get("rates", "")
-    if rates and not _RATE_RE.search(rates):
-        issues.append(ValidationIssue(
-            Severity.INFO, "rates",
-            "Rates field is present but does not contain a recognisable dollar amount or number",
-            value=rates[:100],
-        ))
-
 
 def _check_anomalies(c: dict, issues: list) -> None:
     """

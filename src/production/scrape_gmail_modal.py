@@ -306,6 +306,62 @@ _AUTO_RETRY_GRACE_MIN = 5
 _AUTO_RETRY_LOOKBACK_HOURS = 24
 
 
+def _alert_stuck_practice_jobs(get_conn, log_job_event) -> None:
+    """
+    Layer-3 backstop: a job blocked on empty ``practice_value`` that has exhausted
+    auto-retries (the self-heal couldn't recover it) is GENUINELY stuck — it can't be
+    created in Salesforce and would otherwise sit silent in the validation UI. Email
+    one alert per such job so a human is told immediately. Deduped via a
+    ``practice_stuck_alerted`` event so it fires once per job.
+    """
+    with get_conn() as conn:
+        if conn is None:
+            return
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT jc.job_id, jc.city, jc.state, jc.view_job_link, jc.email_scrape_id,
+                       (SELECT count(*) FROM job_event_log r
+                          WHERE r.event_type = 'auto_retry_completed'
+                            AND (r.payload->>'email_scrape_id') = jc.email_scrape_id::text) AS attempts
+                FROM job_content jc
+                WHERE jc.id IN (SELECT MAX(id) FROM job_content GROUP BY job_id)   -- latest row per job
+                  AND COALESCE(NULLIF(jc.title_line, ''), '') <> ''
+                  AND COALESCE(NULLIF(jc.practice_value, ''), '') = ''
+                  AND COALESCE(NULLIF(jc.sf_job_id, ''), '') = ''
+                  AND COALESCE(jc.status, '') NOT ILIKE %s
+                  AND EXISTS (SELECT 1 FROM job_event_log b WHERE b.job_id = jc.job_id
+                                AND b.event_type = 'mapping_blocked_no_practice_value'
+                                AND b.created_at >= NOW() - INTERVAL '48 hours')
+                  AND (SELECT count(*) FROM job_event_log r
+                         WHERE r.event_type = 'auto_retry_completed'
+                           AND (r.payload->>'email_scrape_id') = jc.email_scrape_id::text) >= %s
+                  AND NOT EXISTS (SELECT 1 FROM job_event_log a WHERE a.job_id = jc.job_id
+                                    AND a.event_type = 'practice_stuck_alerted')
+                """,
+                ("%closed%", _AUTO_RETRY_MAX_ATTEMPTS),
+            )
+            stuck = cur.fetchall()
+        if not stuck:
+            return
+        from utils.alert_email import send_practice_block_alert
+        for job_id, city, state, link, _escrape_id, attempts in stuck:
+            jid = str(job_id or "").strip()
+            if not jid:
+                continue
+            kimedics_url = (link or "").strip() or f"https://portal.kimedics.com/app/workspace/job-posts/{jid}"
+            sent = send_practice_block_alert(
+                jid, kimedics_url=kimedics_url, city=city or "", state=state or "",
+                attempts=int(attempts or 0),
+            )
+            print(f"  [alert_email] practice-stuck alert for #{jid} (attempts={attempts}) sent={sent}")
+            log_job_event(
+                conn, job_id=jid, event_type="practice_stuck_alerted", run_id=None,
+                schema="public", payload={"email_sent": bool(sent), "attempts": int(attempts or 0)},
+            )
+        conn.commit()
+
+
 def _auto_retry_orphaned_scrapes(*, kimedics_email: str, kimedics_password: str) -> None:
     """
     Find email_scrapes rows with no matching job_content (orphaned by an
@@ -319,6 +375,13 @@ def _auto_retry_orphaned_scrapes(*, kimedics_email: str, kimedics_password: str)
     from utils.playwright_job_scrape import scrape_job_pages
     from utils.pipeline_link_scrape import process_link_scrape_batch
     from utils.supabase_db import get_conn, log_job_event, log_run_finish, log_run_start
+
+    # Layer-3 backstop: surface genuinely-stuck practice jobs every cron, independent
+    # of retry candidates or credentials. Non-fatal — never block the retry path.
+    try:
+        _alert_stuck_practice_jobs(get_conn, log_job_event)
+    except Exception as e:
+        print(f"Auto-retry: stuck-practice alert check failed (non-fatal): {e}")
 
     if not kimedics_email or not kimedics_password:
         print("Auto-retry: KIMEDICS credentials missing; skipping")
