@@ -2216,7 +2216,7 @@ def impact_report_endpoint(payload: dict):
 
 
 @app.local_entrypoint()
-def run_impact_report_once(to: str = "anddy0622@gmail.com"):
+def run_impact_report_once(to: str = "seanhyang1@gmail.com"):
     """Generate + send the all-time impact report. Defaults to a REVIEW-ONLY copy to
     one address; pass --to '' to send to the full distribution, or a comma list."""
     ok = impact_report_job.remote(to)
@@ -2264,7 +2264,7 @@ def run_dates_alert_sample():
     secrets=[modal.Secret.from_name("salesforce-automation")],
     timeout=60,
 )
-def dates_missing_sample_job(to: str = "anddy0622@gmail.com"):
+def dates_missing_sample_job(to: str = "seanhyang1@gmail.com"):
     """Send a [SAMPLE] 'no coverage dates captured' alert (the email a real scrape
     fires when an open job yields no dates) to a single recipient."""
     sys.path.insert(0, "/root")
@@ -2289,7 +2289,7 @@ def dates_missing_sample_job(to: str = "anddy0622@gmail.com"):
 
 
 @app.local_entrypoint()
-def run_dates_missing_sample(to: str = "anddy0622@gmail.com"):
+def run_dates_missing_sample(to: str = "seanhyang1@gmail.com"):
     """Send the [SAMPLE] 'no dates captured' alert via Modal to a single recipient."""
     ok = dates_missing_sample_job.remote(to)
     print(f"Done: sample missing-dates alert sent={ok} -> {to}")

@@ -31,7 +31,6 @@ from typing import Any, Sequence, Optional
 # ── Config ────────────────────────────────────────────────────────────────────
 
 ALERT_RECIPIENTS = [
-    "anddy0622@gmail.com",
     "seanhyang1@gmail.com",
     "proxi@scrubnetwork.com",
 ]
