@@ -782,9 +782,35 @@ def sync_missing_scrape_fields_for_job_ids(
             )
             continue
         attempted += 1
-        r = sync_missing_scrape_fields_to_salesforce(
-            dict(row), conn=conn, job_id_for_log=jid, schema=schema, dry_run=dry_run, run_id=run_id
-        )
-        if r.get("patched"):
-            patched += 1
+        # Per-job isolation: a single job's failure (e.g. a transient Salesforce API
+        # error) must NOT abort the whole batch, and it must be LOGGED — otherwise the
+        # job is left mapped-but-unsynced with no error trail, the recovery engine
+        # (which keys off sf_scrape_fields_error) stays blind, and it shows "Success".
+        # This is exactly what stranded job #20046.
+        try:
+            r = sync_missing_scrape_fields_to_salesforce(
+                dict(row), conn=conn, job_id_for_log=jid, schema=schema, dry_run=dry_run, run_id=run_id
+            )
+            if r.get("patched"):
+                patched += 1
+        except Exception as e:
+            import traceback as _tb
+            log_job_event(
+                conn,
+                job_id=jid,
+                event_type="sf_scrape_fields_error",
+                run_id=run_id,
+                schema=schema,
+                payload={
+                    "reason": "sync_exception",
+                    "error": f"{type(e).__name__}: {e}"[:500],
+                    "sf_job_id": (row.get("sf_job_id") or "").strip() or None,
+                    "detail": (
+                        "Field sync raised before completing for this job. Logged as an error so the "
+                        "recovery loop retries it instead of leaving it mapped-but-unsynced (silent 'Success')."
+                    ),
+                    "traceback": _tb.format_exc()[:1500],
+                },
+            )
+            print(f"  [sf_scrape_sync] field sync errored for #{jid} (logged for recovery): {e}")
     return (attempted, patched)
