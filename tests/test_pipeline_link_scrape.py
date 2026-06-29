@@ -155,3 +155,19 @@ def test_python_src_has_no_legacy_sf_patch_queue_api():
         t = path.read_text(encoding="utf-8")
         for sym in forbidden:
             assert sym not in t, f"{sym!r} must not appear in {path.relative_to(_AUTOMATION_ROOT)}"
+
+
+def test_log_step_failure_records_per_job_error(monkeypatch):
+    """A STEP-level crash (before per-job logging) must be recorded as a per-job error
+    event for every touched job — never swallowed by a bare print (the #20046 cause)."""
+    import utils.pipeline_link_scrape as p
+    import utils.supabase_db as db
+    logged = []
+    monkeypatch.setattr(
+        db, "log_job_event",
+        lambda conn, **k: logged.append((k["job_id"], k["event_type"], k["payload"].get("reason"))),
+    )
+    p._log_step_failure(None, ["20046", "20047"], event_type="sf_scrape_fields_error",
+                        step="field_sync", error=RuntimeError("boom"), schema="public", run_id=1)
+    assert ("20046", "sf_scrape_fields_error", "field_sync_step_exception") in logged
+    assert ("20047", "sf_scrape_fields_error", "field_sync_step_exception") in logged

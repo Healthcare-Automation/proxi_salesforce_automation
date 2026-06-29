@@ -362,6 +362,60 @@ def _alert_stuck_practice_jobs(get_conn, log_job_event) -> None:
         conn.commit()
 
 
+_RESYNC_SWEEP_MAX = 25  # cap mapped-but-unsynced jobs re-synced per cron
+
+
+def _resync_unsynced_mapped_jobs(get_conn) -> None:
+    """
+    The "never again" backstop. Any job mapped to Salesforce (sf_job_id is set) that has
+    NO field-sync event of ANY kind — patched, recovered, skip, error, or no-mapping —
+    since its latest scrape never had its details written and left no trail. That is the
+    exact #20046 silent-failure shape, and it can be produced by ANY future bug, not just
+    the one we fixed. So instead of trusting every code path to log correctly, we sweep
+    the DB every cron and re-run the field sync for these jobs: it pushes the values, or
+    (now that errors are isolated + logged) records an error the recovery loop will retry.
+    Self-limiting — once a job has any field-sync event it drops out of this set.
+    """
+    with get_conn() as conn:
+        if conn is None:
+            return
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT jc.job_id
+                FROM job_content jc
+                WHERE jc.id IN (SELECT MAX(id) FROM job_content GROUP BY job_id)   -- latest row per job
+                  AND COALESCE(NULLIF(jc.sf_job_id, ''), '') <> ''                 -- mapped to Salesforce
+                  AND COALESCE(jc.status, '') NOT ILIKE %s                         -- still open
+                  AND jc.created_at <  NOW() - INTERVAL '15 minutes'               -- not mid-pipeline
+                  AND jc.created_at >  NOW() - INTERVAL '21 days'                  -- bounded window
+                  AND NOT EXISTS (
+                    SELECT 1 FROM job_event_log e
+                    WHERE e.job_id = jc.job_id
+                      AND e.event_type IN (
+                            'sf_scrape_fields_patched', 'sf_scrape_fields_recovered',
+                            'sf_scrape_fields_skip', 'sf_scrape_fields_error',
+                            'sf_sync_skipped_no_mapping')
+                      AND e.created_at >= jc.created_at - INTERVAL '5 minutes'      -- since this scrape
+                  )
+                ORDER BY jc.created_at DESC
+                LIMIT %s
+                """,
+                ("%closed%", _RESYNC_SWEEP_MAX),
+            )
+            ids = [str(r[0]) for r in cur.fetchall() if str(r[0] or "").strip()]
+        if not ids:
+            return
+        print(f"[resync-sweep] {len(ids)} mapped-but-unsynced job(s) — re-running field sync: {ids}")
+        try:
+            from utils.sf_scrape_sync import sync_missing_scrape_fields_for_job_ids
+            att, patched = sync_missing_scrape_fields_for_job_ids(conn, ids, schema="public", run_id=None)
+            conn.commit()
+            print(f"[resync-sweep] attempted={att} patched={patched}")
+        except Exception as e:
+            print(f"[resync-sweep] field sync raised (per-job errors logged inside): {e}")
+
+
 def _auto_retry_orphaned_scrapes(*, kimedics_email: str, kimedics_password: str) -> None:
     """
     Find email_scrapes rows with no matching job_content (orphaned by an
@@ -376,12 +430,17 @@ def _auto_retry_orphaned_scrapes(*, kimedics_email: str, kimedics_password: str)
     from utils.pipeline_link_scrape import process_link_scrape_batch
     from utils.supabase_db import get_conn, log_job_event, log_run_finish, log_run_start
 
-    # Layer-3 backstop: surface genuinely-stuck practice jobs every cron, independent
-    # of retry candidates or credentials. Non-fatal — never block the retry path.
+    # Backstops that run every cron, independent of retry candidates or credentials.
+    # Non-fatal — never block the retry path.
     try:
         _alert_stuck_practice_jobs(get_conn, log_job_event)
     except Exception as e:
         print(f"Auto-retry: stuck-practice alert check failed (non-fatal): {e}")
+    try:
+        # The "never again" sweep: re-sync any mapped-but-unsynced job (the #20046 shape).
+        _resync_unsynced_mapped_jobs(get_conn)
+    except Exception as e:
+        print(f"Auto-retry: mapped-but-unsynced resync sweep failed (non-fatal): {e}")
 
     if not kimedics_email or not kimedics_password:
         print("Auto-retry: KIMEDICS credentials missing; skipping")
@@ -1200,7 +1259,13 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
                           AND rs.created_at >= jel.created_at
                           AND COALESCE(rs.payload->>'action','') IN ('re_scraped','re_scraped_with_warning')
                       )
-                    ) AS stuck
+                    ) AS stuck,
+                    -- Did the scrape's field sync reach a terminal resolution (patched,
+                    -- recovered, or a deliberate skip)? A MAPPED row with NONE of these never
+                    -- had its details written to Salesforce — the silent #20046 failure.
+                    bool_or(jel.event_type IN (
+                      'sf_scrape_fields_patched', 'sf_scrape_fields_recovered', 'sf_scrape_fields_skip'
+                    )) AS field_sync_resolved
                   FROM window_emails we
                   LEFT JOIN job_event_log jel
                     ON jel.job_id = we.job_post_id
@@ -1227,7 +1292,8 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
                   COALESCE(ev.push_recovered, 0)   AS push_recovered,
                   COALESCE(ev.push_errors, 0)      AS push_errors,
                   COALESCE(ev.push_error_unresolved, false) AS push_error_unresolved,
-                  COALESCE(ev.stuck, false)        AS stuck
+                  COALESCE(ev.stuck, false)        AS stuck,
+                  COALESCE(ev.field_sync_resolved, false) AS field_sync_resolved
                 FROM window_emails we
                 LEFT JOIN jc_by_email jc ON jc.email_scrape_id = we.id
                 LEFT JOIN events      ev ON ev.email_scrape_id = we.id
@@ -1272,6 +1338,9 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
     stats["silent_failures"]     = _jobs(lambda r: int(r["silent_failures"] or 0) > 0)
     stats["pushes_recovered"]    = _jobs(lambda r: int(r["push_recovered"] or 0) > 0)
     stats["push_errors_unresolved"] = _jobs(lambda r: r["push_error_unresolved"])
+    # Mapped to Salesforce but its fields were never written (no field-sync resolution).
+    # This is the silent #20046 failure — it must surface as a problem, never a success.
+    stats["mapped_not_synced"] = _jobs(lambda r: r["sf_mapped"] and not r.get("field_sync_resolved"))
 
     return stats
 

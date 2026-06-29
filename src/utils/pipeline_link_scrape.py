@@ -9,6 +9,46 @@ import re
 from typing import Any, Set
 
 
+def _log_step_failure(conn, job_ids, *, event_type: str, step: str, error: Exception,
+                      schema: str, run_id) -> None:
+    """Record a STEP-level crash as a per-job error event so it's never swallowed.
+
+    Without this, a crash in the SF resolution / field-sync step (before per-job
+    logging runs) left every touched job with no error trail — invisible to the
+    recovery loop and to the dashboard, which then showed a false "Success"
+    (job #20046). One ``sf_scrape_fields_error`` per job fixes both: the recovery
+    engine retries it, and the dashboard/report mark it as not-done."""
+    import traceback as _tb
+    tb = _tb.format_exc()[:1500]
+    try:
+        from utils.supabase_db import log_job_event
+    except Exception:
+        return
+    for jid in job_ids:
+        sid = str(jid or "").strip()
+        if not sid:
+            continue
+        try:
+            log_job_event(
+                conn,
+                job_id=sid,
+                event_type=event_type,
+                run_id=run_id,
+                schema=schema,
+                payload={
+                    "reason": f"{step}_step_exception",
+                    "error": f"{type(error).__name__}: {error}"[:400],
+                    "detail": (
+                        f"The {step} step crashed before it could finish for this job. Logged per job so "
+                        "it is flagged as not-synced and the recovery loop retries it — never a silent success."
+                    ),
+                    "traceback": tb,
+                },
+            )
+        except Exception:
+            pass
+
+
 def process_link_scrape_batch(
     conn,
     *,
@@ -105,6 +145,11 @@ def process_link_scrape_batch(
             print(f"  [alert_email] dates review alert skipped for #{job_post_id}: {_e}")
 
     # ── SF resolution + scrape-field sync (existing) ──────────────────────────
+    # Both steps are wrapped so a STEP-LEVEL crash (before per-job logging is even
+    # reached) is recorded as a per-job error event — NEVER swallowed by a bare print.
+    # A swallowed sync crash is exactly what left job #20046 mapped-but-unsynced while
+    # still showing "Success". An error event makes it visible AND lets the recovery
+    # loop retry it.
     if touched_job_ids:
         try:
             from utils.sf_job_supabase_resolve import resolve_sf_ids_for_job_ids
@@ -115,7 +160,9 @@ def process_link_scrape_batch(
             if updated:
                 print(f"Resolved sf ids for {updated}/{len(touched_job_ids)} touched job(s).")
         except Exception as e:
-            print(f"SF id resolution step skipped (error): {e}")
+            print(f"SF id resolution step FAILED: {e}")
+            _log_step_failure(conn, sorted(touched_job_ids), event_type="sf_mapping_pull_failed",
+                              step="sf_id_resolution", error=e, schema=schema, run_id=link_run_id)
 
         try:
             from utils.sf_scrape_sync import sync_missing_scrape_fields_for_job_ids
@@ -132,7 +179,9 @@ def process_link_scrape_batch(
                     f"(touched job_ids={len(touched_job_ids)})."
                 )
         except Exception as e:
-            print(f"Salesforce scrape-field sync skipped (error): {e}")
+            print(f"Salesforce scrape-field sync STEP FAILED: {e}")
+            _log_step_failure(conn, sorted(touched_job_ids), event_type="sf_scrape_fields_error",
+                              step="field_sync", error=e, schema=schema, run_id=link_run_id)
 
     # ── Pass 2: consolidated alerting with full pipeline context ──────────────
     _decide_and_send_alerts(conn, per_row_state, link_run_id, schema)
