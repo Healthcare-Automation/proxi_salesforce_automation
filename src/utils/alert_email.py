@@ -475,6 +475,7 @@ def send_daily_summary(stats: dict) -> bool:
     push_errors_total     = g("push_errors_total",       0)
     push_errors_unresolved = g("push_errors_unresolved", 0)
     mapped_not_synced     = g("mapped_not_synced",       0)
+    sync_failed_recovered = g("sync_failed_recovered",   0)
     rows            = g("rows",                 [])
 
     if emails == 0:
@@ -489,7 +490,7 @@ def send_daily_summary(stats: dict) -> bool:
             or silent_failures > 0 or mapped_not_synced > 0):
         health_badge = '<span class="badge badge-crit">NEEDS ATTENTION</span>'
         subject_pfx  = "🚨"
-    elif ext_id_swaps > 0 or fields_quarantined > 0 or pushes_recovered > 0:
+    elif ext_id_swaps > 0 or fields_quarantined > 0 or pushes_recovered > 0 or sync_failed_recovered > 0:
         health_badge = '<span class="badge badge-warn">REVIEW AMENDMENTS</span>'
         subject_pfx  = "⚠️"
     else:
@@ -499,14 +500,15 @@ def send_daily_summary(stats: dict) -> bool:
     # Subject includes amendments when present so operators can triage from inbox.
     subject_amend = ""
     if (pushes_recovered or fields_quarantined or push_errors_unresolved or blocked_no_practice
-            or silent_failures or mapped_not_synced):
+            or silent_failures or mapped_not_synced or sync_failed_recovered):
         bits = []
         if pushes_recovered:       bits.append(f"{pushes_recovered} recovered")
         if fields_quarantined:     bits.append(f"{fields_quarantined} field{'s' if fields_quarantined != 1 else ''} dropped")
         if push_errors_unresolved: bits.append(f"{push_errors_unresolved} push err")
         if blocked_no_practice:    bits.append(f"{blocked_no_practice} blocked (no practice)")
         if silent_failures:        bits.append(f"{silent_failures} silent fail")
-        if mapped_not_synced:      bits.append(f"{mapped_not_synced} mapped, not synced")
+        if mapped_not_synced:      bits.append(f"{mapped_not_synced} not synced")
+        if sync_failed_recovered:  bits.append(f"{sync_failed_recovered} sync recovered")
         subject_amend = " · " + " · ".join(bits)
     subject = (
         f"{subject_pfx} Proxi Daily — {period} — "
@@ -543,7 +545,8 @@ def send_daily_summary(stats: dict) -> bool:
         + _box(manual_rescr,    "Manual Rescrapes", "#0369a1" if manual_rescr else "#aaa")
         + _box(stuck_jobs,      "Stuck (needs fix)", color_red if stuck_jobs else "#aaa")
         + _box(scrape_fails,    "Scrape Failures",  color_red if scrape_fails else "#aaa")
-        + _box(mapped_not_synced, "Mapped, Not Synced", color_red if mapped_not_synced else "#aaa")
+        + _box(mapped_not_synced, "Sync Failed (broken)", color_red if mapped_not_synced else "#aaa")
+        + _box(sync_failed_recovered, "Sync Failed (recovered)", color_amber if sync_failed_recovered else "#aaa")
         + "</div>"
     )
 
@@ -610,6 +613,10 @@ def send_daily_summary(stats: dict) -> bool:
                 sf_html = _chip("not synced", "red",
                                 "Mapped to a Salesforce record but its details were NEVER written "
                                 "(no field-sync completed) — a failure, being auto-recovered. This is the #20046 case.")
+            elif r["sf_mapped"] and not r.get("field_sync_prompt"):
+                sf_html = _chip("synced late", "amber",
+                                "Mapped but its details didn’t sync promptly — a sync failure that was "
+                                "recovered afterward. Shown so it isn’t hidden behind a clean success.")
             elif r["sf_mapped"]:
                 sf_html = _chip("mapped", "green", f"Mapped to Salesforce · sf_job_id={sfid}")
             elif int(r.get("blocked_no_practice") or 0) > 0:
@@ -752,6 +759,7 @@ def send_daily_summary(stats: dict) -> bool:
         scrape = "OK" if r["scrape_ok"] else ("STUCK" if r["stuck"] else "—")
         sf = (
             "NOT SYNCED" if (r["sf_mapped"] and not r.get("field_sync_resolved"))
+            else "SYNCED LATE" if (r["sf_mapped"] and not r.get("field_sync_prompt"))
             else "OK" if r["sf_mapped"]
             else "BLOCKED" if int(r.get("blocked_no_practice") or 0) > 0
             else "STUCK" if r["stuck"]

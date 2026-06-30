@@ -1293,7 +1293,19 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
                   COALESCE(ev.push_errors, 0)      AS push_errors,
                   COALESCE(ev.push_error_unresolved, false) AS push_error_unresolved,
                   COALESCE(ev.stuck, false)        AS stuck,
-                  COALESCE(ev.field_sync_resolved, false) AS field_sync_resolved
+                  COALESCE(ev.field_sync_resolved, false) AS field_sync_resolved,
+                  -- Did the job's fields sync PROMPTLY (within 10 min of being mapped)?
+                  -- If it was mapped but only synced later (or not at all), a sync FAILURE
+                  -- happened during this period — even if it was recovered afterward. The
+                  -- report records that it went wrong, not just the current state.
+                  EXISTS (
+                    SELECT 1 FROM job_event_log m, job_event_log fp
+                    WHERE m.job_id = we.job_post_id AND m.event_type = 'sf_ids_update'
+                      AND COALESCE(m.payload->'next'->>'sf_job_id', '') <> ''
+                      AND fp.job_id = we.job_post_id
+                      AND fp.event_type IN ('sf_scrape_fields_patched', 'sf_scrape_fields_recovered', 'sf_scrape_fields_skip')
+                      AND fp.created_at BETWEEN m.created_at - INTERVAL '5 minutes' AND m.created_at + INTERVAL '10 minutes'
+                  ) AS field_sync_prompt
                 FROM window_emails we
                 LEFT JOIN jc_by_email jc ON jc.email_scrape_id = we.id
                 LEFT JOIN events      ev ON ev.email_scrape_id = we.id
@@ -1338,9 +1350,15 @@ def _build_daily_stats(get_conn, validate_scraped_job, issues_as_text, issues_su
     stats["silent_failures"]     = _jobs(lambda r: int(r["silent_failures"] or 0) > 0)
     stats["pushes_recovered"]    = _jobs(lambda r: int(r["push_recovered"] or 0) > 0)
     stats["push_errors_unresolved"] = _jobs(lambda r: r["push_error_unresolved"])
-    # Mapped to Salesforce but its fields were never written (no field-sync resolution).
-    # This is the silent #20046 failure — it must surface as a problem, never a success.
-    stats["mapped_not_synced"] = _jobs(lambda r: r["sf_mapped"] and not r.get("field_sync_resolved"))
+    # Sync failures that occurred this period (the report records what went wrong, not
+    # just the current state):
+    #   • still broken  — mapped but never synced (the silent #20046 failure). Critical.
+    #   • recovered     — mapped, didn't sync promptly, but was fixed afterward. Still a
+    #                     failure that happened and must be shown, just not critical.
+    stats["mapped_not_synced"]     = _jobs(lambda r: r["sf_mapped"] and not r.get("field_sync_resolved"))
+    stats["sync_failed_recovered"] = _jobs(
+        lambda r: r["sf_mapped"] and r.get("field_sync_resolved") and not r.get("field_sync_prompt")
+    )
 
     return stats
 
