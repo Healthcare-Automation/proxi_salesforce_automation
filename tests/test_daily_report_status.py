@@ -40,6 +40,7 @@ def test_still_broken_sync_is_critical(monkeypatch):
     assert "not synced" in cap["html"]
     assert "Sync Failed (broken)" in cap["html"]
     assert "NOT SYNCED" in cap["text"]
+    assert "auto-recovering" in cap["html"]   # row shows it is being fixed
 
 
 def test_recovered_late_sync_is_shown(monkeypatch):
@@ -53,6 +54,7 @@ def test_recovered_late_sync_is_shown(monkeypatch):
     assert "Sync Failed (recovered)" in cap["html"]
     assert "REVIEW AMENDMENTS" in cap["html"]            # surfaced, but not critical
     assert "SYNCED LATE" in cap["text"]
+    assert "amended later" in cap["html"]    # the recovery is named in Notes
 
 
 def test_promptly_synced_job_is_clean(monkeypatch):

@@ -654,6 +654,16 @@ def send_daily_summary(stats: dict) -> bool:
 
             # Notes — chips show amendments + actions for this email.
             notes: list[str] = []
+            # Sync-failure recovery status, so the row tells the whole story:
+            #   • not synced → still being fixed by the auto-recovery sweep.
+            #   • synced late → it failed at first but was amended afterward.
+            if r["sf_mapped"] and not r.get("field_sync_resolved"):
+                notes.append(_chip("auto-recovering", "amber",
+                                   "Mapped but its details haven’t synced yet — the recovery sweep is "
+                                   "re-pushing it and will resolve it within minutes."))
+            elif r["sf_mapped"] and not r.get("field_sync_prompt"):
+                notes.append(_chip("amended later", "cyan",
+                                   "Didn’t sync promptly, but its details were written afterward (recovered)."))
             quar_n = int(r.get("fields_quarantined") or 0)
             rec_n  = int(r.get("push_recovered") or 0)
             err_n  = int(r.get("push_errors") or 0)
