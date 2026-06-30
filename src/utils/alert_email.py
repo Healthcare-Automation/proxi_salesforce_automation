@@ -66,6 +66,13 @@ _BASE_STYLE = """
        font-size:12px; color:#666; font-weight:600; }
   td { padding:7px 10px; border-bottom:1px solid #f0f0f0; vertical-align:top; }
   tr:last-child td { border-bottom:none; }
+  /* Email-by-email table: compact so all columns fit the body width on web, and the
+     debug buttons WRAP to a new line (never overflow/clip) when the row is narrow. */
+  .ebe { font-size:11.5px; }
+  .ebe th, .ebe td { padding:5px 6px; }
+  .dbtn { display:inline-block; padding:2px 7px; margin:1px 4px 1px 0; border:1px solid #d1d5db;
+          border-radius:5px; background:#f3f4f6; color:#374151; font-size:9.5px; font-weight:700;
+          text-decoration:none; line-height:1.6; white-space:nowrap; }
   .badge { display:inline-block; padding:2px 8px; border-radius:12px;
            font-size:11px; font-weight:700; letter-spacing:.3px; }
   .badge-crit { background:#fde8e8; color:#c0392b; }
@@ -98,6 +105,9 @@ _BASE_STYLE = """
     .stat-box .lbl { font-size:10px !important; }
     table { font-size:12px !important; }
     th, td { padding:5px 6px !important; }
+    .ebe { font-size:11px !important; }
+    .ebe th, .ebe td { padding:4px 4px !important; }
+    .dbtn { padding:2px 5px !important; font-size:9px !important; margin:1px 3px 1px 0 !important; }
   }
 </style>
 """
@@ -672,21 +682,19 @@ def send_daily_summary(stats: dict) -> bool:
                 notes.append(_chip("rescraped", "blue", "Operator hit Rescrape in /admin/recovery"))
             notes_html = " ".join(notes) if notes else '<span style="color:#aaa;">—</span>'
 
-            # Debug buttons — Kimedics + Salesforce, side by side on one line so each
-            # job stays a single row. Clearly buttons (not inline text links).
+            # Debug buttons — Kimedics + Salesforce. Side by side when there's room;
+            # they WRAP to a second line on narrow widths instead of overflowing the
+            # table (each button itself never breaks). Compact .dbtn keeps the table
+            # within the email body on both web and mobile.
             def _btn(href: str, label: str) -> str:
-                return (
-                    f'<a href="{href}" style="display:inline-block;padding:3px 10px;border:1px solid #d1d5db;'
-                    f'border-radius:5px;background:#f3f4f6;color:#374151;font-size:10px;font-weight:700;'
-                    f'text-decoration:none;line-height:1.4;">{label}</a>'
-                )
+                return f'<a href="{href}" class="dbtn">{label}</a>'
             btns = []
             if link:
                 btns.append(_btn(link, "Kimedics"))
             if sfid and r["sf_mapped"]:
                 btns.append(_btn(f"https://proxi.lightning.force.com/lightning/r/Job__c/{sfid}/view", "SF"))
             open_html = (
-                f'<span style="white-space:nowrap;">{"&nbsp;".join(btns)}</span>'
+                "".join(btns)
                 if btns else '<span style="color:#aaa;">—</span>'
             )
 
@@ -708,7 +716,7 @@ def send_daily_summary(stats: dict) -> bool:
                 f"<td style='text-align:center;'>{sf_html}</td>"
                 f"<td>{fields_html}</td>"
                 f"<td>{notes_html}</td>"
-                f"<td style='white-space:nowrap;text-align:right;'>{open_html}</td>"
+                f"<td>{open_html}</td>"
                 "</tr>"
             )
 
@@ -719,14 +727,17 @@ def send_daily_summary(stats: dict) -> bool:
             One row per email received. Each row shows whether the job was scraped, whether SF was mapped,
             how many fields were patched, and any notable actions (ID swap, rescrape, stuck, etc.).
           </p>
-          <table style="font-size:12px;width:100%;">
+          <!-- Scroll wrapper: on a narrow phone the 9-column table scrolls sideways here
+               instead of overflowing/clipping the email body. On web it fits and never scrolls. -->
+          <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">
+          <table class="ebe" style="width:100%;min-width:680px;">
             <tr>
               <th>Time</th><th>Email</th><th>Job</th><th>Title / Org</th>
               <th>Scrape</th><th>SF</th><th>SF Fields</th><th>Notes</th><th>Open</th>
             </tr>
             {''.join(body_rows)}
           </table>
-        </div>"""
+          </div>"""
     else:
         emails_section = (
             '<div class="section"><h2>Email-by-email outcome</h2>'
