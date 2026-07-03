@@ -386,7 +386,10 @@ def _resync_unsynced_mapped_jobs(get_conn) -> None:
                 FROM job_content jc
                 WHERE jc.id IN (SELECT MAX(id) FROM job_content GROUP BY job_id)   -- latest row per job
                   AND COALESCE(NULLIF(jc.sf_job_id, ''), '') <> ''                 -- mapped to Salesforce
-                  AND COALESCE(jc.status, '') NOT ILIKE %s                         -- still open
+                  -- NOTE: closed jobs are INCLUDED. A job that closes while unsynced (e.g. a
+                  -- 'status: Closed' update whose field sync silently didn't run — #20076) must
+                  -- still have its final state recorded in Salesforce; the sweep is the only
+                  -- thing that recovers it, since it never gets re-scraped after closing.
                   AND jc.created_at <  NOW() - INTERVAL '15 minutes'               -- not mid-pipeline
                   AND jc.created_at >  NOW() - INTERVAL '21 days'                  -- bounded window
                   AND NOT EXISTS (
@@ -401,7 +404,7 @@ def _resync_unsynced_mapped_jobs(get_conn) -> None:
                 ORDER BY jc.created_at DESC
                 LIMIT %s
                 """,
-                ("%closed%", _RESYNC_SWEEP_MAX),
+                (_RESYNC_SWEEP_MAX,),
             )
             ids = [str(r[0]) for r in cur.fetchall() if str(r[0] or "").strip()]
         if not ids:
