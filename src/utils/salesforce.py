@@ -186,11 +186,18 @@ def get_token_client_credentials(
     No username or password. Requires "Run As" configured in the ECA's OAuth Policies.
     Returns dict with access_token, instance_url, etc.
 
-    Token POST always uses login.salesforce.com (production) or test.salesforce.com (sandbox).
-    ``token_url`` is ignored (kept for call-site compatibility).
+    Salesforce only supports this grant on the org My Domain host
+    (e.g. https://proxi.my.salesforce.com), never login.salesforce.com — pass it via
+    ``token_url``. (``use_sandbox`` is unused; the sandbox My Domain is carried by token_url.)
     """
-    host = "test.salesforce.com" if use_sandbox else "login.salesforce.com"
-    url = f"https://{host}/services/oauth2/token"
+    base = (token_url or "").strip().rstrip("/")
+    host = urllib.parse.urlparse(base).hostname or ""
+    if not host.endswith(".my.salesforce.com"):
+        raise RuntimeError(
+            "client_credentials requires the org My Domain in SALESFORCE_TOKEN_URL "
+            f"(e.g. https://proxi.my.salesforce.com); got {token_url or '(unset)'!r}."
+        )
+    url = f"{base}/services/oauth2/token"
 
     body = {
         "grant_type": "client_credentials",

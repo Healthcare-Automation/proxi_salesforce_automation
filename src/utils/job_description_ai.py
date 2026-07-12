@@ -31,6 +31,17 @@ class DateResolution:
     reason: str = ""
 
 
+_DANGLING_DASH_RE = re.compile(r"\s*[-–—]+\s*$")
+
+
+def strip_dangling_range_dash(dates: str) -> str:
+    """Remove a trailing range dash with no end date ('July 15-' → 'July 15').
+    Posters sometimes leave the dash in or forget the end date ('July 15- open
+    to roster'); the dangling dash is poster error, not data — it reads as a
+    typo in Salesforce and in the review alerts. Inner ranges are untouched."""
+    return _DANGLING_DASH_RE.sub("", (dates or "").strip())
+
+
 # ── Active-dates override (AI) ───────────────────────────────────────────────
 #
 # Kimedics posts carry a full ``Dates:`` line listing every date ever associated
@@ -208,7 +219,7 @@ def _validate_ai_dates(
         raise ValueError("AI date override: JSON is not an object")
     if not obj.get("override"):
         return DateResolution(None, 100, "")
-    dates = str(obj.get("dates") or "").strip().rstrip(".").strip()
+    dates = strip_dangling_range_dash(str(obj.get("dates") or "").strip().rstrip(".").strip())
     if not dates:
         return DateResolution(None, 100, "")
     haystack = _norm_for_match(f"{description_full_text} {structured_dates or ''}")

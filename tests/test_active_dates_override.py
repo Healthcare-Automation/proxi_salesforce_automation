@@ -205,3 +205,24 @@ def test_live_cancellation_subtracts_cancelled_dates(live_ai):
 def test_live_cancellation_with_restated_need_uses_need(live_ai):
     txt = "6/5 update. June 8-9 have been cancelled. Partial fill. Active need is June 26\nDates: June 8-9, 17-19, 26"
     assert ai.ai_active_dates_override(txt, "June 8-9, 17-19, 26").dates == "June 26"
+
+
+# ── strip_dangling_range_dash (#19705: 'July 15-' poster typo) ────────────────
+def test_dangling_dash_is_stripped():
+    assert ai.strip_dangling_range_dash("July 15-") == "July 15"
+    assert ai.strip_dangling_range_dash("July 15 -") == "July 15"
+    assert ai.strip_dangling_range_dash("July 15–") == "July 15"   # en dash
+    assert ai.strip_dangling_range_dash("July 15— ") == "July 15"  # em dash
+
+
+def test_inner_ranges_untouched():
+    assert ai.strip_dangling_range_dash("May 18-22, 26-29") == "May 18-22, 26-29"
+    assert ai.strip_dangling_range_dash("July 15-20") == "July 15-20"
+
+
+def test_validate_strips_dangling_dash_from_ai_result():
+    raw = '{"override": true, "dates": "July 15-", "confidence": 90, "reason": "no end date"}'
+    desc = "7/7 date reopened. Active need is July 15- open to roster"
+    res = ai._validate_ai_dates(raw, desc)
+    assert res.dates == "July 15"
+    assert res.confidence == 90

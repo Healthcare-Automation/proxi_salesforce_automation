@@ -9,7 +9,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from utils.job_content_parser import (
     repair_flat_jobpost_text_missing_posted_date,
@@ -602,11 +602,23 @@ def scrape_job_pages(
     rows_with_email_scrape_id: list[tuple[dict, int]],
     kimedics_email: str,
     kimedics_password: str,
+    *,
+    on_result: Optional[Callable[[dict], None]] = None,
+    deadline_ts: Optional[float] = None,
 ) -> list[dict]:
     """
     For each (row, email_scrape_id): visit row["view_job_link"], extract body + description textarea, parse.
     Returns list of dicts: job_post_id, email_received_date, cleaned, error.
     One browser session; login on first URL.
+
+    ``on_result`` is invoked with each result dict the moment it exists, so the
+    caller can persist/push it immediately — a hard kill mid-batch then loses at
+    most the page in flight, never the whole batch. Callback errors are logged
+    and never break the scrape loop.
+
+    ``deadline_ts`` is a ``time.monotonic()`` timestamp; once reached, remaining
+    pages are left unscraped (their email_scrapes stay orphaned, so the
+    auto-retry tail picks them up) instead of running into Modal's hard kill.
     """
     from utils.job_content_parser import parse_job_content_txt
 
@@ -650,7 +662,16 @@ def scrape_job_pages(
         # Track consecutive auth failures to fast-fail the rest of the batch
         # when Kimedics auth is broken globally (see AUTH_BROKEN_SKIP_THRESHOLD).
         consecutive_auth_fails = 0
+        reported = 0
         for idx, (row, email_scrape_id) in enumerate(rows_with_email_scrape_id, 1):
+            if deadline_ts is not None and time.monotonic() >= deadline_ts:
+                print(
+                    f"  [time-budget] stopping with {total - idx + 1} page(s) unscraped — "
+                    "left orphaned for the auto-retry tail",
+                    file=sys.stderr,
+                )
+                break
+
             job_id = row.get("job_post_id", "")
             url = (row.get("view_job_link") or "").strip()
             email_date = row.get("date")
@@ -755,6 +776,17 @@ def scrape_job_pages(
                     "body_sample": body_sample,
                     "email_scrape_id": email_scrape_id,
                 })
+            if on_result is not None:
+                while reported < len(results):
+                    try:
+                        on_result(results[reported])
+                    except Exception as cb_e:
+                        print(
+                            f"  [on-result-error] job {results[reported].get('job_post_id', '?')}: {cb_e}",
+                            file=sys.stderr,
+                        )
+                    reported += 1
+
             if idx < total:
                 time.sleep(BETWEEN_URLS_S)
 

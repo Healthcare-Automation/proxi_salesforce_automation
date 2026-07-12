@@ -2415,6 +2415,120 @@ def send_practice_block_alert(
     return _send(subject, html, text, recipients=recipients)
 
 
+# ── Pipeline watchdog alert ──────────────────────────────────────────────────────────
+
+_HUB_URL = "https://automation-hub-rosy.vercel.app"
+
+
+def send_pipeline_watchdog_alert(
+    *,
+    orphans: list[dict],
+    unsynced: list[dict],
+    cron_dead: bool,
+    beat_age_minutes: Optional[int] = None,
+    inbox_locked: bool = False,
+    fetch_age_minutes: Optional[int] = None,
+    recipients: Optional[Sequence[str]] = None,
+) -> bool:
+    """
+    Independent watchdog alert — fired from its own cron when the pipeline is in
+    trouble it cannot report itself (hard-killed task, dead cron, stuck backlog,
+    persistent inbox lockout).
+    ``orphans``: [{job_id, age_min, attempts}], ``unsynced``: [{job_id, age_min}].
+    """
+    problems: list[str] = []
+    if cron_dead:
+        problems.append(
+            "the scrape cron is NOT running"
+            + (f" (last heartbeat {beat_age_minutes} min ago)" if beat_age_minutes is not None
+               else " (no heartbeat recorded)")
+        )
+    if inbox_locked:
+        problems.append(
+            f"the mailbox has been unreadable for {fetch_age_minutes} min"
+        )
+    if orphans:
+        problems.append(f"{len(orphans)} job update(s) received but not scraped")
+    if unsynced:
+        problems.append(f"{len(unsynced)} job(s) linked to Salesforce but details not written")
+
+    subject = f"🚨 Proxi watchdog — {'; '.join(problems)}"
+    headline = "Pipeline needs attention — " + "; ".join(problems)
+    lede = ("The independent watchdog found work stuck past its normal auto-recovery window. "
+            "These are updates from Kimedics that have not fully reached Salesforce. "
+            "Auto-recovery keeps retrying, but something is preventing it from clearing — "
+            "please check the automation hub.")
+
+    def _job_rows(items: list[dict], detail) -> str:
+        return "".join(
+            f'<tr><td style="padding:5px 14px 5px 0;font-size:13px;font-weight:600;color:#111827;white-space:nowrap;">'
+            f'<a href="https://portal.kimedics.com/app/workspace/job-posts/{_html_escape(i["job_id"])}" style="color:#2563eb;">#{_html_escape(i["job_id"])}</a></td>'
+            f'<td style="padding:5px 0;font-size:13px;color:#6b7280;">{detail(i)}</td></tr>'
+            for i in items[:15]
+        ) + (
+            f'<tr><td colspan="2" style="padding:5px 0;font-size:12px;color:#9ca3af;">…and {len(items) - 15} more</td></tr>'
+            if len(items) > 15 else ""
+        )
+
+    sections: list[str] = []
+    if cron_dead:
+        beat_txt = (f"last ran {beat_age_minutes} min ago" if beat_age_minutes is not None
+                    else "has never recorded a heartbeat")
+        sections.append(
+            '<div style="margin-top:14px;padding:10px 12px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;'
+            'font-size:13px;color:#b91c1c;font-weight:600;">Scrape cron down — '
+            f'{beat_txt} (expected every 10 min). New Kimedics updates are NOT being processed.</div>'
+        )
+    if inbox_locked:
+        sections.append(
+            '<div style="margin-top:14px;padding:10px 12px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;'
+            'font-size:13px;color:#b91c1c;font-weight:600;">Mailbox unreadable — the automation has not been able to read '
+            f'the inbox for {fetch_age_minutes} min. Another program is holding all of the mailbox\'s connection slots '
+            '(limit 15). Check which app is connected at myaccount.google.com/apppasswords for the shared inbox. '
+            'The automation keeps retrying every 10 min and will catch up on its own once the inbox frees up.</div>'
+        )
+    if orphans:
+        sections.append(
+            '<div style="margin-top:14px;"><div style="font-size:12px;font-weight:700;color:#374151;margin-bottom:4px;">'
+            f'Received but not scraped ({len(orphans)})</div>'
+            '<table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">'
+            + _job_rows(orphans, lambda i: f'waiting {i["age_min"]} min · {i["attempts"]} auto-retries so far')
+            + "</table></div>"
+        )
+    if unsynced:
+        sections.append(
+            '<div style="margin-top:14px;"><div style="font-size:12px;font-weight:700;color:#374151;margin-bottom:4px;">'
+            f'Linked to Salesforce but details not written ({len(unsynced)})</div>'
+            '<table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">'
+            + _job_rows(unsynced, lambda i: f'unsynced for {i["age_min"]} min')
+            + "</table></div>"
+        )
+
+    html = f"""<!DOCTYPE html><html><body style="margin:0;padding:24px;background:#f9fafb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+      <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #dc2626;border-radius:10px;padding:22px 24px;">
+        <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#b91c1c;">Pipeline watchdog · NEEDS ATTENTION</div>
+        <div style="font-size:17px;font-weight:700;color:#111827;margin:6px 0 4px;">{headline}</div>
+        <div style="font-size:13px;color:#6b7280;line-height:1.6;">{lede}</div>
+        {''.join(sections)}
+        <div style="margin-top:16px;font-size:13px;"><a href="{_HUB_URL}" style="color:#2563eb;">Open the automation hub</a></div>
+      </div>
+      <div style="max-width:560px;margin:12px auto 0;font-size:11px;color:#9ca3af;text-align:center;">Proxi · pipeline watchdog (independent of the scrape cron)</div>
+    </body></html>"""
+
+    text_lines = [headline, "", lede, ""]
+    if cron_dead:
+        text_lines.append(f"CRON DOWN — last heartbeat: {beat_age_minutes if beat_age_minutes is not None else 'never'} min ago")
+    if inbox_locked:
+        text_lines.append(f"MAILBOX UNREADABLE — no successful inbox read for {fetch_age_minutes} min (connection slots held by another program)")
+    for i in orphans:
+        text_lines.append(f"NOT SCRAPED  #{i['job_id']} — waiting {i['age_min']} min, {i['attempts']} auto-retries")
+    for i in unsynced:
+        text_lines.append(f"NOT SYNCED   #{i['job_id']} — unsynced for {i['age_min']} min")
+    text_lines.append(f"\nHub: {_HUB_URL}")
+
+    return _send(subject, html, "\n".join(text_lines), recipients=recipients)
+
+
 # ── Authentication failure alert ────────────────────────────────────────────────────
 
 def send_authentication_failure_alert(

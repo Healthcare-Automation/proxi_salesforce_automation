@@ -451,6 +451,12 @@ def _fill_from_description_blocks(out: dict) -> None:
             out["dates_confidence"] = _res.confidence
             out["dates_reason"] = _res.reason
             out["dates_structured"] = _structured_dates
+    # Last touch on dates_needed: drop a dangling range dash left by the poster
+    # ('July 15-' → 'July 15') on ANY capture path — structured line, recovered
+    # block, or AI resolution.
+    if (out.get("dates_needed") or "").strip():
+        from utils.job_description_ai import strip_dangling_range_dash
+        out["dates_needed"] = strip_dangling_range_dash(out["dates_needed"])
 
     if not (out.get("standard_schedule") or "").strip():
         # Avoid bare "schedule" — it often grabs the next non-label line (e.g. a person's name).
