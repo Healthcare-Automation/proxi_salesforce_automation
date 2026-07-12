@@ -8,6 +8,9 @@ daily_summary_job  — Query Supabase, validate quality, send digest email (dail
 
 Secrets (salesforce-automation): GMAIL_APP_PASSWORD, GMAIL_EMAIL, DB_PASSWORD,
 KIMEDICS_EMAIL, KIMEDICS_PASSWORD, OPENAI_API_KEY, plus Salesforce env vars.
+Secrets (gmail-oauth, scrape job only): GMAIL_OAUTH_CLIENT_ID / _CLIENT_SECRET /
+_REFRESH_TOKEN — enables the Gmail API fetch path (no 15-connection IMAP cap);
+remove these three keys to revert the fetch to pure IMAP, no redeploy needed.
 
 Deploy (from project root) — registers **both** scheduled functions on app ``salesforce-automation``:
   modal deploy src/production/scrape_gmail_modal.py
@@ -20,8 +23,10 @@ Run once (manual):
   modal run src/production/scrape_gmail_modal.py::run_daily_summary_once
 """
 
+import imaplib
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -40,7 +45,10 @@ _src_root  = _modal_dir.parent
 # Full image: Playwright + psycopg2 (for scrape runs)
 _full_image = (
     modal.Image.debian_slim()
-    .pip_install("psycopg2-binary", "playwright", "python-dotenv", "openai>=1.0.0")
+    .pip_install(
+        "psycopg2-binary", "playwright", "python-dotenv", "openai>=1.0.0",
+        "google-api-python-client", "google-auth",
+    )
     .run_commands("playwright install chromium", "playwright install-deps chromium")
     .add_local_dir(_src_root / "utils", remote_path="/root/utils")
 )
@@ -85,13 +93,54 @@ _WARN_THRESHOLD = 3   # 3+ warnings → send alert even without CRITICAL
 
 # ── Scrape pipeline (every 10 min) ────────────────────────────────────────────
 
+# Soft time budgets inside the 600s Modal hard timeout. A hard kill mid-run is
+# what dropped the July 2 burst: job_content was only written after the whole
+# batch, so the kill discarded every page already scraped. Results are now
+# persisted per page (see on_result below), and each Playwright loop stops at
+# its soft deadline and defers the rest to the auto-retry tail — so the hard
+# kill should never fire, and even if it does, at most one in-flight page is lost.
+_MODAL_TIMEOUT_S = 600
+_PRIMARY_SCRAPE_DEADLINE_S = 330   # primary scrape loop stops by t0+330s
+_RUN_SOFT_DEADLINE_S = 510         # everything (incl. auto-retry tail) stops by t0+510s
+_AUTO_RETRY_MIN_BUDGET_S = 60      # don't even start the retry scrape with less than this
+
+
+def _record_heartbeats(*, cron: bool, fetch: bool) -> None:
+    """Best-effort watchdog beats on a short-lived connection. ``cron`` = the tick
+    ran at all; ``fetch`` = the Gmail read actually succeeded. The gap between the
+    two is what lets the watchdog distinguish a dead cron from a locked inbox."""
+    try:
+        from utils.pipeline_watchdog import (
+            HEARTBEAT_GMAIL_CRON,
+            HEARTBEAT_GMAIL_FETCH,
+            record_heartbeat,
+        )
+        from utils.supabase_db import get_conn
+
+        with get_conn() as conn:
+            if conn is None:
+                return
+            if cron:
+                record_heartbeat(conn, HEARTBEAT_GMAIL_CRON)
+            if fetch:
+                record_heartbeat(conn, HEARTBEAT_GMAIL_FETCH)
+            conn.commit()
+    except Exception as e_hb:
+        print(f"warn: heartbeat write failed (non-fatal): {e_hb}")
+
+
 @app.function(
     image=_full_image,
     schedule=modal.Period(minutes=10),
-    secrets=[modal.Secret.from_name("salesforce-automation")],
-    timeout=600,
+    secrets=[
+        modal.Secret.from_name("salesforce-automation"),
+        # Separate secret so the existing one is never recreated/clobbered.
+        modal.Secret.from_name("gmail-oauth"),
+    ],
+    timeout=_MODAL_TIMEOUT_S,
 )
 def scrape_gmail_job():
+    t0 = time.monotonic()
     sys.path.insert(0, "/root")
     from utils.gmail import parse_kimedics_job_email, scrape_emails_from_sender
     from utils.playwright_job_scrape import scrape_job_pages
@@ -117,13 +166,27 @@ def scrape_gmail_job():
         print("GMAIL_APP_PASSWORD not set in secret")
         return 0
 
-    raw_emails = scrape_emails_from_sender(
-        email_account=email_account,
-        email_password=email_password,
-        from_email=from_email,
-        hours=EMAIL_HOURS,
-        max_results=500,
-    )
+    try:
+        raw_emails = scrape_emails_from_sender(
+            email_account=email_account,
+            email_password=email_password,
+            from_email=from_email,
+            hours=EMAIL_HOURS,
+            max_results=500,
+        )
+    except imaplib.IMAP4.error as e:
+        if "too many simultaneous connections" not in str(e).lower():
+            raise
+        # Known daily flood (~08:46 UTC): an external client holds all 15 of the
+        # shared inbox's IMAP slots for ~20-40 min, outlasting the login retries.
+        # Skip quietly — the next tick re-reads a 24h window so nothing is lost,
+        # and the watchdog pages a human via the fetch-staleness signal if the
+        # lockout ever persists. Failing loudly here just produced Modal failure
+        # emails for a condition that self-heals.
+        print("Inbox at its connection cap even after retries — skipping this tick "
+              "(next tick catches up; watchdog alerts if the lockout persists)")
+        _record_heartbeats(cron=True, fetch=False)
+        return 0
     parsed = [parse_kimedics_job_email(e) for e in raw_emails]
 
     conn = None
@@ -144,19 +207,32 @@ def scrape_gmail_job():
     run_id = None
     try:
         ensure_tables(conn)
+        # Liveness beats for the independent watchdog — committed immediately so
+        # they survive even if everything after this point dies. CRON beats every
+        # run; FETCH beats only here, after a successful Gmail read (the capped-
+        # inbox skip path above beats CRON alone), so the watchdog can tell a
+        # locked inbox from a dead cron.
+        try:
+            from utils.pipeline_watchdog import (
+                HEARTBEAT_GMAIL_CRON,
+                HEARTBEAT_GMAIL_FETCH,
+                record_heartbeat,
+            )
+            record_heartbeat(conn, HEARTBEAT_GMAIL_CRON)
+            record_heartbeat(conn, HEARTBEAT_GMAIL_FETCH)
+            conn.commit()
+        except Exception as e_hb:
+            print(f"warn: heartbeat write failed (non-fatal): {e_hb}")
         existing  = get_existing_email_keys(conn, since_hours_ago=SUPABASE_LOOKBACK_HOURS)
         new_rows  = filter_parsed_emails_not_logged(parsed, existing)
 
-        if not new_rows:
-            print("No new emails in the window (all already logged)")
-            return 0
-
-        csv_fields = ["job_post_id", "location", "action_or_change", "view_job_link", "subject", "date", "from_"]
-        run_id = log_run_start(conn, "gmail", csv_fields)
-        if not run_id:
-            return 0
-        email_scrape_ids = log_email_scrapes(conn, run_id, new_rows, csv_fields)
-        conn.commit()
+        if new_rows:
+            csv_fields = ["job_post_id", "location", "action_or_change", "view_job_link", "subject", "date", "from_"]
+            run_id = log_run_start(conn, "gmail", csv_fields)
+            if not run_id:
+                return 0
+            email_scrape_ids = log_email_scrapes(conn, run_id, new_rows, csv_fields)
+            conn.commit()
     finally:
         # Mark the run as finished even if anything above raised after
         # log_run_start. See the link_batch block below for the same pattern
@@ -169,13 +245,40 @@ def scrape_gmail_job():
                 print(f"warn: log_run_finish failed for gmail run_id={run_id}: {e_fin}")
         conn.close()
 
+    if not new_rows:
+        # Nothing new this cron — but still drain any orphaned email_scrapes that
+        # earlier runs logged and never scraped (e.g. a burst that hit the 600s
+        # Modal timeout). Previously we returned here BEFORE the retry tail below,
+        # so on the common "no new emails" cron the orphans never recovered.
+        print("No new emails in the window (all already logged)")
+        try:
+            _auto_retry_orphaned_scrapes(
+                kimedics_email=kimedics_email,
+                kimedics_password=kimedics_password,
+                deadline_ts=t0 + _RUN_SOFT_DEADLINE_S,
+            )
+        except Exception as e:
+            print(f"Auto-retry tail failed (non-fatal): {e}")
+        return 0
+
     print(f"Logged {len(new_rows)} new email(s) to Supabase (run_id={run_id})")
 
+    # Cap the primary batch so a burst of new emails can't run the Playwright
+    # scrape past Modal's 600s timeout — a timeout cancels the whole task and
+    # discards every scraped page, since job_content is only written after the
+    # full batch completes. Overflow emails are already logged as email_scrapes;
+    # the auto-retry tail / subsequent crons pick them up a few at a time.
+    _PRIMARY_SCRAPE_MAX = 8
     with_links = [
         (new_rows[i], email_scrape_ids[i])
         for i in range(len(new_rows))
         if (new_rows[i].get("view_job_link") or "").strip() and i < len(email_scrape_ids)
     ]
+    if len(with_links) > _PRIMARY_SCRAPE_MAX:
+        deferred = len(with_links) - _PRIMARY_SCRAPE_MAX
+        with_links = with_links[:_PRIMARY_SCRAPE_MAX]
+        print(f"Deferring {deferred} job(s) beyond the per-cron cap of "
+              f"{_PRIMARY_SCRAPE_MAX} — auto-retry tail / next crons will drain them")
     if not with_links:
         return len(new_rows)
 
@@ -183,23 +286,48 @@ def scrape_gmail_job():
         print("KIMEDICS_EMAIL / KIMEDICS_PASSWORD not set; skipping link scrape")
         return len(new_rows)
 
-    print(f"Scraping {len(with_links)} job page(s) with Playwright...")
-    scrape_results = scrape_job_pages(with_links, kimedics_email, kimedics_password)
-
+    print(f"Scraping {len(with_links)} job page(s) with Playwright (incremental saves)...")
+    scrape_results: list = []
     link_run_id = None
     with get_conn() as conn:
         if conn:
+            # The link_batch run is created BEFORE scraping and each page's result
+            # is persisted + pushed the moment it's scraped (on_result). A hard
+            # kill mid-batch can then lose at most the page in flight — never the
+            # whole batch, which is how the July 2 burst silently dropped 19 jobs.
             link_run_id = log_run_start(conn, "link_batch", ["job_post_id", "error"])
+            conn.commit()
+
+            def _persist_result(r: dict) -> None:
+                try:
+                    process_link_scrape_batch(
+                        conn,
+                        link_run_id=link_run_id,
+                        scrape_results=[r],
+                        schema="public",
+                    )
+                    conn.commit()
+                except Exception as e_row:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    print(
+                        f"  [incremental-save] job {r.get('job_post_id', '?')} failed to "
+                        f"persist: {e_row} — email stays orphaned; auto-retry will pick it up"
+                    )
+
             try:
-                process_link_scrape_batch(
-                    conn,
-                    link_run_id=link_run_id,
-                    scrape_results=scrape_results,
-                    schema="public",
+                scrape_results = scrape_job_pages(
+                    with_links,
+                    kimedics_email,
+                    kimedics_password,
+                    on_result=_persist_result,
+                    deadline_ts=t0 + _PRIMARY_SCRAPE_DEADLINE_S,
                 )
             finally:
-                # Always mark the run as finished, even if process_link_scrape_batch
-                # raised. Without this guarantee, the scrape_runs row stays orphaned
+                # Always mark the run as finished, even if the scrape raised.
+                # Without this guarantee, the scrape_runs row stays orphaned
                 # (finished_at = NULL) and the dashboard reports "Failed" even when
                 # the work succeeded up to the exception. Best-effort: if the
                 # log_run_finish write itself fails, swallow it so we still let the
@@ -287,6 +415,7 @@ def scrape_gmail_job():
         _auto_retry_orphaned_scrapes(
             kimedics_email=kimedics_email,
             kimedics_password=kimedics_password,
+            deadline_ts=t0 + _RUN_SOFT_DEADLINE_S,
         )
     except Exception as e:
         print(f"Auto-retry tail failed (non-fatal): {e}")
@@ -296,7 +425,7 @@ def scrape_gmail_job():
 
 # Per-cron caps. Keep the auto-retry tail bounded so it never threatens the
 # primary 10-min Modal timeout, even with the new circuit breaker.
-_AUTO_RETRY_MAX_PER_CRON = 3        # at most N orphaned jobs picked per run
+_AUTO_RETRY_MAX_PER_CRON = 6        # at most N orphaned jobs picked per run
 _AUTO_RETRY_MAX_ATTEMPTS = 6        # give up after this many auto-retries
 # Exponential backoff: 5min, 10, 20, 40, 80, 160 → ~5.3h total before giveup.
 _AUTO_RETRY_BACKOFF_BASE_MIN = 5
@@ -419,7 +548,9 @@ def _resync_unsynced_mapped_jobs(get_conn) -> None:
             print(f"[resync-sweep] field sync raised (per-job errors logged inside): {e}")
 
 
-def _auto_retry_orphaned_scrapes(*, kimedics_email: str, kimedics_password: str) -> None:
+def _auto_retry_orphaned_scrapes(
+    *, kimedics_email: str, kimedics_password: str, deadline_ts: Optional[float] = None
+) -> None:
     """
     Find email_scrapes rows with no matching job_content (orphaned by an
     earlier failure) and re-run the scrape pipeline against them, with
@@ -550,6 +681,13 @@ def _auto_retry_orphaned_scrapes(*, kimedics_email: str, kimedics_password: str)
     if not candidates:
         return
 
+    if deadline_ts is not None and time.monotonic() >= deadline_ts - _AUTO_RETRY_MIN_BUDGET_S:
+        print(
+            f"Auto-retry: {len(candidates)} candidate(s) but <{_AUTO_RETRY_MIN_BUDGET_S}s "
+            "of soft budget left — deferring to the next cron"
+        )
+        return
+
     print(f"Auto-retry: picking up {len(candidates)} orphaned scrape(s)")
 
     # Build the with_links tuples the way the cron does. Use the canonical
@@ -568,8 +706,11 @@ def _auto_retry_orphaned_scrapes(*, kimedics_email: str, kimedics_password: str)
 
     # Re-scrape using the same Playwright pipeline (now retry-capped + circuit
     # broken). If auth is broken, the circuit breaker fast-fails the rest and
-    # the next cron will pick them up.
-    scrape_results = scrape_job_pages(with_links, kimedics_email, kimedics_password)
+    # the next cron will pick them up. The soft deadline stops the loop before
+    # Modal's hard kill; unscraped candidates stay orphaned for the next cron.
+    scrape_results = scrape_job_pages(
+        with_links, kimedics_email, kimedics_password, deadline_ts=deadline_ts
+    )
 
     retry_run_id: Optional[int] = None
     touched: set[str] = set()
@@ -682,11 +823,48 @@ def daily_summary_job():
     return ok
 
 
-# ── Weekly client-facing pulse (Monday 9 AM ET = 13:00 UTC) ──────────────────
+# ── Independent pipeline watchdog (every 30 min) ──────────────────────────────
+# Runs on its OWN schedule so a hard-killed scrape task can never suppress the
+# alarm — the July 2 failure mode. Reads only the DB; alerts on stale orphans,
+# mapped-but-unsynced jobs, and a dead scrape cron (stale heartbeat).
 
 @app.function(
     image=_light_image,
-    schedule=modal.Cron("0 13 * * 1"),  # Monday 13:00 UTC ≈ 9 AM ET
+    schedule=modal.Period(minutes=30),
+    secrets=[modal.Secret.from_name("salesforce-automation")],
+    timeout=120,
+)
+def pipeline_watchdog_job():
+    sys.path.insert(0, "/root")
+    from utils.pipeline_watchdog import run_watchdog
+    from utils.supabase_db import get_conn
+
+    with get_conn() as conn:
+        if conn is None:
+            print("watchdog: no DB connection — cannot check pipeline health")
+            return False
+        return run_watchdog(conn)
+
+
+@app.function(
+    image=_light_image,
+    secrets=[modal.Secret.from_name("salesforce-automation")],
+    timeout=120,
+)
+def run_watchdog_once():
+    """Manual trigger: modal run …::run_watchdog_once"""
+    return pipeline_watchdog_job.local()
+
+
+# ── Weekly client-facing pulse (Monday 9 AM ET = 13:00 UTC) ──────────────────
+
+# NOTE: weekly + monthly pulses share ONE cron slot via pulse_dispatcher_job
+# below (Modal's plan caps scheduled functions at 5 workspace-wide, and the
+# independent watchdog needs a slot). The dispatcher fires daily at the same
+# 13:00 UTC and calls these; both remain directly runnable via `modal run`.
+
+@app.function(
+    image=_light_image,
     secrets=[modal.Secret.from_name("salesforce-automation")],
     timeout=180,
 )
@@ -711,7 +889,6 @@ def weekly_summary_job():
 
 @app.function(
     image=_light_image,
-    schedule=modal.Cron("0 13 1 * *"),  # 1st of month 13:00 UTC ≈ 9 AM ET
     secrets=[modal.Secret.from_name("salesforce-automation")],
     timeout=180,
 )
@@ -729,6 +906,32 @@ def monthly_summary_job():
     ok = send_monthly_summary(stats)
     print(f"monthly_summary_job: email sent={ok}, emails={stats.get('current', {}).get('emails_received')}")
     return ok
+
+
+@app.function(
+    image=_light_image,
+    schedule=modal.Cron("0 13 * * *"),  # daily 13:00 UTC ≈ 9 AM ET
+    secrets=[modal.Secret.from_name("salesforce-automation")],
+    timeout=400,
+)
+def pulse_dispatcher_job():
+    """
+    One cron slot for both client pulses: fires daily at the same 13:00 UTC the
+    old dedicated crons used, sends the weekly pulse on Mondays and the monthly
+    pulse on the 1st. Cadence and send times are identical to before.
+    """
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc)
+    ran = []
+    if today.weekday() == 0:  # Monday → weekly pulse
+        weekly_summary_job.local()
+        ran.append("weekly")
+    if today.day == 1:  # 1st of month → monthly pulse
+        monthly_summary_job.local()
+        ran.append("monthly")
+    print(f"pulse_dispatcher_job: ran={ran or 'nothing scheduled today'}")
+    return ran
 
 
 # ── Admin-triggered rescrape web endpoint (called by automation-hub) ──────────
