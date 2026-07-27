@@ -333,67 +333,81 @@ def _mdy_to_iso(d: Optional[str]) -> Optional[str]:
         return None
 
 
+def _email_date_to_iso(email_date: Any) -> Optional[str]:
+    if hasattr(email_date, "date"):
+        return email_date.date().isoformat()
+    if hasattr(email_date, "isoformat"):
+        return email_date.isoformat().split("T")[0]
+    try:
+        return datetime.fromisoformat(str(email_date)).date().isoformat()
+    except ValueError:
+        return None
+
+
+def most_recent_open_date_from_history(rows: Any) -> Optional[str]:
+    """
+    Date the job last *transitioned into* Open, from ``(email_date, status, posted_date)``
+    rows ordered newest → oldest.
+
+    Walk back over the trailing non-Open tail, then keep walking while the run stays
+    Open; the earliest date of that run is the first time it opened after the previous
+    close. Open/Closed comes from ``job_status_for_salesforce_push`` so this can never
+    drift from what ``Job_Status__c`` receives — notably "Active, not accepting new
+    providers" is Closed, so a job that stops accepting does not restamp its open date.
+
+    Falls back to the Kimedics ``posted_date`` when no Open row exists at all.
+    """
+    run_start: Optional[str] = None
+    in_open_run = False
+    posted_date: Optional[str] = None
+
+    for row in rows:
+        email_date, status = row[0], row[1]
+        if posted_date is None and len(row) > 2 and row[2]:
+            posted_date = str(row[2])
+
+        if job_status_for_salesforce_push(status) == "Open":
+            iso = _email_date_to_iso(email_date)
+            if iso:
+                run_start, in_open_run = iso, True
+        elif in_open_run:
+            break
+
+    return run_start or _mdy_to_iso(posted_date)
+
+
 def get_most_recent_open_date(conn, job_id: str, schema: str = "public") -> Optional[str]:
     """
-    Find the most recent date when this job transitioned to Open/Active status.
+    Date this job most recently transitioned to Open. See
+    ``most_recent_open_date_from_history`` for the rule.
 
-    Looks through job_content history to find the most recent email_received_date
-    where the status was "Open" or "Active, accepting new providers".
-
-    This handles cases where a job went: closed -> open -> closed -> open
-    by returning the date from the most recent transition to open.
-
-    Returns ISO date string (YYYY-MM-DD) or None if no open status found.
+    Returns ISO date string (YYYY-MM-DD) or None.
     """
     if not conn or not job_id:
         return None
 
     try:
         cur = conn.cursor()
-        # Query job_content history for this job, ordered by most recent first
-        # Join with email_scrapes to get the email_received_date
+        # Newest first; jc.id breaks ties when one day carries several emails.
         query = """
         SELECT
             es.date as email_received_date,
-            jc.status
+            jc.status,
+            jc.posted_date
         FROM job_content jc
         LEFT JOIN email_scrapes es ON es.id = jc.email_scrape_id
         WHERE jc.job_id = %s
         AND jc.status IS NOT NULL
         AND jc.status != ''
         AND es.date IS NOT NULL
-        ORDER BY es.date DESC
+        ORDER BY es.date DESC, jc.id DESC
         """
 
         cur.execute(query, (job_id,))
         rows = cur.fetchall()
         cur.close()
 
-        if not rows:
-            return None
-
-        # Find the most recent transition to Open/Active status
-        for row in rows:
-            email_date, status = row
-            status_lower = str(status).lower().strip()
-
-            # Check if this is an open/active status
-            if ("open" in status_lower and "not" not in status_lower) or \
-               "accepting new provider" in status_lower:
-                # Convert datetime to ISO date string
-                if hasattr(email_date, 'date'):
-                    return email_date.date().isoformat()
-                elif hasattr(email_date, 'isoformat'):
-                    return email_date.isoformat().split('T')[0]
-                else:
-                    # Try to parse if it's a string
-                    try:
-                        dt = datetime.fromisoformat(str(email_date))
-                        return dt.date().isoformat()
-                    except:
-                        pass
-
-        return None
+        return most_recent_open_date_from_history(rows)
 
     except Exception as e:
         print(f"Error getting most recent open date for job {job_id}: {e}", file=sys.stderr)

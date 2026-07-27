@@ -1,5 +1,7 @@
 """Small helpers for Salesforce push mapping."""
 
+from datetime import date, datetime
+
 from utils.sf_job_payload import (
     EXTERNAL_JOB_LINK_MAX_LEN,
     KIMEDICS_PORTAL_JOB_POST_URL_PREFIX,
@@ -10,6 +12,7 @@ from utils.sf_job_payload import (
     external_job_link_from_job_row,
     job_row_to_salesforce_fields,
     job_status_for_salesforce_push,
+    most_recent_open_date_from_history,
 )
 from utils.sf_pay_range import DEFAULT_SALARY_PAY_RANGE, extract_pay_range_from_description
 from utils.sf_push_defaults import (
@@ -299,3 +302,68 @@ def test_build_salesforce_job_name_strips_bare_empty_parens_prefix():
     )
     assert got == "General Dentistry - Aspen Dental Management Inc. - Open"
     assert not got.startswith("()")
+
+
+# ── Job_Open_Date__c: latest transition into Open ────────────────────────────
+# Rows are (email_date, status, posted_date) ordered NEWEST first, matching the
+# SQL in get_most_recent_open_date.
+OPEN = "Active, accepting new providers"
+NOT_ACCEPTING = "Active, not accepting new providers"
+
+
+def test_open_date_is_start_of_latest_open_run_not_its_end():
+    """Real history of Kimedics job 20084 — must be 07-08, not 07-17 or 07-10."""
+    rows = [
+        (date(2026, 7, 27), "Closed", "07/06/26"),
+        (date(2026, 7, 17), NOT_ACCEPTING, "07/06/26"),
+        (date(2026, 7, 17), NOT_ACCEPTING, "07/06/26"),
+        (date(2026, 7, 10), OPEN, "07/06/26"),
+        (date(2026, 7, 9), OPEN, "07/06/26"),
+        (date(2026, 7, 8), OPEN, "07/06/26"),
+        (date(2026, 7, 8), OPEN, "07/06/26"),
+        (date(2026, 7, 7), NOT_ACCEPTING, "07/06/26"),
+        (date(2026, 7, 6), OPEN, "07/06/26"),
+    ]
+    assert most_recent_open_date_from_history(rows) == "2026-07-08"
+
+
+def test_open_date_ignores_not_accepting_rows():
+    """"not accepting" contains "accepting" — it must never stamp the open date."""
+    rows = [
+        (date(2026, 7, 17), NOT_ACCEPTING, "07/06/26"),
+        (date(2026, 7, 6), OPEN, "07/06/26"),
+    ]
+    assert most_recent_open_date_from_history(rows) == "2026-07-06"
+
+
+def test_open_date_uses_latest_run_after_a_reopen():
+    rows = [
+        (date(2026, 6, 20), OPEN, "05/01/26"),
+        (date(2026, 6, 19), OPEN, "05/01/26"),
+        (date(2026, 6, 10), "Closed", "05/01/26"),
+        (date(2026, 5, 2), OPEN, "05/01/26"),
+    ]
+    assert most_recent_open_date_from_history(rows) == "2026-06-19"
+
+
+def test_open_date_single_open_row():
+    rows = [(date(2026, 7, 1), OPEN, "07/01/26")]
+    assert most_recent_open_date_from_history(rows) == "2026-07-01"
+
+
+def test_open_date_falls_back_to_posted_date_when_never_open():
+    rows = [
+        (date(2026, 7, 5), "Closed", "07/02/26"),
+        (date(2026, 7, 3), NOT_ACCEPTING, "07/02/26"),
+    ]
+    assert most_recent_open_date_from_history(rows) == "2026-07-02"
+
+
+def test_open_date_none_when_never_open_and_no_posted_date():
+    assert most_recent_open_date_from_history([(date(2026, 7, 5), "Closed", None)]) is None
+    assert most_recent_open_date_from_history([]) is None
+
+
+def test_open_date_accepts_datetime_rows():
+    rows = [(datetime(2026, 7, 8, 14, 16, 41), OPEN, "07/06/26")]
+    assert most_recent_open_date_from_history(rows) == "2026-07-08"
