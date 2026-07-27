@@ -76,6 +76,42 @@ def _pick_swap_candidate(candidates: Sequence[dict]) -> Optional[dict]:
     return sorted(pool, key=_mtime, reverse=True)[0]
 
 
+def _recruiting_activity(candidate: dict) -> float:
+    """Placements + submittals + applications on a Job__c (0.0 when absent/unparseable)."""
+    total = 0.0
+    for field in ("Total_Placements__c", "Total_Submittals__c", "Total_Applications__c"):
+        try:
+            total += float(candidate.get(field) or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _pick_canonical_practice_record(candidates: Sequence[dict]) -> Optional[dict]:
+    """Pick the single Job__c that survives when several share one practice key.
+
+    Salesforce marks ``Job_Client_Job_Id__c`` unique — one practice is meant to have
+    one Job__c. Legacy pairs slipped past that constraint on cosmetic string drift
+    (``"4096- X"`` vs ``"4096 - X"``), which ``practice_key`` correctly folds together.
+
+    Rule: keep the record carrying the most recruiting history (placements +
+    submittals + applications), tie-break on newest ``CreatedDate``.
+
+    Deliberately NOT ``_pick_swap_candidate``'s "prefer no External_Job_ID__c" — against
+    a duplicate pair that rule hands each new Kimedics posting a *different* record and
+    keeps every duplicate alive forever, which is how job 20084 resurrected a 2022 row.
+
+    Returns None if the list is empty. Never raises.
+    """
+    if not candidates:
+        return None
+    return sorted(
+        candidates,
+        key=lambda c: (_recruiting_activity(c), (c.get("CreatedDate") or "")),
+        reverse=True,
+    )[0]
+
+
 def _sf_rest_token() -> Optional[tuple[str, str]]:
     ck = (os.environ.get("SALESFORCE_CONSUMER_KEY") or "").strip()
     cs = (os.environ.get("SALESFORCE_CONSUMER_SECRET") or "").strip()
@@ -101,6 +137,123 @@ def _sf_rest_token() -> Optional[tuple[str, str]]:
     if not instance_url or not access_token:
         return None
     return instance_url, access_token
+
+
+def _consolidate_practice_duplicates(
+    conn,
+    *,
+    job_id: str,
+    practice_key_value: str,
+    practice_raw: Optional[str],
+    winner: Optional[dict],
+    losers: Sequence[dict],
+    run_id=None,
+    schema: str = "public",
+) -> None:
+    """Collapse duplicate Job__c at one practice onto ``winner`` in Salesforce.
+
+    Blanks each loser's ``Job_Client_Job_Id__c`` (the unique field that has been
+    rejecting the winner's PATCH) and marks it Closed, then normalizes the winner's
+    practice value to the Kimedics-scraped string. Losers are never deleted — their
+    recruiting history stays intact and reachable, they just stop competing for the
+    practice key.
+
+    Order matters: the losers must release the unique value before the winner can
+    take it, otherwise Salesforce rejects the winner's write.
+
+    Always logs ``practice_duplicate_consolidated`` so the pair is visible even when
+    writes are gated off (``PROXI_SF_CONSOLIDATE_DUPLICATE_JOBS`` unset → detect-only).
+    """
+    from utils.supabase_db import log_job_event
+
+    winner_id = ((winner or {}).get("Id") or "").strip()
+    loser_ids = [(c.get("Id") or "").strip() for c in losers if (c.get("Id") or "").strip()]
+    if not winner_id or not loser_ids:
+        return
+
+    writes_on = proxi_sf_writes_enabled() and _env_truthy("PROXI_SF_CONSOLIDATE_DUPLICATE_JOBS")
+    payload = {
+        "practice_key": practice_key_value or None,
+        "winner_sf_job_id": winner_id,
+        "winner_activity": _recruiting_activity(winner or {}),
+        "duplicate_sf_job_ids": loser_ids,
+        "consolidated": False,
+        "detail": (
+            "Several Job__c share one practice key. Kept the record with the most "
+            "recruiting history; the others release the unique practice value so they "
+            "stop shadowing it. No record is deleted."
+        ),
+    }
+
+    if not writes_on:
+        payload["detail"] += " Detect-only: PROXI_SF_CONSOLIDATE_DUPLICATE_JOBS is not enabled."
+        log_job_event(
+            conn,
+            job_id=job_id,
+            event_type="practice_duplicate_consolidated",
+            schema=schema,
+            run_id=run_id,
+            payload=payload,
+        )
+        return
+
+    creds = _sf_rest_token()
+    if not creds:
+        payload["detail"] += " Skipped: no Salesforce credentials available."
+        log_job_event(
+            conn,
+            job_id=job_id,
+            event_type="practice_duplicate_consolidated",
+            schema=schema,
+            run_id=run_id,
+            payload=payload,
+        )
+        return
+
+    instance_url, access_token = creds
+    from utils.sf_job_rest_minimal import update_job_record
+
+    released: list[str] = []
+    errors: list[dict] = []
+    for loser_id in loser_ids:
+        try:
+            update_job_record(
+                instance_url,
+                access_token,
+                "Job__c",
+                loser_id,
+                {"Job_Client_Job_Id__c": None, "Job_Status__c": "Closed"},
+            )
+            released.append(loser_id)
+        except Exception as exc:
+            errors.append({"sf_job_id": loser_id, "error": str(exc)[:500]})
+
+    if released and (practice_raw or "").strip():
+        try:
+            update_job_record(
+                instance_url,
+                access_token,
+                "Job__c",
+                winner_id,
+                {"Job_Client_Job_Id__c": (practice_raw or "").strip()},
+            )
+            payload["winner_practice_value"] = (practice_raw or "").strip()
+        except Exception as exc:
+            errors.append({"sf_job_id": winner_id, "error": str(exc)[:500]})
+
+    payload["consolidated"] = bool(released) and not errors
+    payload["released_sf_job_ids"] = released
+    if errors:
+        payload["errors"] = errors
+
+    log_job_event(
+        conn,
+        job_id=job_id,
+        event_type="practice_duplicate_consolidated",
+        schema=schema,
+        run_id=run_id,
+        payload=payload,
+    )
 
 
 def _try_create_sf_job_after_no_match(
@@ -733,12 +886,13 @@ def resolve_sf_ids_for_job_ids(
             continue
 
         if len(hits) > 1:
-            # Multiple SF Job__c records share the same practice key. Per the
-            # "no human-in-the-loop" rule, ID-swap into the most recently
-            # modified one (preferring candidates without an existing
-            # External_Job_ID__c so we don't stomp another Kimedics ↔ SF link).
+            # Several SF Job__c share this practice key — they are duplicates of one
+            # practice, not separate postings (SF marks Job_Client_Job_Id__c unique;
+            # legacy pairs only slipped through on "4096-" vs "4096 - " string drift).
+            # Pin EVERY Kimedics job at this practice to one canonical record so the
+            # duplicates stop being kept alive, and consolidate them in Salesforce.
             candidates_full = [sf_by_id[sid] for sid in hits if sid in sf_by_id]
-            pick = _pick_swap_candidate(candidates_full)
+            pick = _pick_canonical_practice_record(candidates_full)
             sfid = (pick.get("Id") or "").strip() if pick else (hits[0] if hits else "")
             losers = [s for s in hits if s != sfid]
             wid = (sf_by_id.get(sfid, {}).get("Job_Worksite_Location_1__c") or "").strip() or None
@@ -750,12 +904,22 @@ def resolve_sf_ids_for_job_ids(
                     job_id=jid,
                     sf_job_id=j_final or None,
                     sf_worksite_account_id=w_final or None,
-                    source="sf_practice_match_deterministic_pick",
+                    source="sf_practice_match_canonical_pick",
                     mapping_status="resolved",
                     mapping_detail=(
                         f"{len(hits)} SF Job__c share practice_key={p!r}; "
-                        f"picked most-recent ({sfid}). Other candidates: {losers}"
+                        f"kept canonical ({sfid}). Duplicates: {losers}"
                     ),
+                    run_id=run_id,
+                    schema=schema,
+                )
+                _consolidate_practice_duplicates(
+                    conn,
+                    job_id=jid,
+                    practice_key_value=p,
+                    practice_raw=practice_raw,
+                    winner=pick,
+                    losers=[sf_by_id[s] for s in losers if s in sf_by_id],
                     run_id=run_id,
                     schema=schema,
                 )

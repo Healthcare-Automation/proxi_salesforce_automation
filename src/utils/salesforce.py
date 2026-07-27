@@ -660,6 +660,11 @@ _RESOLVER_JOB_FIELDS: tuple[str, ...] = (
     "Job_Worksite_Location_1__c",
     "External_Job_ID__c",
     "LastModifiedDate",
+    # Canonical-winner inputs when several Job__c collide on one practice key.
+    "CreatedDate",
+    "Total_Placements__c",
+    "Total_Submittals__c",
+    "Total_Applications__c",
 )
 
 
