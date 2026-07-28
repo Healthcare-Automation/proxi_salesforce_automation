@@ -78,6 +78,51 @@ def _norm_for_match(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
+_MONTH_NUMBERS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_MONTH_WORD_RE = re.compile(r"(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b")
+_M_SLASH_D_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")
+_DAY_RANGE_RE = re.compile(r"\b(\d{1,2})\s*[-–—]\s*(\d{1,2})\b")
+_DAY_RE = re.compile(r"\b(\d{1,2})\b")
+
+
+def expand_date_tokens(dates: str) -> set[tuple[int, int]]:
+    """Expand a dates string into ``{(month, day)}``.
+
+    ``"July 13-17, 20-22, 24"`` → July 13,14,15,16,17,20,21,22,24. The month carries
+    across commas the way posts write them (``"July 2, Aug 10-14, 17"`` → the trailing
+    17 is August). Returns an empty set when no month can be established.
+    """
+    out: set[tuple[int, int]] = set()
+    month: Optional[int] = None
+    for chunk in re.split(r"[,;]", dates or ""):
+        s = chunk.strip()
+        if not s:
+            continue
+        for mm, dd in _M_SLASH_D_RE.findall(s):
+            mi, di = int(mm), int(dd)
+            if 1 <= mi <= 12 and 1 <= di <= 31:
+                out.add((mi, di))
+                month = mi
+        s = _M_SLASH_D_RE.sub(" ", s)
+        word = _MONTH_WORD_RE.search(s)
+        if word:
+            month = _MONTH_NUMBERS[word.group(1)[:3].lower()]
+            s = f"{s[:word.start()]} {s[word.end():]}"
+        if month is None:
+            continue
+        for a, b in _DAY_RANGE_RE.findall(s):
+            start, end = int(a), int(b)
+            if 1 <= start <= 31 and 1 <= end <= 31 and start <= end:
+                out.update((month, d) for d in range(start, end + 1))
+        for d in _DAY_RE.findall(_DAY_RANGE_RE.sub(" ", s)):
+            if 1 <= int(d) <= 31:
+                out.add((month, int(d)))
+    return out
+
+
 def description_top(description_full_text: str, n: int = 8) -> str:
     """The top portion of a post that the date resolver actually reads (first ``n``
     lines). Shared so the review alert can show reviewers the exact text the AI saw."""
@@ -223,10 +268,17 @@ def _validate_ai_dates(
     if not dates:
         return DateResolution(None, 100, "")
     haystack = _norm_for_match(f"{description_full_text} {structured_dates or ''}")
-    for piece in dates.split(","):
-        p = _norm_for_match(piece)
-        if p and p not in haystack:
-            raise ValueError(f"AI date piece not present in post: {piece!r}")
+    unmatched = [p for p in dates.split(",") if _norm_for_match(p) and _norm_for_match(p) not in haystack]
+    if unmatched:
+        # Excluding a date that sits inside a range has no verbatim form: dropping the
+        # pending 7/17 from "July 13-17" yields "July 13-16", which appears nowhere in
+        # the post, so the literal check would reject the one correct answer. Accept it
+        # only when every returned day is already in the structured list — a narrowing
+        # of dates the job actually has. Invented dates are still rejected.
+        allowed = expand_date_tokens(structured_dates or "")
+        returned = expand_date_tokens(dates)
+        if not (allowed and returned and returned <= allowed):
+            raise ValueError(f"AI date piece not present in post: {unmatched[0]!r}")
     try:
         confidence = int(round(float(obj.get("confidence", 100))))
     except (TypeError, ValueError):
@@ -277,15 +329,21 @@ Every post has a structured full "Dates:" list (every date ever associated with 
 
 Never invent dates: every date you return must appear in the post or the structured list.
 
+A leading date stamp is WHEN the note was written, not a date that is needed. Never return it as a date.
+
+When rules 2 or 3 exclude a date that falls INSIDE a range, rewrite that range to cover only the remaining days — do not return it untouched. "July 13-17" minus July 17 → "July 13-16"; minus July 15 → "July 13-14, 16-17"; "July 13-14" minus July 14 → "July 13".
+
 Also report "confidence": an integer 0-100 for how certain you are the returned dates are EXACTLY correct. Use 100 ONLY when the active dates are completely unambiguous and required no guessing. Lower it when the wording is ambiguous or conflicting, the cancellation scope is unclear, dates are malformed, or you had to interpret. When confidence < 100, give a brief "reason".
 
 Examples (structured | top → output):
 - "June 8-9, 17-19, 26, 29-30, July 1-2" | "6/12 Dates added: June 29-30, July 1-2" → {{"override": true, "dates": "June 29-30, July 1-2", "confidence": 100, "reason": ""}}
 - "Monday only" | "4/8 Active needs are Fridays June 5, 12" → {{"override": true, "dates": "Fridays June 5, 12", "confidence": 100, "reason": ""}}
 - "June 22-24" | "6/19 pending confirmation for June 22-24, open to submittals for June 25-26" → {{"override": true, "dates": "June 25-26", "confidence": 100, "reason": ""}}
+- "July 13-17, 20-22, 24, 27-29, 31" | "7/17 pending confirmation" → {{"override": true, "dates": "July 13-16, 20-22, 24, 27-29, 31", "confidence": 100, "reason": ""}}
 - "June 1-2, 11-12, 15-19, 22" | "6/10 the office cancelled the need for June 11/12" → {{"override": true, "dates": "June 1-2, 15-19, 22", "confidence": 100, "reason": ""}}
 - "June 8-9, 17-19, 26" | "6/5 June 8-9 have been cancelled. Active need is June 26" → {{"override": true, "dates": "June 26", "confidence": 100, "reason": ""}}
 - "June 8-9, 17-19, 26" | "**Aspen exp preferred" → {{"override": false, "dates": "", "confidence": 100, "reason": ""}}
+- "July 20" | "6/29 date reopened" → {{"override": false, "dates": "", "confidence": 100, "reason": ""}}  (6/29 is the stamp saying when it reopened; the needed date is still July 20)
 
 Structured "Dates:" list: {structured or "(none provided)"}
 

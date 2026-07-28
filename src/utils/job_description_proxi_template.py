@@ -221,11 +221,13 @@ def effective_dates_needed(row: dict) -> str:
     cancellation (see :func:`active_dates_override`) resolves against the
     structured ``dates_needed`` list when present.
     """
+    from utils.job_description_ai import strip_dangling_range_dash
+
     structured = (row.get("dates_needed") or "").strip()
     active = active_dates_override((row.get("description_full_text") or "").strip(), structured)
-    if active:
-        return active
-    return structured
+    # The AI path strips a dangling "July 15-" itself; the regex fallback did not, so a
+    # poster's unfinished range reached Salesforce verbatim (job 19705).
+    return strip_dangling_range_dash(active or structured)
 
 
 def extract_kimedics_dates_update_preamble(description_full_text: str) -> Optional[str]:
