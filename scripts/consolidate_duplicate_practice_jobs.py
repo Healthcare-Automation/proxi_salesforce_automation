@@ -43,6 +43,7 @@ from utils.sf_job_supabase_resolve import (  # noqa: E402
     _recruiting_activity,
 )
 from utils.sf_practice_key import practice_key  # noqa: E402
+from utils.sf_scrape_sync import sync_missing_scrape_fields_for_job_ids  # noqa: E402
 from utils.supabase_db import get_conn, update_sf_ids_for_job  # noqa: E402
 
 FIELDS = (
@@ -236,6 +237,22 @@ def main() -> int:
                 except Exception as exc:
                     failures += 1
                     print(f"   ✗ FAILED supabase re-point for {job_id}: {str(exc)[:300]}")
+
+            # Re-pointing only moves the identity fields. Without this the winner keeps the
+            # retired posting's dates, schedule and link while claiming the new job's id —
+            # and since these postings are Closed, no future email would ever correct it.
+            # In the live pipeline resolve_sf_ids_for_job_ids is followed by this same sync;
+            # running out-of-band has to do it explicitly.
+            if target_ext and target_ext != winner_ext:
+                try:
+                    attempted, patched = sync_missing_scrape_fields_for_job_ids(
+                        conn, [target_ext]
+                    )
+                    print(f"   ✓ content re-synced from job {target_ext} "
+                          f"(attempted={attempted}, patched={patched})")
+                except Exception as exc:
+                    failures += 1
+                    print(f"   ✗ FAILED content re-sync for {target_ext}: {str(exc)[:300]}")
             print()
 
         if args.apply:
