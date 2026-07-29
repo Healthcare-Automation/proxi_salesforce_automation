@@ -2533,13 +2533,35 @@ def checkin_endpoint(payload: dict):
     if not expected or supplied != expected:
         raise HTTPException(status_code=401, detail="unauthorized")
 
-    token_data = get_token_auto(
-        os.environ.get("SALESFORCE_CONSUMER_KEY", ""),
-        os.environ.get("SALESFORCE_CONSUMER_SECRET", ""),
-        token_url=os.environ.get("SALESFORCE_TOKEN_URL") or None,
-    )
-    with get_conn() as conn:
-        report = run_checkin(conn, token_data["instance_url"], token_data["access_token"])
+    try:
+        token_data = get_token_auto(
+            os.environ.get("SALESFORCE_CONSUMER_KEY", ""),
+            os.environ.get("SALESFORCE_CONSUMER_SECRET", ""),
+            token_url=os.environ.get("SALESFORCE_TOKEN_URL") or None,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Salesforce auth failed: {str(e)[:300]}")
+
+    # get_conn yields None on connection failure (e.g. the Supabase session pooler's
+    # 15-client cap when a scrape tick holds slots). Transient — retry briefly, and
+    # surface a real message instead of Modal's opaque "Internal Server Error".
+    report = None
+    for attempt in range(3):
+        with get_conn() as conn:
+            if conn is None:
+                time.sleep(3)
+                continue
+            try:
+                report = run_checkin(conn, token_data["instance_url"], token_data["access_token"])
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"check-in failed: {str(e)[:300]}")
+        break
+    if report is None:
+        raise HTTPException(
+            status_code=503,
+            detail="database busy (connection pool full) — wait a minute and run again",
+        )
+
     report["invoker"] = str(payload.get("invoker") or "")[:200]
     report["email_sent"] = bool(send_checkin_report(report))
     return report
