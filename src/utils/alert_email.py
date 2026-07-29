@@ -969,16 +969,16 @@ def send_weekly_summary(stats: dict) -> bool:
         spark_cell = (f'<td class="spark-cell" style="vertical-align:bottom;width:38%;padding-left:20px;">{spark}</td>'
                       if spark else "")
         roi_html = f"""
-        <div class="roi" style="margin:18px 0 0;padding:22px 24px;background:#18181b;border-radius:8px;">
+        <div class="card" style="margin:18px 0 0;padding:22px 24px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
           <table role="presentation" cellpadding="0" cellspacing="0" class="duo-stack" style="width:100%;border-collapse:collapse;">
             <tr>
               <td style="vertical-align:top;">
-                <div style="color:#a1a1aa;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;">Manual time recouped this week</div>
+                <div class="dim" style="color:#71717a;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;">Manual time recouped this week</div>
                 <div style="margin-top:10px;white-space:nowrap;">
-                  <span style="color:#ffffff;font-size:48px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;vertical-align:middle;">{hrs_saved:g} hrs</span>
+                  <span class="num" style="color:#18181b;font-size:48px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;vertical-align:middle;">{hrs_saved:g} hrs</span>
                   <span style="margin-left:12px;vertical-align:middle;">{hrs_delta}</span>
                 </div>
-                <div style="color:#71717a;font-size:11px;margin-top:12px;">{all_time_txt}</div>
+                <div class="dim" style="color:#71717a;font-size:11px;margin-top:12px;">{all_time_txt}</div>
               </td>
               {spark_cell}
             </tr>
@@ -1263,7 +1263,6 @@ def send_weekly_summary(stats: dict) -> bool:
         .muted { color:#a1a1aa !important; }
         .dim   { color:#71717a !important; }
         a { color:#d4d4d8 !important; }
-        .roi  { background:#0a0a0c !important; border:1px solid #27272a; }
 
         .chart-num  { color:#fafafa !important; }
         .chart-base { border-bottom-color:#3f3f46 !important; }
@@ -1393,7 +1392,6 @@ _PULSE_STYLE = """
         .muted { color:#a1a1aa !important; }
         .dim   { color:#71717a !important; }
         a { color:#d4d4d8 !important; }
-        .roi  { background:#0a0a0c !important; border:1px solid #27272a; }
         .chart-num  { color:#fafafa !important; }
         .chart-base { border-bottom-color:#3f3f46 !important; }
         .bar        { background:#d4d4d8 !important; }
@@ -1549,15 +1547,18 @@ def _pulse_stacked(series_split, labels, bar_h=120, show_totals=True, label_keep
 
 
 def _pulse_line_chart(series, w=280, h=84):
-    """White line chart as a rendered image (QuickChart / Chart.js). Renders in the
+    """Green line chart as a rendered image (QuickChart / Chart.js). Renders in the
     browser preview AND email clients including Gmail (which strip inline SVG). Single
-    white line, only the last point dotted; no axes/grid. (White, not red — the trend
-    is a positive metric and red reads as negative.)
+    line, only the last point dotted; no axes/grid.
 
-    The image carries its OWN dark background (not transparent): Gmail's dark theme
-    inverts the surrounding card's HTML background to light but can't recolor image
-    pixels, so a transparent white line would vanish on the flipped-light card. A solid
-    dark backing keeps the line legible in every client/mode."""
+    The image background is TRANSPARENT and the line is a mid-tone brand green on
+    purpose. Gmail's mobile app strips <style> (ignoring our dark-mode rules) and runs
+    its own inversion on HTML, flipping the card's background — but it can't recolor
+    image pixels. A baked-in background (light OR dark) therefore becomes a mismatched
+    box the moment Gmail flips the card the other way (the old bug: a dark-backed chart
+    stranded on a Gmail-lightened card). Transparent lets the chart inherit whatever the
+    card actually is in every client/mode, and a mid green (#6e9b7e) stays legible on
+    both light and dark backings, so there is nothing left to mismatch."""
     import json, urllib.parse
     pts = [(l, v) for l, v in series if v is not None]
     if len(pts) < 2:
@@ -1569,10 +1570,10 @@ def _pulse_line_chart(series, w=280, h=84):
             "labels": [l for l, _ in pts],
             "datasets": [{
                 "data": data,
-                "borderColor": "#ffffff",
-                "borderWidth": 2,
+                "borderColor": "#6e9b7e",
+                "borderWidth": 3,
                 "pointRadius": [0] * (len(data) - 1) + [4],
-                "pointBackgroundColor": "#ffffff",
+                "pointBackgroundColor": "#6e9b7e",
                 "fill": False,
                 "lineTension": 0.35,
             }],
@@ -1586,9 +1587,9 @@ def _pulse_line_chart(series, w=280, h=84):
         },
     }
     c = urllib.parse.quote(json.dumps(cfg, separators=(",", ":")))
-    # Solid dark backing (matches the ROI card) so the white line survives client dark-mode
-    # inversion; rounded so it reads as an intentional inset chart if the card flips light.
-    url = f"https://quickchart.io/chart?bkg=%2318181b&w={w * 2}&h={h * 2}&c={c}"
+    # Transparent backing so the chart inherits the card's real background in every client
+    # and dark-mode variant — no baked box to mismatch when Gmail inverts the card's HTML.
+    url = f"https://quickchart.io/chart?bkg=transparent&w={w * 2}&h={h * 2}&c={c}"
     return (f'<img src="{url}" width="{w}" height="{h}" alt="Hours saved trend" '
             f'style="display:block;width:100%;max-width:{w}px;height:auto;border-radius:6px;">')
 
@@ -1601,9 +1602,9 @@ def _pulse_trend(series, caption=""):
     if not img:
         return ""
     last = series[-1][1] or 0
-    label = (f'<div style="font-size:12px;line-height:14px;color:#ffffff;font-weight:700;'
+    label = (f'<div class="num" style="font-size:12px;line-height:14px;color:#18181b;font-weight:700;'
              f'text-align:right;font-variant-numeric:tabular-nums;margin-bottom:4px;">{last:g} hrs</div>')
-    cap = (f'<div style="font-size:10px;color:#71717a;text-align:right;margin-top:5px;'
+    cap = (f'<div class="dim" style="font-size:10px;color:#71717a;text-align:right;margin-top:5px;'
            f'text-transform:uppercase;letter-spacing:.04em;">{caption}</div>') if caption else ""
     return label + img + cap
 
@@ -1780,16 +1781,16 @@ def send_monthly_summary(stats: dict) -> bool:
         spark_cell = (f'<td class="spark-cell" style="vertical-align:bottom;width:38%;padding-left:20px;">{spark}</td>'
                       if spark else "")
         roi_html = f"""
-        <div class="roi" style="margin:18px 0 0;padding:22px 24px;background:#18181b;border-radius:8px;">
+        <div class="card" style="margin:18px 0 0;padding:22px 24px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
           <table role="presentation" cellpadding="0" cellspacing="0" class="duo-stack" style="width:100%;border-collapse:collapse;">
             <tr>
               <td style="vertical-align:top;">
-                <div style="color:#a1a1aa;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;">Manual time recouped this month</div>
+                <div class="dim" style="color:#71717a;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;">Manual time recouped this month</div>
                 <div style="margin-top:10px;white-space:nowrap;">
-                  <span style="color:#ffffff;font-size:48px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;vertical-align:middle;">{hrs_saved:g} hrs</span>
+                  <span class="num" style="color:#18181b;font-size:48px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;vertical-align:middle;">{hrs_saved:g} hrs</span>
                   <span style="margin-left:12px;vertical-align:middle;">{hrs_delta}</span>
                 </div>
-                <div style="color:#71717a;font-size:11px;margin-top:14px;">{cum_h:g} hrs all-time{f' since {launch}' if launch else ''}</div>
+                <div class="dim" style="color:#71717a;font-size:11px;margin-top:14px;">{cum_h:g} hrs all-time{f' since {launch}' if launch else ''}</div>
               </td>
               {spark_cell}
             </tr>
@@ -2122,15 +2123,15 @@ def send_impact_report(stats: dict, djc: dict | None = None,
     spark_cell = (f'<td class="spark-cell" style="vertical-align:bottom;width:38%;padding-left:20px;">{spark}</td>'
                   if spark else "")
     roi_html = f"""
-    <div class="roi" style="margin:18px 0 0;padding:24px 26px;background:#18181b;border-radius:8px;">
+    <div class="card" style="margin:18px 0 0;padding:24px 26px;background:#ffffff;border:1px solid #e4e4e7;border-radius:8px;">
       <table role="presentation" cellpadding="0" cellspacing="0" class="duo-stack" style="width:100%;border-collapse:collapse;">
         <tr>
           <td style="vertical-align:top;">
-            <div style="color:#a1a1aa;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;">Manual time recouped since launch</div>
+            <div class="dim" style="color:#71717a;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;">Manual time recouped since launch</div>
             <div style="margin-top:10px;white-space:nowrap;">
-              <span style="color:#ffffff;font-size:52px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;">{hrs_saved:g} hrs</span>
+              <span class="num" style="color:#18181b;font-size:52px;font-weight:700;line-height:1.0;letter-spacing:-0.02em;">{hrs_saved:g} hrs</span>
             </div>
-            <div style="color:#71717a;font-size:12px;margin-top:14px;line-height:1.5;">Estimated hands-on data-entry time the automation handled across {days_live} days.</div>
+            <div class="dim" style="color:#71717a;font-size:12px;margin-top:14px;line-height:1.5;">Estimated hands-on data-entry time the automation handled across {days_live} days.</div>
           </td>
           {spark_cell}
         </tr>
@@ -2164,7 +2165,7 @@ def send_impact_report(stats: dict, djc: dict | None = None,
       <tr>
         {_pulse_card_sm("Avg sync time",  lat_txt,             _pulse_sub("email → Salesforce"))}
         {_pulse_card_sm("States active",  f"{states_total}",   _pulse_sub("national coverage"))}
-        {_pulse_card_sm("Days live",      f"{days_live}",      _pulse_sub(f"since {launch_disp or launch}"))}
+        {_pulse_card_sm("Jobs per week",  f"{(opened / max(days_live / 7, 1)):.0f}", _pulse_sub("average since launch"))}
       </tr>
     </table>"""
     hero_row = hero_big + hero_a + hero_b
@@ -2233,7 +2234,7 @@ def send_impact_report(stats: dict, djc: dict | None = None,
     Proxi — Kimedics → Salesforce Impact Report
     {period}
     ============================================
-    Live since launch ({launch_disp or launch}), {days_live} days live.
+    Live since launch ({launch_disp or launch}).
 
     Manual time recouped : {hrs_saved:g} hrs (estimated)
     Emails processed     : {emails}
@@ -2637,3 +2638,124 @@ def send_authentication_failure_alert(
         ),
         text,
     )
+
+
+# ── Manual check-in report (hub Admin → Check-In button) ─────────────────────────────
+
+CHECKIN_RECIPIENTS = ["seanhyang1@gmail.com", "anddy0622@gmail.com"]
+
+
+def _checkin_check_rows(checks: list[dict]) -> str:
+    rows = []
+    for c in checks:
+        ok = c.get("ok")
+        mark = "✓" if ok else "✗"
+        color = "#059669" if ok else "#dc2626"
+        detail = ""
+        if not ok:
+            detail = (f' — expected <b>{_html_escape(str(c.get("expected")))}</b>, '
+                      f'got <b>{_html_escape(str(c.get("actual")))}</b>')
+        elif c.get("note"):
+            detail = f' — {_html_escape(c["note"])}'
+        rows.append(
+            f'<div style="font-size:12px;color:#374151;padding:2px 0;">'
+            f'<span style="color:{color};font-weight:700;">{mark}</span> '
+            f'{_html_escape(c.get("name", ""))}{detail}</div>'
+        )
+    return "".join(rows)
+
+
+def _checkin_job_card(job: dict) -> str:
+    jid = _html_escape(str(job.get("job_id") or ""))
+    failed = [c for c in job.get("checks", []) if not c.get("ok")]
+    border = "#dc2626" if failed else "#e5e7eb"
+    state = job.get("state") or {}
+    links = job.get("links") or {}
+    flags_html = "".join(
+        f'<div style="font-size:12px;color:#b45309;padding:2px 0;">⚑ {_html_escape(f)}</div>'
+        for f in job.get("flags", [])
+    )
+    email_rows = "".join(
+        f'<tr><td style="padding:2px 10px 2px 0;color:#6b7280;font-size:11px;white-space:nowrap;'
+        f'vertical-align:top;">{_html_escape(str(e.get("date", ""))[:16].replace("T", " "))}</td>'
+        f'<td style="padding:2px 10px 2px 0;color:#374151;font-size:11px;">{_html_escape(e.get("subject", ""))}</td>'
+        f'<td style="padding:2px 0;color:#6b7280;font-size:11px;">{_html_escape(e.get("action", ""))}</td></tr>'
+        for e in job.get("emails", [])
+    )
+    return f"""
+    <div style="background:#ffffff;border:1px solid {border};border-radius:8px;padding:14px 16px;margin:10px 0;">
+      <div style="font-size:14px;font-weight:700;color:#111827;">
+        Job #{jid}
+        <span style="font-weight:400;color:#6b7280;font-size:12px;"> · {_html_escape(str(state.get("status") or ""))}</span>
+      </div>
+      <div style="font-size:12px;margin:4px 0 8px;">
+        <a href="{links.get("kimedics", "")}" style="color:#2563eb;">Kimedics post</a>
+        &nbsp;·&nbsp;
+        <a href="{links.get("salesforce", "")}" style="color:#2563eb;">Salesforce job</a>
+      </div>
+      <div style="font-size:12px;color:#6b7280;margin-bottom:8px;">
+        Dates: <b style="color:#374151;">{_html_escape(str(state.get("sf_dates_needed") or "—"))}</b>
+        &nbsp;·&nbsp; Open date: <b style="color:#374151;">{_html_escape(str(state.get("sf_open_date") or "—"))}</b>
+        &nbsp;·&nbsp; Practice: <b style="color:#374151;">{_html_escape(str(state.get("practice_value") or "—"))}</b>
+      </div>
+      {_checkin_check_rows(job.get("checks", []))}
+      {flags_html}
+      {f'<div style="margin-top:10px;"><div style="font-size:11px;font-weight:600;color:#6b7280;margin-bottom:3px;">Email timeline</div><table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">{email_rows}</table></div>' if email_rows else ''}
+    </div>"""
+
+
+def send_checkin_report(report: dict, recipients: Optional[Sequence[str]] = None) -> bool:
+    """Check-in review packets → Andy + Sean. One email to both; two assignee sections
+    so each reviewer sees the whole list. Light cards only (dark-mode email rule)."""
+    jobs = report.get("jobs", [])
+    pulse = report.get("pulse", [])
+    pulse_bad = [c for c in pulse if not c.get("ok")]
+    failed = int(report.get("failed_jobs") or 0)
+    when = str(report.get("generated_at") or "")[:16].replace("T", " ")
+
+    pulse_html = "".join(
+        f'<span style="display:inline-block;margin:0 10px 4px 0;font-size:12px;'
+        f'color:{"#059669" if c.get("ok") else "#dc2626"};">'
+        f'{"✓" if c.get("ok") else "✗"} {_html_escape(c.get("note") or c.get("name", ""))}</span>'
+        for c in pulse
+    )
+    sections = []
+    for reviewer in ("Andy", "Sean"):
+        mine = [j for j in jobs if j.get("assignee") == reviewer]
+        if not mine:
+            continue
+        cards = "".join(_checkin_job_card(j) for j in mine)
+        sections.append(
+            f'<div style="font-size:13px;font-weight:700;color:#111827;margin:18px 0 2px;">'
+            f"{reviewer}&rsquo;s {len(mine)}</div>{cards}"
+        )
+
+    status_word = "issues found" if (failed or pulse_bad) else "all clear"
+    subject = (f"🔍 Proxi · Kimedics check-in — {failed} of "
+               f"{report.get('checked_jobs', 0)} jobs flagged" if failed
+               else f"🔍 Proxi · Kimedics check-in — all {report.get('checked_jobs', 0)} jobs clear")
+
+    html = f"""<!DOCTYPE html><html><body style="margin:0;padding:24px;background:#f9fafb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+      <div style="max-width:640px;margin:0 auto;">
+        <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;padding:18px 20px;">
+          <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#6b7280;">Kimedics automation · manual check-in</div>
+          <div style="font-size:17px;font-weight:700;color:#111827;margin:6px 0 2px;">{when} UTC — {status_word}</div>
+          <div style="font-size:12px;color:#6b7280;margin-bottom:10px;">
+            {report.get("checked_jobs", 0)} jobs checked (last 7 days) · {failed} with failed checks ·
+            {len(jobs)} selected for review</div>
+          {pulse_html}
+        </div>
+        {"".join(sections)}
+        <div style="font-size:11px;color:#9ca3af;text-align:center;margin-top:12px;">Proxi · Kimedics → Salesforce automation · triggered manually from the hub</div>
+      </div>
+    </body></html>"""
+
+    lines = [f"Kimedics check-in {when} UTC — {status_word}",
+             f"{report.get('checked_jobs', 0)} jobs checked, {failed} with failed checks", ""]
+    for j in jobs:
+        bad = [c for c in j.get("checks", []) if not c.get("ok")]
+        lines.append(f"[{j.get('assignee')}] #{j.get('job_id')} — "
+                     + (", ".join(c["name"] for c in bad) if bad else "all checks pass"))
+        lines.append(f"  Kimedics: {j.get('links', {}).get('kimedics', '')}")
+        lines.append(f"  Salesforce: {j.get('links', {}).get('salesforce', '')}")
+    return _send(subject, html, "\n".join(lines), recipients=list(recipients or CHECKIN_RECIPIENTS))

@@ -2508,6 +2508,43 @@ def impact_report_endpoint(payload: dict):
             "emails": int(stats.get("current", {}).get("emails_received", 0))}
 
 
+@app.function(
+    image=_endpoint_image,
+    secrets=[modal.Secret.from_dotenv(), modal.Secret.from_name("salesforce-automation")],
+    timeout=300,
+)
+@modal.fastapi_endpoint(method="POST")
+def checkin_endpoint(payload: dict):
+    """Manual Kimedics check-in, triggered from the hub (Admin → Check-In).
+    Body: {token, invoker?}. Read-only: builds review packets for the 10 most
+    concerning recently-touched jobs, emails Andy + Sean, returns the full report
+    JSON for the hub to render. Reuses IMPACT_ENDPOINT_TOKEN so the Modal secret
+    never needs editing. Spec: docs/superpowers/specs/2026-07-29-kimedics-checkin-design.md
+    """
+    sys.path.insert(0, "/root")
+    from fastapi import HTTPException
+    from utils.alert_email import send_checkin_report
+    from utils.checkin import run_checkin
+    from utils.salesforce import get_token_auto
+    from utils.supabase_db import get_conn
+
+    expected = (os.environ.get("IMPACT_ENDPOINT_TOKEN") or "").strip()
+    supplied = (payload.get("token") or "").strip() if isinstance(payload, dict) else ""
+    if not expected or supplied != expected:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    token_data = get_token_auto(
+        os.environ.get("SALESFORCE_CONSUMER_KEY", ""),
+        os.environ.get("SALESFORCE_CONSUMER_SECRET", ""),
+        token_url=os.environ.get("SALESFORCE_TOKEN_URL") or None,
+    )
+    with get_conn() as conn:
+        report = run_checkin(conn, token_data["instance_url"], token_data["access_token"])
+    report["invoker"] = str(payload.get("invoker") or "")[:200]
+    report["email_sent"] = bool(send_checkin_report(report))
+    return report
+
+
 @app.local_entrypoint()
 def run_impact_report_once(to: str = "seanhyang1@gmail.com"):
     """Generate + send the all-time impact report. Defaults to a REVIEW-ONLY copy to
