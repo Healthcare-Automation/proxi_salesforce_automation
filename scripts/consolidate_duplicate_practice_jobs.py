@@ -49,8 +49,14 @@ from utils.supabase_db import get_conn, update_sf_ids_for_job  # noqa: E402
 FIELDS = (
     "Id, Name, Job_Client_Job_Id__c, External_Job_ID__c, Job_Status__c, CreatedDate, "
     "LastModifiedDate, Total_Placements__c, Total_Submittals__c, Total_Applications__c, "
-    "Job_Worksite_Location_1__c"
+    "Job_Worksite_Location_1__c, Job_Ranking__c"
 )
+
+
+def _ranking(record: dict) -> str:
+    # The org requires Job_Ranking__c on every PATCH; legacy rows have it blank, so any
+    # edit fails validation unless the PATCH supplies it. Same default as sf_scrape_sync.
+    return str(record.get("Job_Ranking__c") or "B").strip() or "B"
 
 
 def find_duplicate_groups(instance_url: str, access_token: str) -> list[tuple[str, list[dict]]]:
@@ -100,9 +106,40 @@ def describe(record: dict) -> str:
     )
 
 
+def fetch_explicit_group(
+    instance_url: str, access_token: str, ids: list[str]
+) -> tuple[str, list[dict]]:
+    """One duplicate group from explicit Job__c ids (for drift practice_key can't fold,
+    e.g. "4168 - Lawrence, NJ" vs "4168 - Lawrence Township, NJ").
+
+    Records keep the given order and the FIRST id's practice value defines the group's
+    key and canonical rename target — pass the Kimedics-format record first, or the
+    winner is renamed to a value future postings won't match.
+    """
+    rows = sf.query_all(
+        instance_url,
+        access_token,
+        f"SELECT {FIELDS} FROM Job__c WHERE Id IN ('%s')" % "','".join(ids),
+    )
+    by_id = {r["Id"]: r for r in rows}
+    missing = [i for i in ids if i not in by_id]
+    if missing or len(ids) < 2:
+        raise SystemExit(f"--group {','.join(ids)}: needs >=2 valid Job__c ids (missing: {missing})")
+    records = [by_id[i] for i in ids]
+    return practice_key(records[0].get("Job_Client_Job_Id__c")), records
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="perform the writes (default: plan only)")
+    ap.add_argument(
+        "--group",
+        action="append",
+        default=[],
+        metavar="ID1,ID2",
+        help="explicit Job__c ids to consolidate as one group (repeatable); "
+        "put the record whose practice value matches Kimedics' format FIRST",
+    )
     args = ap.parse_args()
 
     token = sf.get_token_auto(
@@ -113,6 +150,12 @@ def main() -> int:
     instance_url, access_token = token["instance_url"], token["access_token"]
 
     groups = find_duplicate_groups(instance_url, access_token)
+    auto_ids = {r["Id"] for _, records in groups for r in records}
+    for spec in args.group:
+        ids = [s.strip() for s in spec.split(",") if s.strip()]
+        if any(i in auto_ids for i in ids):
+            raise SystemExit(f"--group {spec}: overlaps a group already detected by practice_key")
+        groups.append(fetch_explicit_group(instance_url, access_token, ids))
     if not groups:
         print("No practice-key duplicates found.")
         return 0
@@ -187,6 +230,7 @@ def main() -> int:
                             "Job_Client_Job_Id__c": None,
                             "External_Job_ID__c": None,
                             "Job_Status__c": "Closed",
+                            "Job_Ranking__c": _ranking(loser),
                         },
                     )
                     writes += 1
@@ -208,6 +252,7 @@ def main() -> int:
                 if new_open_date:
                     winner_fields["Job_Open_Date__c"] = new_open_date
             if winner_fields:
+                winner_fields["Job_Ranking__c"] = _ranking(winner)
                 try:
                     update_job_record(
                         instance_url, access_token, "Job__c", winner["Id"], winner_fields
