@@ -286,6 +286,7 @@ def _try_create_sf_job_after_no_match(
         describe_sobject,
         filter_createable_fields,
         is_salesforce_deleted_entity_error,
+        update_job_record,
     )
     from utils.salesforce import query_jobs_by_external_id_exact, query_jobs_by_worksite_id_exact
     from utils.sf_worksite_create import fetch_or_create_worksite_account_id
@@ -542,6 +543,7 @@ def _try_create_sf_job_after_no_match(
     describe = describe_sobject(instance_url, access_token, job_object_name)
     new_job_id = ""
     attempt = 0
+    flip_to_open = False
     last_exc: Optional[BaseException] = None
     while attempt < 2:
         try:
@@ -557,6 +559,12 @@ def _try_create_sf_job_after_no_match(
             fields = filter_createable_fields(describe, fields)
             if not fields:
                 raise RuntimeError("create payload empty after createable filter")
+            # The client's "Job Opened - Send Slack Alert" flow triggers on UPDATE into
+            # Open only — a Job__c born Open never alerts. Create Closed, then PATCH to
+            # Open right after (below) so the flow sees a real Closed→Open transition.
+            flip_to_open = fields.get("Job_Status__c") == "Open"
+            if flip_to_open:
+                fields["Job_Status__c"] = "Closed"
             # Assign new Job__c to Cara on create (create-only — see JOB_DEFAULT_OWNER_ID).
             if JOB_DEFAULT_OWNER_ID:
                 fields["OwnerId"] = JOB_DEFAULT_OWNER_ID
@@ -648,6 +656,36 @@ def _try_create_sf_job_after_no_match(
         run_id=run_id,
         schema=schema,
     )
+    if flip_to_open:
+        flip_error: Optional[str] = None
+        try:
+            update_job_record(
+                instance_url,
+                access_token,
+                job_object_name,
+                new_job_id,
+                {"Job_Status__c": "Open"},
+            )
+        except Exception as e:
+            # Non-fatal: the scrape-fields PATCH later this run also sets Open and
+            # still fires the client's alert flow.
+            flip_error = str(e)[:1500]
+        log_job_event(
+            conn,
+            job_id=jid,
+            event_type="job_open_flip_after_create",
+            schema=schema,
+            run_id=run_id,
+            payload={
+                "sf_job_id": new_job_id,
+                "ok": flip_error is None,
+                "error": flip_error,
+                "summary": (
+                    "Created Closed then PATCHed to Open so the client's update-triggered "
+                    "'Job Opened - Send Slack Alert' flow fires for brand-new Job__c records."
+                ),
+            },
+        )
     log_job_event(
         conn,
         job_id=jid,
