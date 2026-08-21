@@ -23,3 +23,24 @@ __pycache__/
 
 # Streamlit app (separate deployment, not part of Modal pipeline)
 prox_streamlit_app/
+
+# Portable Mac + VPS development
+.env.*
+!.env.example
+!.env.local.example
+node_modules/
+.next/
+dist/
+build/
+coverage/
+.playwright/
+.cache/
+tmp/
+temp/
+venv/
+.stfolder
+.stignore
+.stversions/
+.syncthing.*.tmp
+.claude/settings.local.json
+.claude/*.local.json

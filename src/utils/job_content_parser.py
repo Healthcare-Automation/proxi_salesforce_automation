@@ -125,11 +125,28 @@ def _parse_city_state(text: str) -> tuple[str, str]:
     if m:
         had_numeric_prefix = True
         s = m.group(1).strip()
+    else:
+        # Kimedics drift: office number with NO dash ("4412 Humble, TX"). Only
+        # strip the number when the remainder still looks like a location — a
+        # comma, or a trailing 2-letter token that is a real state code.
+        m2 = re.match(r"^\d{3,5}\s+([A-Za-z].+)$", s)
+        if m2:
+            rest = m2.group(1).strip()
+            tail = re.search(r"[.\s]\s*([A-Za-z]{2})\.?$", rest)
+            if "," in rest or (tail and tail.group(1).upper() in US_STATE_CODE_TO_NAME):
+                had_numeric_prefix = True
+                s = rest
     s = re.sub(r"^location\s*:\s*", "", s, flags=re.IGNORECASE).strip()
     if "," in s:
         left, right = s.rsplit(",", 1)
         return left.strip(), right.strip()
     if had_numeric_prefix and s:
+        # Kimedics drift: "1029 - Keizer. OR" / "1029 - Keizer OR" (period or
+        # space where the comma should be). Only trust a trailing 2-letter
+        # token that is a real state code; anything else stays city-only.
+        m = re.match(r"^(.+?)[.\s]+([A-Za-z]{2})\.?$", s)
+        if m and m.group(2).upper() in US_STATE_CODE_TO_NAME:
+            return m.group(1).strip(" ."), m.group(2).upper()
         return s, ""
     return "", ""
 
@@ -660,8 +677,9 @@ def _extract_practice_value_from_description(desc: str) -> str:
         # Skip ISO / numeric date-only lines so we do not treat them as practice ids.
         if re.match(r"^\d{4}-\d{2}-\d{2}\b", t) or re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}\b", t):
             continue
-        # Office id + location: "4361 - Rosenberg, TX" (digit chunk then hyphen; rest has letters).
-        if re.match(r"^\d{3,5}\s*-\s*.+", t) and re.search(r"[A-Za-z]", t):
+        # Office id + location: "4361 - Rosenberg, TX" (digit chunk then hyphen; rest has
+        # letters). Dash optional — Kimedics drift like "4412 Humble, TX" must match too.
+        if re.match(r"^\d{3,5}\s*(?:-\s*)?[A-Za-z].*,", t):
             return t
     return ""
 

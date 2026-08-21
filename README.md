@@ -28,7 +28,7 @@ proxi_salesforce_automation/
 
 ## 1. Gmail: Kimedics job emails
 
-Reads your inbox (e.g. **proxi@scrubnetwork.com**) for emails from **donotreply@kimedics.com**, parses them into structured rows, and optionally saves to CSV or a Modal Dict.
+Reads your inbox (e.g. **andy@uzu.studio**) for emails from **donotreply@kimedics.com**, parses them into structured rows, and optionally saves to CSV or a Modal Dict.
 
 ### Parsed fields
 

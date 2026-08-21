@@ -156,7 +156,7 @@ def scrape_gmail_job():
     )
     from utils.pipeline_link_scrape import process_link_scrape_batch
 
-    email_account    = os.environ.get("GMAIL_EMAIL", "proxi@scrubnetwork.com")
+    email_account    = os.environ.get("GMAIL_EMAIL", "andy@uzu.studio")
     email_password   = os.environ.get("GMAIL_APP_PASSWORD", "")
     kimedics_email   = os.environ.get("KIMEDICS_EMAIL", "").strip()
     kimedics_password = os.environ.get("KIMEDICS_PASSWORD", "").strip()

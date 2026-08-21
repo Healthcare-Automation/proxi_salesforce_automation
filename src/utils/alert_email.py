@@ -1,7 +1,7 @@
 """
 Email alerting for the Proxi Salesforce Automation pipeline.
 
-Sends from proxi@scrubnetwork.com via Gmail SMTP (uses GMAIL_APP_PASSWORD env var).
+Sends from andy@uzu.studio via Gmail SMTP (uses GMAIL_APP_PASSWORD env var).
 No extra dependencies — stdlib smtplib + email.mime only.
 
 Two main entry points
@@ -32,7 +32,8 @@ from typing import Any, Sequence, Optional
 
 ALERT_RECIPIENTS = [
     "seanhyang1@gmail.com",
-    "proxi@scrubnetwork.com",
+    "andy@uzu.studio",
+    "anddy0622@gmail.com",
 ]
 # Client-facing recurring pulses (weekly + monthly) also go to the proxidocs
 # stakeholders. The daily digest and all failure/date-review alerts stay on
@@ -43,7 +44,7 @@ PULSE_RECIPIENTS = ALERT_RECIPIENTS + [
 ]
 SMTP_HOST        = "smtp.gmail.com"
 SMTP_PORT        = 587
-_SENDER_DEFAULT  = "proxi@scrubnetwork.com"
+_SENDER_DEFAULT  = "andy@uzu.studio"
 
 # ── Base HTML template ────────────────────────────────────────────────────────
 
@@ -122,7 +123,7 @@ def _html_wrap(header_title: str, header_sub: str, body_html: str) -> str:
     <p>{header_sub}</p>
   </div>
   <div class="body">{body_html}</div>
-  <div class="footer">Proxi Salesforce Automation · {ts} · proxi@scrubnetwork.com</div>
+  <div class="footer">Proxi Salesforce Automation · {ts} · andy@uzu.studio</div>
 </div>
 </body></html>"""
 

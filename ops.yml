@@ -1,0 +1,11 @@
+# Mission Control metadata — edit freely; ops-sync picks it up on next commit/refresh
+name: Kimedics Automation
+boundary: client
+description: Kimedics job emails -> Salesforce Job__c/Worksite create-or-update
+account: salesforce:proxi-prod | writes
+account: supabase:kimedics | writes
+account: gmail:proxi-inbox | reads
+account: modal:anddy0622 | runs  # app: salesforce-automation — client work in the personal Modal workspace
+automation: kimedics-scrape | modal | every 10 min (:00 grid) | salesforce:proxi-prod, supabase:kimedics, gmail:proxi-inbox
+automation: daily-summary | modal | 13:00 UTC daily | gmail:proxi-inbox
+automation: watchdog | modal | every 30 min | supabase:kimedics

@@ -1926,7 +1926,7 @@ def _upsert_job_current(
         cur.execute(
             pg_sql.SQL(
                 """
-                INSERT INTO {} (
+                INSERT INTO {} AS jc (
                     job_id, title_line, location_line, practice_value, city, state, address_line,
                     job_title, posting_org, priority, status, point_of_contact,
                     provider_start_date, provider_end_date, posted_date, view_job_link,
@@ -1942,10 +1942,13 @@ def _upsert_job_current(
                 ON CONFLICT (job_id) DO UPDATE SET
                     title_line = EXCLUDED.title_line,
                     location_line = EXCLUDED.location_line,
-                    practice_value = EXCLUDED.practice_value,
-                    city = EXCLUDED.city,
-                    state = EXCLUDED.state,
-                    address_line = EXCLUDED.address_line,
+                    -- A failed/partial scrape must never erase these with blanks
+                    -- (the job-20311 clobbering bug): keep the existing value
+                    -- unless the new one is non-empty.
+                    practice_value = COALESCE(NULLIF(btrim(EXCLUDED.practice_value), ''), jc.practice_value),
+                    city = COALESCE(NULLIF(btrim(EXCLUDED.city), ''), jc.city),
+                    state = COALESCE(NULLIF(btrim(EXCLUDED.state), ''), jc.state),
+                    address_line = COALESCE(NULLIF(btrim(EXCLUDED.address_line), ''), jc.address_line),
                     job_title = EXCLUDED.job_title,
                     posting_org = EXCLUDED.posting_org,
                     priority = EXCLUDED.priority,

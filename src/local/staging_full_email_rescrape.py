@@ -80,7 +80,7 @@ def main() -> int:
     else:
         schema = prompt_pg_schema(staging_only=True)
     print(f"Staging schema in use: {schema!r}")
-    email_account = os.environ.get("GMAIL_EMAIL", "proxi@scrubnetwork.com").strip()
+    email_account = os.environ.get("GMAIL_EMAIL", "andy@uzu.studio").strip()
     email_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
     from_email = os.environ.get("KIMEDICS_FROM_EMAIL", DEFAULT_FROM).strip() or DEFAULT_FROM
 

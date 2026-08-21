@@ -19,7 +19,7 @@ Everything you need to run, test, and maintain the Kimedics → Salesforce autom
 
 ```
 # Gmail IMAP
-GMAIL_APP_PASSWORD=...         # Google App Password for proxi@scrubnetwork.com
+GMAIL_APP_PASSWORD=...         # Google App Password for andy@uzu.studio
 
 # Salesforce (Connected App / External Client App)
 SALESFORCE_CONSUMER_KEY=...

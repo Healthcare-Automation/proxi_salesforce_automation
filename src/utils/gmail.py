@@ -124,7 +124,9 @@ _LOCATION_RE = re.compile(r"\bat\s+([^(]+?)\s*\([^)]+\)", re.IGNORECASE)
 _ACTION_PATTERNS = [
     (re.compile(r"updated the job post", re.I), "updated"),
     (re.compile(r"New job post from", re.I), "new"),
-    (re.compile(r"has been assigned a new status:\s*(\w+)", re.I), "status"),
+    # Full label up to the sentence period — "Active, not accepting new providers"
+    # must not truncate to "Active" (ambiguous for the Open/Closed mapping).
+    (re.compile(r"has been assigned a new status:\s*([^.\n<]+)", re.I), "status"),
     (re.compile(r"Accept to submit providers", re.I), "accept_to_submit"),
 ]
 

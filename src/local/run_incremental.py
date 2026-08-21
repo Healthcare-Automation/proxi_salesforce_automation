@@ -108,7 +108,7 @@ def main():
 
     from utils.run_target_prompt import resolve_pg_schema
 
-    email_account = os.environ.get("GMAIL_EMAIL", "proxi@scrubnetwork.com")
+    email_account = os.environ.get("GMAIL_EMAIL", "andy@uzu.studio")
     email_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
     if not email_password:
         print("Set GMAIL_APP_PASSWORD in .env")

@@ -198,7 +198,7 @@ modal run src/production/scrape_gmail_modal.py::run_once
 
 ## Email Credentials
 
-Emails are sent from `proxi@scrubnetwork.com` using the `GMAIL_APP_PASSWORD` Modal secret (same credential used for IMAP reading).  
+Emails are sent from `andy@uzu.studio` using the `GMAIL_APP_PASSWORD` Modal secret (same credential used for IMAP reading).  
 No extra packages are required — uses Python stdlib `smtplib`.
 
 To change recipients, edit `ALERT_RECIPIENTS` in `src/utils/alert_email.py`:

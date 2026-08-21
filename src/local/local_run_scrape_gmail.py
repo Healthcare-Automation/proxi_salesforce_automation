@@ -32,7 +32,7 @@ load_dotenv(_env_path)
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
-EMAIL_ACCOUNT = "proxi@scrubnetwork.com"
+EMAIL_ACCOUNT = os.environ.get("GMAIL_EMAIL", "andy@uzu.studio")
 EMAIL_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 FROM_EMAIL = "donotreply@kimedics.com"
 MAX_EMAILS = 500  # Max emails to fetch per run (None = no cap)

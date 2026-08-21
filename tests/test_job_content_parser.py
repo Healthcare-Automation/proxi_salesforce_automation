@@ -614,6 +614,70 @@ def test_practice_value_city_only_numeric_prefix_sets_city():
     assert "gloucester" in (out.get("city") or "").lower()
 
 
+def test_practice_value_period_before_state_parses_city_and_state():
+    """``1029 - Keizer. OR`` (period where the comma should be) must still yield city+state."""
+    body = (
+        "Title #20306\n"
+        "Loc, ST\n"
+        "Practice\n"
+        "1029 - Keizer. OR\n"
+        "Job Title\n"
+        "#20306: Dentistry (Dentist (DMD/DDS))\n"
+    )
+    out = parse_job_content_txt(body)
+    assert (out.get("city") or "").strip() == "Keizer"
+    assert (out.get("state") or "").strip().upper() == "OR"
+
+
+def test_practice_value_space_before_state_parses_city_and_state():
+    """``1029 - Keizer OR`` (no comma at all) must also yield city+state."""
+    from utils.job_content_parser import _parse_city_state
+
+    assert _parse_city_state("1029 - Keizer OR") == ("Keizer", "OR")
+    assert _parse_city_state("1029 - Salt Lake City. UT") == ("Salt Lake City", "UT")
+    # A trailing 2-letter token that is NOT a state code stays part of the city.
+    assert _parse_city_state("4190 - Gloucester") == ("Gloucester", "")
+    # No numeric prefix → unchanged behavior (practice names are not cities).
+    assert _parse_city_state("Acme Dental QQ") == ("", "")
+
+
+def test_practice_value_office_number_without_dash_parses_city_and_state():
+    """``4412 Humble, TX`` (office number with NO dash) must not leak the number into the city."""
+    from utils.job_content_parser import _parse_city_state
+
+    assert _parse_city_state("4412 Humble, TX") == ("Humble", "TX")
+    assert _parse_city_state("4412 Humble TX") == ("Humble", "TX")
+    assert _parse_city_state("1029 Keizer. OR") == ("Keizer", "OR")
+    # Bare number + word with no comma and no state token stays unparsed.
+    assert _parse_city_state("4412 Humble") == ("", "")
+
+
+def test_description_fallback_rescues_practice_without_dash():
+    """When the Practice field is blank, the description line "4412 Humble, TX" must be used."""
+    from utils.job_content_parser import _extract_practice_value_from_description
+
+    assert _extract_practice_value_from_description(
+        "8/18 update: pending confirmation\n\n**Updated hours\n4412 Humble, TX \nAddress: 10007 Farm Rd"
+    ) == "4412 Humble, TX"
+    assert _extract_practice_value_from_description("4361 - Rosenberg, TX\nmore") == "4361 - Rosenberg, TX"
+    # A plain street address must NOT be mistaken for a practice id.
+    assert _extract_practice_value_from_description("10007 Farm to Market Rd\nHumble") == ""
+
+
+def test_practice_value_office_number_without_dash_end_to_end():
+    body = (
+        "Title #20311\n"
+        "Loc, ST\n"
+        "Practice\n"
+        "4412 Humble, TX\n"
+        "Job Title\n"
+        "#20311: Dentistry (Dentist (DMD/DDS))\n"
+    )
+    out = parse_job_content_txt(body)
+    assert (out.get("city") or "").strip() == "Humble"
+    assert (out.get("state") or "").strip().upper() == "TX"
+
+
 def test_parse_city_state_from_location_line():
     body = (
         "Title #1\n"

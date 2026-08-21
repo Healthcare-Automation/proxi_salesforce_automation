@@ -92,6 +92,14 @@ def process_link_scrape_batch(
         if jid:
             touched_job_ids.add(jid)
 
+        # Email-as-status-truth: the triggering email can fill a missing page
+        # status or (when fresh + explicit) override a contradicting one. Runs
+        # BEFORE validation so the validator sees the effective status.
+        try:
+            _apply_email_status_signal(conn, r, cl, job_id=jid or job_post_id, run_id=link_run_id, schema=schema)
+        except Exception as _e_sig:
+            print(f"  [email-status] signal check skipped for #{job_post_id}: {_e_sig}")
+
         issues = validate_scraped_job(cl, job_post_id=job_post_id)
         summary = issues_summary(issues)
 
@@ -187,6 +195,77 @@ def process_link_scrape_batch(
     _decide_and_send_alerts(conn, per_row_state, link_run_id, schema)
 
     return touched_job_ids
+
+
+def _apply_email_status_signal(conn, r: dict, cl: dict, *, job_id: str, run_id, schema: str) -> None:
+    """Fill/override ``cl['status']`` from the triggering email's status signal.
+
+    Emits ``status_filled_from_email`` (silent recovery) and
+    ``status_email_page_mismatch`` (alerts — page and email disagreed).
+    """
+    esid = r.get("email_scrape_id")
+    if conn is None or not esid or not job_id:
+        return
+    from utils.email_status_signal import resolve_status_with_email
+    from utils.supabase_db import log_job_event
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT action_or_change, date, job_post_id FROM email_scrapes WHERE id = %s",
+            (esid,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+        action_or_change, email_date, es_job_post_id = row[0], row[1], row[2]
+        cur.execute(
+            """
+            SELECT MAX(date) FROM email_scrapes
+            WHERE job_post_id = %s
+              AND (action_or_change = 'new' OR action_or_change ILIKE 'status:%%')
+            """,
+            (es_job_post_id,),
+        )
+        newest = (cur.fetchone() or (None,))[0]
+
+    dec = resolve_status_with_email(
+        page_status=cl.get("status"),
+        action_or_change=action_or_change,
+        email_date=email_date,
+        newest_status_email_date=newest,
+    )
+    if dec.filled or dec.overrode_page:
+        cl["status"] = dec.status
+    if dec.filled:
+        log_job_event(
+            conn, job_id=job_id, event_type="status_filled_from_email",
+            schema=schema, run_id=run_id,
+            payload={
+                "email_action": action_or_change,
+                "filled_status": dec.status,
+                "page_status": dec.page_status or None,
+                "detail": (
+                    "The page's Status field was missing or unrecognized; used the "
+                    "authoritative status carried by the Kimedics email instead."
+                ),
+            },
+        )
+    if dec.mismatch:
+        log_job_event(
+            conn, job_id=job_id, event_type="status_email_page_mismatch",
+            schema=schema, run_id=run_id,
+            payload={
+                "email_action": action_or_change,
+                "email_status": dec.email_status,
+                "page_status": dec.page_status,
+                "email_won": dec.overrode_page,
+                "detail": (
+                    "The Kimedics status email and the job page disagreed. "
+                    + ("Used the fresh email's status." if dec.overrode_page
+                       else "Kept the live page's status (email was stale — retry of an old email).")
+                ),
+            },
+        )
 
 
 def _alert_low_confidence_dates(conn, job_post_id, cl: dict, *, schema: str, run_id) -> None:
@@ -372,6 +451,7 @@ def _decide_and_send_alerts(conn, per_row_state, link_run_id: int, schema: str) 
             ("sf_sync_skipped_no_mapping",        signals.get("skipped",             0)),
             ("mapping_blocked_no_practice_value", signals.get("blocked_no_practice", 0)),
             ("scrape_silent_failure",             signals.get("silent_failure",      0)),
+            ("status_email_page_mismatch",        signals.get("status_mismatch",     0)),
         ]
         downstream_total = sum(n for _, n in downstream_events)
         history_total = sum([
@@ -482,6 +562,7 @@ def _query_alerting_signals(conn, job_ids: list[str], link_run_id: int, schema: 
               count(*) FILTER (WHERE event_type='sf_sync_skipped_no_mapping')        AS skipped,
               count(*) FILTER (WHERE event_type='mapping_blocked_no_practice_value') AS blocked_no_practice,
               count(*) FILTER (WHERE event_type='scrape_silent_failure')             AS silent_failure,
+              count(*) FILTER (WHERE event_type='status_email_page_mismatch')        AS status_mismatch,
               count(*) FILTER (WHERE event_type='sf_scrape_fields_patched')          AS patched_events,
               bool_or(event_type='job_created_in_salesforce')                 AS created_record,
               SUM(jsonb_array_length(COALESCE(payload->'fields_changed','[]'::jsonb)))
@@ -493,7 +574,7 @@ def _query_alerting_signals(conn, job_ids: list[str], link_run_id: int, schema: 
             (link_run_id, job_ids),
         )
         for row in cur.fetchall():
-            jid, sf_err, jf, wf, q, sk, bnp, sf_sil, p_evt, created, p_fld = row
+            jid, sf_err, jf, wf, q, sk, bnp, sf_sil, st_mm, p_evt, created, p_fld = row
             out.setdefault(jid, {}).update({
                 "sf_error":            int(sf_err or 0),
                 "job_failed":          int(jf or 0),
@@ -502,6 +583,7 @@ def _query_alerting_signals(conn, job_ids: list[str], link_run_id: int, schema: 
                 "skipped":             int(sk or 0),
                 "blocked_no_practice": int(bnp or 0),
                 "silent_failure":      int(sf_sil or 0),
+                "status_mismatch":     int(st_mm or 0),
                 "patched_events":      int(p_evt or 0),
                 "patched_fields":      int(p_fld or 0),
                 "created_record":      bool(created),

@@ -74,3 +74,24 @@ def test_get_body_from_message_plain():
     msg.set_payload("Plain text body", charset="utf-8")
     msg.set_type("text/plain")
     assert "Plain text body" in get_body_from_message(msg)
+
+
+def test_status_update_email_captures_full_status_label():
+    """Multi-word statuses must not be truncated to 'Active' (job-20311 lesson)."""
+    record = {
+        "subject": "Job post status update",
+        "body": (
+            "Job post #20311 Dentistry (Dentist (DMD/DDS)) at 4412 Humble, TX (Humble, TX) "
+            "has been assigned a new status: Active, not accepting new providers. View job post"
+        ),
+        "html": "",
+    }
+    out = parse_kimedics_job_email(record)
+    assert out["action_or_change"] == "status: Active, not accepting new providers"
+
+    record2 = {
+        "subject": "Job post status update",
+        "body": "Job post #20311 has been assigned a new status: Closed. View job post",
+        "html": "",
+    }
+    assert parse_kimedics_job_email(record2)["action_or_change"] == "status: Closed"
