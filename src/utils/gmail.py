@@ -342,7 +342,16 @@ def _scrape_via_gmail_api(
     for mid in msg_ids:
         if max_results and len(email_list) >= max_results:
             break
-        raw = svc.users().messages().get(userId="me", id=mid, format="raw").execute()
+        try:
+            raw = svc.users().messages().get(userId="me", id=mid, format="raw").execute()
+        except Exception as e:
+            # One bad message id (e.g. deleted/expunged between list() and get() --
+            # the real 2026-10-29 failure: HttpError 400 "Precondition check
+            # failed") must never cost the whole batch. Skip it and keep going;
+            # the caller's IMAP fallback exists for total API failures, not for
+            # losing every other email in the run over a single stale id.
+            print(f"Gmail API: skipping message {mid} ({type(e).__name__}: {e})")
+            continue
         msg = message_from_bytes(base64.urlsafe_b64decode(raw["raw"]))
         record = _message_to_record(msg, cutoff_date)
         if record is not None:
